@@ -74,3 +74,8 @@ test/modular/test_wire_security.py
 test/modular/test_model_kwargs_tensor_transport.py
 test/modular/test_engine_rows_only_tail.py
 test/modular/test_ingest_rollback.py
+test/modular/test_engine_uniform_inputs.py
+test/modular/test_kv_decode_plan_cache.py
+test/modular/test_kv_pinned_index_ring.py
+test/modular/test_kv_plan_host_lens.py
+test/modular/test_sampler_trash_row.py

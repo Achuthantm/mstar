@@ -72,12 +72,16 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     device_loopback_enabled,
 )
+from mstar.utils.knobs import ingraph_decode_rope
 from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
 
 
 class LLMSubmodule(ARNodeSubmodule):
+    # the decode walk reads its input ids off the sampler's slot masters
+    reads_device_loopback = True
+
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
     # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
@@ -318,6 +322,33 @@ class LLMSubmodule(ARNodeSubmodule):
             return frozenset({"text_inputs"})
         return frozenset()
 
+    @staticmethod
+    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A decode step replayed on a leased slot, or being captured for one.
+        The caller's walk decides (a capture's own context carries the
+        piecewise walk), the lease says the slot's static buffers are in
+        play."""
+        if graph_walk != "decode":
+            return False
+        step = getattr(engine_inputs, "step", None)
+        ctx = getattr(step, "ctx", None) if step is not None else None
+        return ctx is not None and getattr(ctx, "slot_lease", None) is not None
+
+    def _decode_cos_sin(
+        self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The rotary tables of a decode step from the position resource's
+        planned positions: one token per row, no custom grids."""
+        pos_ids = self.node_resources[ROPE].pos_ids("main")
+        assert pos_ids is not None, (
+            "position resource has no plan for this step; `plan` must run "
+            "before the forward"
+        )
+        pos = pos_ids[:num_tokens].unsqueeze(0).expand(3, -1)
+        return self.model.model.build_cos_sin(
+            pos, dtype=self.model.model.embed_tokens.weight.dtype,
+        )
+
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         """``[3, total_tokens]`` for the step, in packed request order.
 
@@ -356,6 +387,7 @@ class LLMSubmodule(ARNodeSubmodule):
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
         out: dict[str, torch.Tensor | Any] = {}
+        captured = self._captured_decode(engine_inputs, graph_walk)
         first = inputs[0]
         if first.input_embeds is None and (
             first.input_ids is None or any(inp.input_ids is None for inp in inputs)
@@ -378,6 +410,9 @@ class LLMSubmodule(ARNodeSubmodule):
             out["input_ids"] = ids
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
+            if captured and ingraph_decode_rope():
+                # the captured forward builds the rotary tables itself
+                return out
         elif inputs[0].input_ids is not None:
             out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
         else:
@@ -462,13 +497,21 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         attn: AttentionManager = engine_inputs.resources[ATTN]
         sampler: SamplerResource = engine_inputs.resources[SAMPLER]
+        captured = self._captured_decode(engine_inputs, graph_walk)
+        if input_ids is None and input_embeds is None:
+            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
+        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
+            # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
+            # positions, inside the graph; the static cos/sin stay unread
+            num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
+            cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
 
         embeds = (
             self.model.model.embed_tokens(input_ids)
@@ -487,8 +530,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,
@@ -514,8 +557,8 @@ class LLMSubmodule(ARNodeSubmodule):
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor,
-        sin_3d: torch.Tensor,
+        cos_3d: torch.Tensor | None = None,
+        sin_3d: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         **kwargs,

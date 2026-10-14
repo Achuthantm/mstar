@@ -281,6 +281,11 @@ class StepRunner:
                         )
                 raise
 
+    def ingest_capture_row(self, rid: str) -> None:
+        """open a capture padding row on all resources"""
+        for key in self._order:
+            self._resources[key].ingest_capture_row(rid)
+
     def remove_request(self, rid: str) -> None:
         for key in self._order:
             self._resources[key].remove_request(rid)
