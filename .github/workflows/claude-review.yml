@@ -34,13 +34,22 @@ name: Claude Review
 #     a PR merged here, from a fork or not. First-time contributors and
 #     strangers get no automatic review (cost, spam).
 #   - light, when someone with write access comments `/review` on a PR
-#     (re-review after pushes);
+#     (re-review after pushes), or when a contributor comments `/review` on
+#     their own PR, unless it has the `skip-ai-review` label;
 #   - thorough, when someone with write access comments `/review thorough` or
 #     applies the `ai-review-thorough` label.
 # Write access (write, maintain or admin) is checked against the user's actual
 # permission in the preflight; author_association can't tell write from read.
 # The PR can be from anyone, so a maintainer can /review a first-timer's PR.
 # Pushes don't trigger a review on their own; comment /review for that.
+#
+# The action refuses to run for an actor without write access unless that
+# actor is listed in allowed_non_write_users. Most contributors' PRs come from
+# forks without write access, so the preflight lists exactly one login there,
+# and only when the actor is the PR's author, is a contributor, and the run is
+# the automatic review or their own light `/review`. Never '*'. Such a run
+# reads the same untrusted PR content as a maintainer's /review of that PR,
+# with the same tools and token; only who can start it changes.
 #
 # issue_comment also runs with secrets and the default branch's workflow file,
 # so the same rules hold. The comment body is only matched by the `if` below,
@@ -79,8 +88,12 @@ jobs:
       ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       (github.event.comment.body == '/review' || github.event.comment.body == '/review thorough') &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+       (((github.event.comment.body == '/review' || github.event.comment.body == '/review thorough') &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event.comment.body == '/review' &&
+         github.event.comment.user.login == github.event.issue.user.login &&
+         !contains(github.event.issue.labels.*.name, 'skip-ai-review') &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))))
     # Job-level, so an unrelated PR comment (which still starts a workflow run
     # that this `if` skips) can never cancel a review in progress.
     concurrency:
@@ -98,33 +111,50 @@ jobs:
     steps:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
-      # failing a check on every PR. Then, for /review and the label, the
-      # commenter or labeler needs write access; anyone else exits green with
-      # a notice. (The automatic review is gated on the author in the job's `if`.)
+      # failing a check on every PR. Then the actor needs write access, or must
+      # be the PR's author, a contributor, on the automatic review or a light
+      # `/review` (see the header). Anyone else exits green with a notice.
+      # non_write_user is set only for that author, and only when they lack
+      # write access, so a maintainer's run is unchanged.
       - name: Preflight
         id: pre
         env:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
           ACTOR: ${{ github.actor }}
-          ON_REQUEST: ${{ github.event_name == 'issue_comment' || github.event.action == 'labeled' }}
+          AUTHOR: ${{ github.event.pull_request.user.login || github.event.issue.user.login }}
+          # The PR author's association on the automatic run; the commenter's on
+          # /review, where SELF_SERVE also requires commenter == author.
+          ASSOC: ${{ github.event.comment.author_association || github.event.pull_request.author_association }}
+          SELF_SERVE: >-
+            ${{ (github.event_name == 'pull_request_target' && github.event.action != 'labeled') ||
+                (github.event_name == 'issue_comment' && github.event.comment.body == '/review' &&
+                 !contains(github.event.issue.labels.*.name, 'skip-ai-review')) }}
         run: |
           if [ "$KEY_SET" != "true" ]; then
             echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "$ON_REQUEST" != "true" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
           case "$perm" in
             admin|maintain|write)
-              echo "run=true" >> "$GITHUB_OUTPUT" ;;
-            *)
-              echo "::notice::$ACTOR has '$perm' access, not write; only people with write access can request a review."
-              echo "run=false" >> "$GITHUB_OUTPUT" ;;
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
           esac
+          case "$ASSOC" in
+            OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR) contributor=true ;;
+            *) contributor=false ;;
+          esac
+          if [ "$SELF_SERVE" = "true" ] && [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ]; then
+            echo "::notice::$ACTOR has '$perm' access; reviewing their own PR as its author ($ASSOC)."
+            {
+              echo "run=true"
+              echo "non_write_user=$ACTOR"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR, can request a review."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
 
       # Tell the commenter their /review was picked up; a comment-triggered run
       # is otherwise invisible from the PR.
@@ -251,6 +281,10 @@ jobs:
           # action tries to mint a Claude GitHub App token over OIDC, which needs
           # `id-token: write` and the app installed, and fails before reviewing.
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Empty for anyone with write access. Otherwise the PR author alone,
+          # set by the preflight; the action then also scrubs secrets from any
+          # subprocess environment.
+          allowed_non_write_users: ${{ steps.pre.outputs.non_write_user }}
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, your method, your reporting bar and
@@ -293,6 +327,8 @@ jobs:
             || gh pr comment "$PR" --repo "$REPO" --body-file summary.md
 
       # Anything above failed: say so on the PR rather than leaving silence.
+      # A run the preflight skipped never gets here. Repeated failures update
+      # one comment, found by its marker, so retries don't stack up comments.
       - name: Report a review that didn't complete
         if: >-
           always() && steps.pre.outputs.run == 'true' &&
@@ -304,6 +340,12 @@ jobs:
           WHY: ${{ steps.pr.outputs.why || 'a step failed' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          printf 'The automated review didn'"'"'t complete: %s. [Log](%s). Comment `/review` to retry.\n' \
+          printf '<!-- claude-review-incomplete -->\nThe automated review didn'"'"'t complete: %s. [Log](%s). Comment `/review` to retry.\n' \
             "$WHY" "$RUN_URL" > failed.md
-          gh pr comment "$PR" --repo "$REPO" --body-file failed.md
+          id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
+            select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- claude-review-incomplete -->"))) | .id' 2> /dev/null | tail -n 1)
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@failed.md > /dev/null
+          else
+            gh pr comment "$PR" --repo "$REPO" --body-file failed.md
+          fi
