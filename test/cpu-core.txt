@@ -95,3 +95,4 @@ test/modular/test_ltx2_5_model.py
 test/modular/test_startup_graph_validation.py
 test/modular/test_media_paths.py
 test/modular/test_whisper_kv_sizing.py
+test/modular/test_kokoro_chunk_loop.py
