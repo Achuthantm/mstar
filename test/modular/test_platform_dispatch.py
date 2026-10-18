@@ -265,6 +265,7 @@ class _Engine:
         self._submodules = {
             "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
         }
+        self._item_encoders = set()
 
 
 @pytest.mark.parametrize("overrides", [False, True])
