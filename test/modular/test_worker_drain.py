@@ -22,6 +22,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     RemoveRequest,
 )
+from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
 from mstar.worker.worker import Worker
 
@@ -103,7 +104,11 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     w._graph_runtime.cleanup_consumed_inputs = lambda *args: ({}, {})
     w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
     pending = SimpleNamespace(
-        batch=SimpleNamespace(node_name="LLM", request_to_worker_graph={7: 0}),
+        # the real batch: postprocess groups its rids by walk and discards
+        # through it, which a namespace cannot answer for
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
+        ),
         node_batch=SimpleNamespace(
             request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
             final_stream_rids={7}, stream_partition_done_rids={7},
@@ -171,7 +176,10 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
     w.enable_nvtx = w.enable_prof = False
     w._innermost_loop_by_node = {}
     pending = SimpleNamespace(
-        batch=SimpleNamespace(request_to_worker_graph={7: 0}, node_name="LLM", output_signals=["new_token"]),
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="prefill", request_to_worker_graph={7: 0},
+            output_signals=["new_token"],
+        ),
         node_batch=ExecutingBatch(
             node_name="LLM", per_request_info={}, cached_rids={7},
             step_context=StepContext(request_ids=(), graph_walk="prefill", slot=0, capture=False),
