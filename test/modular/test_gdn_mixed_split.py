@@ -62,7 +62,7 @@ def _reference(device, x, weight, inputs):
     # wrapper does not size its token mask for their borrowed tokens
     w = GDNPrefillWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
-        num_tokens=x.shape[0], bs=len(SPANS), cuda_graph=True,
+        num_tokens=x.shape[0], bs=len(SPANS), accelerator_graph=True,
     )
     w.plan(
         SPANS,
@@ -74,10 +74,10 @@ def _reference(device, x, weight, inputs):
     return conv_out, out, state, conv
 
 
-def _mixed(device, x, weight, inputs, cuda_graph):
+def _mixed(device, x, weight, inputs, accelerator_graph):
     state, conv = _pools(device)
     tokens = x.shape[0]
-    if cuda_graph:
+    if accelerator_graph:
         # a bucket wider than the step: its padded tail must not leak in
         bucket_tokens, bucket_bs = 32, 8
         pad_rows = bucket_bs - len(SPANS)
@@ -95,7 +95,7 @@ def _mixed(device, x, weight, inputs, cuda_graph):
         spans, slots, has = SPANS, SLOT_IDS, HAS_STATE
     w = GDNMixedWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
-        num_tokens=bucket_tokens, bs=bucket_bs, cuda_graph=cuda_graph,
+        num_tokens=bucket_tokens, bs=bucket_bs, accelerator_graph=accelerator_graph,
         max_prefill_rows=4,
     )
     w.plan(spans, tuple(slots), tuple(has))
@@ -111,8 +111,8 @@ def _close(a, b, what):
 
 
 @requires_gpu
-@pytest.mark.parametrize("cuda_graph", [False, True], ids=["eager", "bucket"])
-def test_mixed_split_matches_the_chunked_path(cuda_graph):
+@pytest.mark.parametrize("accelerator_graph", [False, True], ids=["eager", "bucket"])
+def test_mixed_split_matches_the_chunked_path(accelerator_graph):
     device = torch.device("cuda")
     tokens = sum(SPANS)
     torch.manual_seed(2)
@@ -121,7 +121,7 @@ def test_mixed_split_matches_the_chunked_path(cuda_graph):
     inputs = _inputs(tokens, device)
 
     ref_conv, ref_out, ref_state, ref_cstate = _reference(device, x, weight, inputs)
-    mix_conv, mix_out, mix_state, mix_cstate = _mixed(device, x, weight, inputs, cuda_graph)
+    mix_conv, mix_out, mix_state, mix_cstate = _mixed(device, x, weight, inputs, accelerator_graph)
 
     _close(mix_conv, ref_conv, "conv output")
     _close(mix_out, ref_out, "delta-rule output")
@@ -138,7 +138,7 @@ def test_mixed_split_matches_the_chunked_path(cuda_graph):
 def test_too_many_prompt_rows_for_the_bucket_is_refused():
     w = GDNMixedWrapper(
         device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
-        num_tokens=64, bs=8, cuda_graph=True, max_prefill_rows=2,
+        num_tokens=64, bs=8, accelerator_graph=True, max_prefill_rows=2,
     )
     with pytest.raises(RuntimeError, match="prompt rows"):
         w.plan([4, 4, 4, 1], (1, 2, 3, 4), (False, False, False, True))

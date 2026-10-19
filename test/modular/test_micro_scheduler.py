@@ -898,7 +898,7 @@ def _capture_group(split=True, captured=(WALK,)):
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
     engine = SimpleNamespace(_submodules={
-        NODE: SimpleNamespace(submodule=_Submodule(split), cuda_graph_runner=runner),
+        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner),
     })
     return Engine.capture_group(engine, NODE, WALK, 0, SimpleNamespace(guided=True))
 
@@ -936,7 +936,7 @@ def _stream_engine():
     runner = SimpleNamespace(captures_walk=lambda walk: walk == WALK)
     engine = _Engine(max_bs=16)  # readiness and the cap; the grouping is the real Engine's
     engine._submodules = {
-        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), cuda_graph_runner=runner),
+        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), accelerator_graph_runner=runner),
     }
     engine.splits_by_capture_key = lambda node, walk: Engine.splits_by_capture_key(engine, node, walk)
     engine.capture_group = lambda *a, **kw: Engine.capture_group(engine, *a, **kw)

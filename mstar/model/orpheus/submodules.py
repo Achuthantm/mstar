@@ -7,7 +7,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig, CudaGraphConfig, PackedCudaGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.attn.base import AttentionManager
@@ -51,18 +55,18 @@ class OrpheusLLMSubmodule(ARNodeSubmodule):
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 4, 16, 64]
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(1, dtype=torch.long, device=device),
                     input_seq_len=1
                 ),
             ),
-            PackedCudaGraphConfig(
+            PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 # a mixed batch is packed rows too, decode rows one token long
                 replay_graph_walks=["prefill", "mixed"],
@@ -247,9 +251,9 @@ class SNACDecoderSubmodule(NodeSubmodule):
         self.config = config
         self.windows = config.snac_window_frames()
 
-    def get_cuda_graph_configs(
+    def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1
-    ) -> list[CudaGraphConfig]:
+    ) -> list[AcceleratorGraphConfig]:
         """One capture per window size a stream can produce, final flushes included.
 
         Not compiled, like the eager path (``disable_torch_compile``): the
@@ -259,7 +263,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
         """
         del tp_world_size
         return [
-            BatchedCudaGraphConfig(
+            BatchedAcceleratorGraphConfig(
                 capture_graph_walk="snac_chunk",
                 single_request_inputs=ARNodeInputs(
                     input_ids=torch.zeros(
@@ -437,9 +441,9 @@ class SNACDecoderSubmodule(NodeSubmodule):
         codes_2 = c2.reshape(mf.shape[0], -1)
         return codes_0, codes_1, codes_2
 
-    def can_use_cuda_graphs(self, batch, model_inputs):
+    def can_use_accelerator_graphs(self, batch, model_inputs):
         widths = {item.input_ids.shape[0] for item in model_inputs}
         return (
             len(widths) == 1 and widths <= set(self.windows)
-            and super().can_use_cuda_graphs(batch, model_inputs)
+            and super().can_use_accelerator_graphs(batch, model_inputs)
         )

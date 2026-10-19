@@ -63,7 +63,7 @@ def test_a_step_with_a_vision_row_replays_the_deepstack_captures(thinker, step_w
 
 def test_one_vision_capture_serves_vision_and_mixed_steps(thinker):
     thinker._get_decode_thinker_mask = lambda device: torch.zeros(2, 1)
-    configs = thinker.get_cuda_graph_configs(torch.device("cpu"))
+    configs = thinker.get_accelerator_graph_configs(torch.device("cpu"))
     vision = [c for c in configs if "prefill_vision" in c.replay_graph_walks]
 
     assert len(vision) == 1

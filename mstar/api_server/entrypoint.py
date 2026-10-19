@@ -402,7 +402,7 @@ class APIServer:
         """
         logger.info(
             "Waiting for workers to finish setup "
-            "(loading weights, capturing CUDA graphs)..."
+            "(loading weights, capturing accelerator graphs)..."
         )
         while True:
             for message in self.communicator.get_all_new_messages():
