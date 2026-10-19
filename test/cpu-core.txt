@@ -128,3 +128,4 @@ test/distributed/test_fanout_shapes.py
 test/modular/test_empty_tensor_transport.py
 test/modular/test_orpheus_snac_stream.py
 test/modular/test_images_n_cap.py
+test/modular/test_chatterbox_watermark_import.py
