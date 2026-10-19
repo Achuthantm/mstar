@@ -119,6 +119,22 @@ def _pick_free_tcp_port() -> int:
         return s.getsockname()[1]
 
 
+def keep_bootstrap_sockets_on_loopback() -> None:
+    """Have NCCL and Gloo open their sockets on loopback, unless the user
+    picked an interface (or, for NCCL, an address family).
+
+    Unset, NCCL listens on a routable interface and Gloo on whatever address
+    the hostname resolves to (a pod or container IP), for as long as the
+    deployment runs. Every rank is spawned by this conductor on this host, so
+    loopback reaches all of them; a launcher that places ranks on other hosts
+    must not call this. Data between GPUs on one host goes over NVLink, PCIe
+    P2P or SHM either way.
+    """
+    if "NCCL_SOCKET_IFNAME" not in os.environ and "NCCL_SOCKET_FAMILY" not in os.environ:
+        os.environ["NCCL_SOCKET_IFNAME"] = "lo"
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+
+
 def _exit_when_orphaned(worker_id: str, parent=None, poll_s: float = 0.5) -> None:
     """Worker-side watchdog that leaves once the conductor is gone.
 
@@ -561,6 +577,7 @@ class Conductor:
         # kernel libraries) while unpickling its arguments, before the worker
         # target runs, and it inherits os.environ.
         apply_process_env_defaults()
+        keep_bootstrap_sockets_on_loopback()
         ctx = mp.get_context("spawn")
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
