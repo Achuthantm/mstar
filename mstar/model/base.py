@@ -751,8 +751,13 @@ class Model(ABC):
         pass
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        img = read_image(filepath).to(device)  # uint8 CxHxW
-        img = img.float().div_(255.0)
+        # RGB whatever the file holds: image processors cannot place the
+        # channel axis of a 4-channel (RGBA or CMYK) image.
+        try:
+            img = read_image(filepath, rgb=True)
+        except (RuntimeError, OSError) as exc:  # torchvision's decoders raise RuntimeError, Pillow's OSError
+            raise ValueError("could not decode image: the file is corrupt or truncated") from exc
+        img = img.to(device).float().div_(255.0)  # CxHxW
 
         return TensorAndMetadata(img)
 
