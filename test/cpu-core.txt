@@ -142,3 +142,4 @@ test/modular/test_dynamo_compose.py
 test/modular/test_rendezvous_store.py
 test/modular/test_mooncake_requirement.py
 test/modular/test_tts_speech_wer.py
+test/modular/test_resample_rate_bound.py
