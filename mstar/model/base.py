@@ -398,6 +398,7 @@ class Model(ABC):
             for graph_walk, graph in walk_graphs.items()
         }
         self._check_stream_driven_walks(walk_to_wgs, config_path)
+        self._check_loop_successors(walk_to_wgs, config_path)
         return sum(walk_to_wgs.values(), start=[])
 
     def _check_walk_placement(
@@ -500,6 +501,35 @@ class Model(ABC):
                     "arrives once per pass (from the conductor, say), or move the work "
                     "after it into a downstream partition fed by a StreamingGraphEdge."
                 )
+
+    def _check_loop_successors(
+        self, walk_to_wgs: dict[str, list[WorkerGraph]], config_path: str,
+    ) -> None:
+        """Reject a Loop member with an edge to a node outside the Loop in the
+        same worker graph.
+
+        A worker graph counts top-level completions, and that successor
+        completes once per iteration, so the pass ends before the Loop and the
+        successor's later inputs are done, and the pass-end reset drops them.
+        ``Loop.accumulated_outputs`` hands the successor every iteration's
+        output once, when the Loop finishes.
+        """
+        for walk, wgs in walk_to_wgs.items():
+            for wg in wgs:
+                wg_nodes = wg.section.get_nodes()
+                for loop in wg.section.get_loops().values():
+                    members = loop.get_nodes()
+                    for name, node in members.items():
+                        for edge in node.outputs:
+                            if edge.next_node in wg_nodes and edge.next_node not in members:
+                                raise ValueError(
+                                    f"{config_path}: graph walk {walk!r}: node {name!r} of Loop "
+                                    f"{loop.name!r} sends {edge.name!r} to {edge.next_node!r}, "
+                                    "outside the Loop in the same worker graph. The worker graph "
+                                    "would report done before the Loop and its successor finish. "
+                                    "Send it through Loop.accumulated_outputs (every iteration's "
+                                    "output, once the Loop finishes) or Loop.outputs instead."
+                                )
 
     def get_sharding_config(self, config_path: str) -> ShardingConfig:
         with open(config_path, "r") as f:
