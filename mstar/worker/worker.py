@@ -2985,6 +2985,18 @@ class Worker:
         self._set_in_flight_flag(batch, False)
 
 
+    def _wait_for_step(self, batch_N: PendingBatch) -> None:
+        """Wait for batch N's GPU work: its completion event, or the whole
+        device when it has none."""
+        if self.device.type == "cpu":
+            return
+        if batch_N.node_batch.completion_event is not None:
+            with self._span("worker.postprocess.event_sync"):
+                batch_N.node_batch.completion_event.synchronize()
+        else:
+            with self._span("worker.postprocess.device_sync"):
+                torch.accelerator.synchronize(self.device)
+
     def _postprocess_batch(
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
@@ -3038,6 +3050,9 @@ class Worker:
             rid for rid in batch_N.node_batch.request_ids if rid in valid_rids
         ]
         if not valid_rids:
+            # no outputs leave, but the step's kernels may still be running
+            # in the slot a later step reuses
+            self._wait_for_step(batch_N)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
             return
@@ -3071,13 +3086,8 @@ class Worker:
 
         # Wait for batch N's completion event before proceeding
         # TODO: may need to refine this based on how it affects performance?
-        if self.device.type != "cpu" and batch_N.batch.request_to_worker_graph:
-            if batch_N.node_batch.completion_event is not None:
-                with self._span("worker.postprocess.event_sync"):
-                    batch_N.node_batch.completion_event.synchronize()
-            else:
-                with self._span("worker.postprocess.device_sync"):
-                    torch.accelerator.synchronize(self.device)
+        if batch_N.batch.request_to_worker_graph:
+            self._wait_for_step(batch_N)
 
         if self.enable_prof:
             batch_N.node_batch.exec_timings.fwd_end = time.perf_counter()
