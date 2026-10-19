@@ -140,3 +140,4 @@ test/modular/test_mooncake_cuda_hint.py
 test/modular/test_transport_microbench.py
 test/modular/test_dynamo_compose.py
 test/modular/test_rendezvous_store.py
+test/modular/test_mooncake_requirement.py
