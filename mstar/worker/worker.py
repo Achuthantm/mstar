@@ -3138,6 +3138,7 @@ class Worker:
                 graph_walk=batch_N.graph_walk,
                 skip_cuda_sync=True,
                 cpu_tensors=cpu_outputs,
+                ready_event=batch_N.node_batch.completion_event,
             )
         flat_uuids = stored.flat_uuids
         flat_rids = stored.flat_rids
