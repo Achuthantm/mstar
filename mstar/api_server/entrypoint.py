@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
+from mstar.api_server.body_limit import BodyLimitMiddleware
 from mstar.api_server.data_worker import PreprocessWorker
 from mstar.api_server.request_types import APIServerMessage, PreprocessInput, ResultChunk
 from mstar.communication.communicator import CommProtocol, make_communicator
@@ -1315,6 +1316,8 @@ app = FastAPI(
     description="Multimodal Inference API",
     root_path=os.environ.get("MSTAR_ROOT_PATH", ""),
 )
+# Added before CORS so CORS stays outermost and a 413 still carries its headers.
+app.add_middleware(BodyLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

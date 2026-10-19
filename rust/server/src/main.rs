@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use axum::{
     body::{Body, Bytes},
-    extract::{rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
+    extract::{multipart::MultipartError, rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
     http::{header::CONTENT_TYPE, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -133,10 +133,7 @@ async fn main() {
         .unwrap_or(256);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     // Uploads (audio/video multipart) routinely exceed axum's 2 MB default.
-    let body_limit_mb: usize = std::env::var("MSTAR_MAX_BODY_MB")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(128);
+    let body_limit_mb = body_limit_mb();
 
     let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
@@ -248,6 +245,27 @@ fn error_type(status: u16) -> &'static str {
     }
 }
 
+/// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
+/// way (`mstar/api_server/body_limit.py`).
+fn body_limit_mb() -> usize {
+    std::env::var("MSTAR_MAX_BODY_MB")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(128)
+}
+
+/// Status and message for a failed multipart read: 413 naming the limit when
+/// the body passed `MSTAR_MAX_BODY_MB`, as the Python frontend answers, else
+/// 400 with `fallback`.
+fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
+    if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let mb = body_limit_mb();
+        (413, format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"))
+    } else {
+        (400, fallback)
+    }
+}
+
 fn error(status: u16, message: &str, type_: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
@@ -272,6 +290,14 @@ fn detail_error(status: u16, message: &str) -> Response {
 /// Python frontend's validation error. Handlers take
 /// `Result<Json<T>, JsonRejection>` and route the error through here.
 fn json_422(rej: JsonRejection) -> Response {
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let mb = body_limit_mb();
+        return error(
+            413,
+            &format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"),
+            "invalid_request_error",
+        );
+    }
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({"detail": [{
@@ -734,9 +760,10 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return error(
-                400, &format!("malformed multipart body: {e}"),
-                "invalid_request_error"),
+            Err(e) => {
+                let (status, msg) = multipart_failure(&e, format!("malformed multipart body: {e}"));
+                return error(status, &msg, "invalid_request_error");
+            }
         };
         let name = field.name().unwrap_or("").to_string();
         let has_file = field.file_name().is_some();
@@ -747,21 +774,31 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
             image_filename = field.file_name().map(str::to_string);
             match field.bytes().await {
                 Ok(b) => image_bytes = Some(b.to_vec()),
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             }
         } else if name == "prompt" {
             prompt = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             };
         } else if known.contains(&name.as_str()) || has_file {
             if let Err(e) = field.bytes().await {
-                return error(400, &e.to_string(), "invalid_request_error");
+                let (status, msg) = multipart_failure(&e, e.to_string());
+                return error(status, &msg, "invalid_request_error");
             }
         } else {
             let v = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return error(400, &e.to_string(), "invalid_request_error"),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return error(status, &msg, "invalid_request_error");
+                }
             };
             let parsed = serde_json::from_str::<Value>(&v).unwrap_or(Value::String(v));
             extra.insert(name, parsed);
@@ -905,7 +942,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return detail_error(400, &format!("malformed multipart body: {e}")),
+            Err(e) => {
+                let (status, msg) = multipart_failure(&e, format!("malformed multipart body: {e}"));
+                return detail_error(status, &msg);
+            }
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "files" {
@@ -916,7 +956,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             }
             let bytes = match field.bytes().await {
                 Ok(b) => b,
-                Err(e) => return detail_error(400, &e.to_string()),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, e.to_string());
+                    return detail_error(status, &msg);
+                }
             };
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
@@ -945,7 +988,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             // as an empty value.
             let val = match field.text().await {
                 Ok(v) => v,
-                Err(e) => return detail_error(400, &format!("reading form field {name:?}: {e}")),
+                Err(e) => {
+                    let (status, msg) = multipart_failure(&e, format!("reading form field {name:?}: {e}"));
+                    return detail_error(status, &msg);
+                }
             };
             match name.as_str() {
                 "text" => text = Some(val),

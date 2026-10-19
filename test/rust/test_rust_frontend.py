@@ -567,6 +567,39 @@ def _error_of(port, path, body):
 _CHAT = {"messages": [{"role": "user", "content": "hi"}]}
 
 
+def test_body_over_limit_is_413_like_the_python_frontend(monkeypatch):
+    """MSTAR_MAX_BODY_MB: a JSON body and a multipart upload over the limit
+    both get a 413 naming it, as `mstar/api_server/body_limit.py` answers
+    (axum's own rejections were a 422 and a 400)."""
+    monkeypatch.setenv("MSTAR_MAX_BODY_MB", "1")
+    big = b"x" * (2 * 2**20)
+    message = "request body is larger than the 1 MiB limit (MSTAR_MAX_BODY_MB)"
+
+    def post(port, path, data, ctype):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=data, headers={"Content-Type": ctype})
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=30)
+        return e.value.code, json.loads(e.value.read())
+
+    boundary = "----limitboundary"
+
+    def form(name, filename):
+        return (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; "
+                f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode() \
+            + big + f"\r\n--{boundary}--\r\n".encode()
+
+    ctype = f"multipart/form-data; boundary={boundary}"
+    with _model_stack("bagel", _ImageStubAPIServer()) as (port, _up):
+        chat = json.dumps({"model": "bagel", "messages": [{"role": "user", "content": "a" * len(big)}]})
+        code, body = post(port, "/v1/chat/completions", chat.encode(), "application/json")
+        assert code == 413 and body["error"]["message"] == message
+        code, body = post(port, "/v1/images/edits", form("image", "a.png"), ctype)
+        assert code == 413 and body["error"]["message"] == message
+        code, body = post(port, "/generate", form("files", "a.wav"), ctype)
+        assert code == 413 and body["detail"] == message
+
+
 @pytest.mark.parametrize("status,error_type", [(400, "invalid_request_error"), (500, "server_error")])
 @pytest.mark.parametrize("model,path,body", [
     ("qwen3_omni", "/v1/chat/completions", {"model": "qwen3_omni", **_CHAT}),
