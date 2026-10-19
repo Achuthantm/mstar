@@ -11,6 +11,7 @@ request lifecycle against a scripted engine.
 import asyncio
 import base64
 import collections
+import itertools
 import threading
 import time
 from types import SimpleNamespace
@@ -79,6 +80,10 @@ def _api(plan, timeout_seconds=5.0):
     api.pending_requests = {}
     api.recently_completed = collections.OrderedDict()
     api._recently_completed_ttl = 15.0
+    api._live = {}
+    api._client_ids = {}
+    api._id_waiters = set()
+    api._generation = itertools.count(1)
     api.fatal_error = None
     api.timeout_seconds = timeout_seconds
     api.log_stats = False
