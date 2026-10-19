@@ -38,6 +38,7 @@ from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
+from mstar.utils.socket_prefix import per_port_socket_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -1749,8 +1750,9 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--mooncake-port", type=int, default=8080)
     parser.add_argument(
-        "--socket-path-prefix", type=str, default="/tmp/mstar",
-        help="ZMQ IPC socket path prefix (shared with conductor/workers)",
+        "--socket-path-prefix", type=str, default=None,
+        help="ZMQ IPC socket path prefix (shared with conductor/workers); "
+             "default /tmp/mstar_<user>_<port>/",
     )
     parser.add_argument(
         "--upload-dir", type=str, default="/tmp/mstar_uploads",
@@ -1803,6 +1805,8 @@ def main(argv: list[str] | None = None):
              "$PATH, then rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    if args.socket_path_prefix is None:
+        args.socket_path_prefix = per_port_socket_prefix(args.port)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
