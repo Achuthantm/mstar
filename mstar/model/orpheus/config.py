@@ -27,6 +27,7 @@ class OrpheusModelConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 500000.0
     vocab_size: int = 156940
+    tie_word_embeddings: bool = True
     rope_scaling: dict = field(default_factory=lambda: {
         "factor": 32.0,
         "high_freq_factor": 4.0,
