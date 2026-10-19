@@ -135,3 +135,4 @@ test/modular/test_resident_delta.py
 test/modular/test_stream_consumer_final_flag.py
 test/modular/test_worker_speculation_loop_counter.py
 test/modular/test_eval_framework.py
+test/modular/test_mooncake_cuda_hint.py
