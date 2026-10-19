@@ -19,7 +19,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
-from fastapi import FastAPI, WebSocketDisconnect  # noqa: E402
+from fastapi import FastAPI, HTTPException, WebSocketDisconnect  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.openai import adapters, serving_realtime  # noqa: E402
@@ -64,7 +64,13 @@ class _StubAPI:
         return kw["request_id"]
 
     async def collect_results(self, request_id, raw_request=None):
-        return self._chunks.get(request_id, [])
+        # as APIServer.collect_results: a request the data worker failed
+        # raises with the error chunk's status instead of returning chunks
+        chunks = self._chunks.get(request_id, [])
+        for c in chunks:
+            if c.modality == "error":
+                raise HTTPException(int((c.metadata or {}).get("status", 500)), c.data.decode("utf-8", "replace"))
+        return chunks
 
 
 class _ContinuingAdapter(adapters.OpenAIAdapter):
@@ -533,3 +539,158 @@ def test_realtime_is_gated_on_the_adapter(client_and_stub):
     with pytest.raises(Exception):  # noqa: B017 — the server closes with 1008 before any event
         with client.websocket_connect("/v1/realtime") as ws:
             ws.receive_text()
+
+
+@pytest.mark.parametrize("transcription", [
+    {"language": ["en"]},
+    {"language": True},
+    {"language": 7},
+    {"prompt": {"text": "names"}},
+    {"prompt": 5},
+    {"language": "x" * 1_000_000},
+    {"language": "x" * 33},  # one past MAX_LANGUAGE_CHARS
+], ids=["language_list", "language_bool", "language_int", "prompt_object", "prompt_int", "language_1mb",
+        "language_one_past"])
+def test_language_and_prompt_are_validated_on_update(client_and_stub, transcription):
+    client, stub = client_and_stub
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(_update(input_audio_transcription=transcription, mstar={"chunk_seconds": 1.0}))
+        error = json.loads(ws.receive_text())
+        assert error["type"] == "error" and len(error["error"]["message"]) <= 180
+        assert "input_audio_transcription." in error["error"]["message"]
+        # all or nothing: the knobs in the refused update did not apply either
+        ws.send_text(_update())
+        view = json.loads(ws.receive_text())["session"]
+        assert view["input_audio_transcription"]["language"] is None
+        assert view["input_audio_transcription"]["prompt"] == ""
+        assert view["mstar"]["chunk_seconds"] == serving_realtime.DEFAULT_CHUNK_SECONDS
+
+
+def test_language_and_prompt_strings_and_null_are_accepted(client_and_stub):
+    client, stub = client_and_stub
+    language = "x" * 32  # MAX_LANGUAGE_CHARS
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(_update(input_audio_transcription={"language": language, "prompt": "p" * 10_000}))
+        view = json.loads(ws.receive_text())["session"]["input_audio_transcription"]
+        assert view["language"] == language and view["prompt"] == "p" * 10_000
+        ws.send_text(_update(input_audio_transcription={"language": None, "prompt": None}))
+        view = json.loads(ws.receive_text())["session"]["input_audio_transcription"]
+        assert view["language"] is None and view["prompt"] == ""
+
+
+def _failing_steps(stub, message: bytes, status=None):
+    submit = stub.submit_request
+
+    def failing(**kw):
+        rid = submit(**kw)
+        stub._chunks[rid] = [_Chunk("error", message, {"status": status} if status else {})]
+        return rid
+
+    stub.submit_request = failing
+
+
+def _step_failure_records(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith("realtime step failed")]
+
+
+def test_failed_step_quotes_a_bounded_request_error_and_logs_it_once_per_item(client_and_stub, caplog):
+    # a model refusing a value it quotes whole (#318's Qwen3-ASR quotes the
+    # language): a 400 from the engine
+    client, stub = client_and_stub
+    detail = ("preprocessing failed: ValueError: Unsupported language " + repr("x" * 1_000_000)).encode()
+    _failing_steps(stub, detail, status=400)
+    caplog.set_level("INFO", logger=serving_realtime.__name__)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        for _ in range(3):
+            ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+            error = json.loads(ws.receive_text())
+            assert error["type"] == "error" and error["error"]["type"] == "invalid_request_error"
+            message = error["error"]["message"]
+            assert len(message) <= serving_realtime.MAX_ERROR_CHARS
+            assert message.startswith("preprocessing failed: ValueError: Unsupported language 'xxx")
+        assert len(_step_failure_records(caplog)) == 1
+        ws.send_text(json.dumps({"type": "input_audio_buffer.clear"}))
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+        assert json.loads(ws.receive_text())["type"] == "error"
+    # a new item logs its failure again
+    assert len(_step_failure_records(caplog)) == 2
+
+
+def test_failed_step_server_error_is_generic_with_an_error_id(client_and_stub, caplog):
+    client, stub = client_and_stub
+    detail = b"Error in worker: io on /dev/shm/mstar_arena_w0_4242_ab12.seg3: No space left on device"
+    _failing_steps(stub, detail, status=500)
+    caplog.set_level("INFO", logger=serving_realtime.__name__)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+        error = json.loads(ws.receive_text())
+    assert error["error"]["type"] == "server_error"
+    message = error["error"]["message"]
+    assert "/dev/shm" not in message and message.startswith("realtime step failed (error id ")
+    error_id = message.removeprefix("realtime step failed (error id ").rstrip(")")
+    (record,) = _step_failure_records(caplog)
+    assert error_id in record.getMessage() and record.levelname == "ERROR"
+    assert "/dev/shm/mstar_arena_w0_4242_ab12.seg3" in caplog.text
+
+
+def test_request_error_raised_locally_does_not_name_the_upload_dir(client_and_stub, monkeypatch):
+    client, stub = client_and_stub
+    adapter = adapters.ADAPTER_REGISTRY["rt_test"]
+
+    def refuse(req, audio_path, prefix):
+        raise ValueError(f"cannot read {audio_path}")
+
+    monkeypatch.setattr(adapter, "realtime_step_request", refuse)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+        message = json.loads(ws.receive_text())["error"]["message"]
+    assert message.startswith("cannot read <upload>/") and str(stub.upload_dir) not in message
+
+
+@pytest.mark.parametrize("raw, scrubbed", [
+    ("cannot load '/home/alice/My Models/private/config.json'", "cannot load 'config.json'"),
+    ('cannot load "/srv/a b/[c]/x.pt" now', 'cannot load "x.pt" now'),
+    ("cannot load path:/home/alice/private/config.json", "cannot load path:config.json"),
+    ("see https://example.com/a/b and file:/etc/x/y", "see https://example.com/a/b and file:y"),
+])
+def test_scrub_paths_takes_quoted_and_colon_prefixed_paths_whole(raw, scrubbed, tmp_path):
+    assert serving_realtime._scrub_paths(raw, tmp_path) == scrubbed
+
+
+def test_alternating_step_failures_are_each_logged_once_per_item(client_and_stub, caplog):
+    client, stub = client_and_stub
+    details = iter([b"refused: A", b"refused: B"] * 3)
+    submit = stub.submit_request
+
+    def failing(**kw):
+        rid = submit(**kw)
+        stub._chunks[rid] = [_Chunk("error", next(details), {"status": 400})]
+        return rid
+
+    stub.submit_request = failing
+    caplog.set_level("INFO", logger=serving_realtime.__name__)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        for _ in range(6):
+            ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+            assert json.loads(ws.receive_text())["type"] == "error"
+    assert len(_step_failure_records(caplog)) == 2
+
+
+def test_request_error_from_the_engine_keeps_only_base_names_of_server_paths(client_and_stub):
+    client, stub = client_and_stub
+    detail = (b"preprocessing failed: ValueError: cannot decode /tmp/mstar_uploads_alice/3f2a.wav "
+              b"(see /home/alice/.cache/mstar/codec.json); docs at https://example.com/a/b, lang en/US")
+    _failing_steps(stub, detail, status=400)
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2.0)}))
+        message = json.loads(ws.receive_text())["error"]["message"]
+    assert message == ("preprocessing failed: ValueError: cannot decode 3f2a.wav "
+                       "(see codec.json); docs at https://example.com/a/b, lang en/US")

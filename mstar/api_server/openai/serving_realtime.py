@@ -13,8 +13,15 @@ Client events
 
 ``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not
 pass the item cap, and the unfixed counts are non-negative integers; numeric
-strings count as numbers. Any other value is an ``error`` and the update
-changes nothing.
+strings count as numbers. ``language`` and ``prompt`` are strings (or null),
+``language`` at most ``MAX_LANGUAGE_CHARS`` characters. Any other value is an
+``error`` and the update changes nothing.
+
+A failed step is an ``error`` too. A request error (a 4xx from the engine,
+such as a model refusing the language) quotes its message, with server paths
+reduced to their base names and cut to ``MAX_ERROR_CHARS``; any other failure
+says only that the step failed, with an error id that the server log carries
+the details under.
 
 Server events
     ``transcription_session.created`` / ``.updated``
@@ -47,13 +54,14 @@ import itertools
 import json
 import logging
 import math
+import re
 import reprlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, rid
@@ -73,6 +81,10 @@ MIN_CHUNK_SECONDS = 0.5
 MAX_ITEM_SECONDS = 300.0
 # Longest excerpt of a client value quoted in an error.
 EXCERPT_CHARS = 100
+# Longest language a session accepts: a code ("en", "zh-Hant") or a name.
+MAX_LANGUAGE_CHARS = 32
+# Longest message a failed step sends.
+MAX_ERROR_CHARS = 300
 class _ExcerptRepr(reprlib.Repr):
     """``reprlib.Repr`` that reads the first items of a dict or set instead
     of sorting all of them, so the work does not grow with the input."""
@@ -118,6 +130,9 @@ class RealtimeSession:
     raw_hypothesis: str = ""   # the model's raw output for the audio so far
     emitted: str = ""          # clean text already sent as deltas
     item_id: str = field(default_factory=lambda: f"item_{uuid.uuid4().hex[:12]}")
+    # error ids of this item's distinct step failures (at most
+    # MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item
+    failures: tuple[str, dict] = ("", {})
 
     @property
     def chunk_samples(self) -> int:
@@ -170,6 +185,39 @@ def _excerpt(value) -> str:
     """The repr of a client-supplied value, at most ``EXCERPT_CHARS`` long."""
     text = _EXCERPT_REPR.repr(value)
     return text if len(text) <= EXCERPT_CHARS else text[: EXCERPT_CHARS - 3] + "..."
+
+
+# distinct step failures remembered per item; past this each new one is
+# logged, so alternating failures cannot grow the session's memory
+MAX_FAILURES_PER_ITEM = 8
+
+
+def _clip(message: str, limit: int = MAX_ERROR_CHARS) -> str:
+    return message if len(message) <= limit else message[: limit - 3] + "..."
+
+
+# An absolute path with at least one directory, not inside a word; a URL's
+# "//" never matches, so a path right after a ":" is still one.
+_ABS_PATH = re.compile(r"(?<![\w./<>])/(?:[^\s/'\"]+/)+([^\s/'\"]+)")
+# A quoted one, taken whole: its directories may hold spaces.
+_QUOTED_PATH = re.compile(r"(['\"])/(?:[^'\"\n/]*/)+([^'\"\n/]+)\1")
+
+
+def _scrub_paths(message: str, upload_dir) -> str:
+    """``message`` with the upload directory as ``<upload>`` and any other
+    absolute path cut to its base name, so a kept error does not show the
+    server's layout (#592)."""
+    message = _QUOTED_PATH.sub(r"\1\2\1", message.replace(str(upload_dir), "<upload>"))
+    return _ABS_PATH.sub(r"\1", message)
+
+
+class StepError(RuntimeError):
+    """The engine's error for a step, with the HTTP status it carried: a 4xx
+    is the request's fault (a model's ValueError), anything else the server's."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
 
 
 def _object(value, name: str) -> dict:
@@ -260,12 +308,17 @@ async def _run_step(api, adapter, session: RealtimeSession, prefix: str) -> str:
         except asyncio.CancelledError:
             api.release_request(request_id)
             raise
+        except HTTPException as exc:
+            # a request the engine failed: the status says whose fault it was
+            raise StepError(str(exc.detail), exc.status_code) from exc
     finally:
         Path(path).unlink(missing_ok=True)
     text = "".join(c.data.decode("utf-8", "replace") for c in chunks if c.modality == "text")
     errors = [c for c in chunks if c.modality == "error"]
     if errors:
-        raise RuntimeError(errors[0].data.decode("utf-8", "replace"))
+        raise StepError(
+            errors[0].data.decode("utf-8", "replace"), int((errors[0].metadata or {}).get("status") or 500),
+        )
     return prefix + text
 
 
@@ -397,8 +450,17 @@ class RealtimeTranscription:
         unfixed_tokens = _number(knobs, "unfixed_tokens", s.unfixed_tokens, 0, integer=True)
         transcription = _object(session.get("input_audio_transcription"), "input_audio_transcription")
         fields = {k: v for k, v in transcription.items() if k in ("language", "prompt")}
-        if fields:
-            s.request = s.request.model_copy(update=fields)
+        for name, value in fields.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"input_audio_transcription.{name} must be a string; got {_excerpt(value)}")
+        language = fields.get("language")
+        if language is not None and len(language) > MAX_LANGUAGE_CHARS:
+            raise ValueError(
+                f"input_audio_transcription.language must be at most {MAX_LANGUAGE_CHARS} characters; "
+                f"got {_excerpt(language)}"
+            )
+        request = TranscriptionRequest.model_validate({**s.request.model_dump(), **fields}) if fields else s.request
+        s.request = request
         s.chunk_seconds, s.unfixed_chunks, s.unfixed_tokens = chunk_seconds, unfixed_chunks, unfixed_tokens
 
     def current_text(self) -> str:
@@ -417,8 +479,7 @@ class RealtimeTranscription:
         try:
             s.raw_hypothesis = await _run_step(self.api, self.adapter, s, prefix)
         except Exception as exc:  # noqa: BLE001 — report it as an event, keep the session
-            logger.exception("realtime step failed")
-            await self.send(_error(str(exc), kind="server_error"))
+            await self._step_failed(exc)
             return
         # a coalesced step counts every chunk it heard, so the prefix that keeps
         # sent text fixed starts after the same audio as with one step per chunk
@@ -437,6 +498,38 @@ class RealtimeTranscription:
             "mstar.transcription.partial", item_id=s.item_id, text=text, chunk_id=s.chunk_id,
             audio_seconds=sum(a.size for a in s.heard) / SAMPLE_RATE, created=now(),
         ))
+
+    async def _step_failed(self, exc: Exception) -> None:
+        """Report a failed step. A request error (a ValueError or TypeError
+        here, a 4xx from the engine) keeps its message, cut to
+        ``MAX_ERROR_CHARS`` and without server paths; anything else is
+        a generic message with an error id, and the full error is logged under
+        that id. Each distinct failure is logged once per item, not once per
+        step."""
+        s = self.session
+        detail = str(exc)
+        client_error = isinstance(exc, (ValueError, TypeError)) or (
+            isinstance(exc, StepError) and 400 <= exc.status < 500
+        )
+        if s.failures[0] != s.item_id:
+            s.failures = (s.item_id, {})
+        seen = s.failures[1]
+        failure = (type(exc).__name__, detail)
+        error_id = seen.get(failure)
+        if error_id is None:
+            error_id = uuid.uuid4().hex[:12]
+            if len(seen) < MAX_FAILURES_PER_ITEM:
+                seen[failure] = error_id
+            logger.log(
+                logging.INFO if client_error else logging.ERROR,
+                "realtime step failed (error id %s, session %s, %s); repeats in this item are not logged",
+                error_id, s.session_id, s.item_id, exc_info=exc,
+            )
+        if client_error:
+            message = _clip(_scrub_paths(detail, self.api.upload_dir))
+            await self.send(_error(message))
+        else:
+            await self.send(_error(f"realtime step failed (error id {error_id})", kind="server_error"))
 
     async def emit(self, text: str, hold: int) -> None:
         """Send the part of ``text`` past what was already sent, minus the
