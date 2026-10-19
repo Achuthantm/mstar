@@ -32,6 +32,7 @@ from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
+from mstar.model.media_limits import RequestMediaBudget, check_media_limits
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -145,6 +146,7 @@ class PreprocessWorker:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
     ):
+        check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -524,6 +526,7 @@ class PreprocessWorkerThread:
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
         if input.file_paths is not None:
+            budget = RequestMediaBudget(sum(len(paths) for paths in input.file_paths.values()))
             for modality in input.file_paths:
                 key = f"{modality}_inputs"
                 tensors[key] = []
@@ -535,23 +538,24 @@ class PreprocessWorkerThread:
                         # Record the file's state before loading it. If the file changes before it
                         # is hashed, its KV would be keyed by bytes we never decoded.
                         file_states.setdefault(modality, []).append(_file_state(filepath))
-                    # ---- Image ----
-                    if modality == "image":
-                        out = self.model.load_image(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
+                    with budget.file():
+                        # ---- Image ----
+                        if modality == "image":
+                            out = self.model.load_image(filepath, self.device)
+                            tensors[key].append(out.data)
+                            input_metadata[key].append(out.metadata)
 
-                    # ---- Audio ----
-                    elif modality == "audio":
-                        out = self.model.load_audio(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
+                        # ---- Audio ----
+                        elif modality == "audio":
+                            out = self.model.load_audio(filepath, self.device)
+                            tensors[key].append(out.data)
+                            input_metadata[key].append(out.metadata)
 
-                    # ---- Video ----
-                    elif modality == "video":
-                        out = self.model.load_video(filepath, self.device)
-                        tensors[key].append(out.data)
-                        input_metadata[key].append(out.metadata)
+                        # ---- Video ----
+                        elif modality == "video":
+                            out = self.model.load_video(filepath, self.device)
+                            tensors[key].append(out.data)
+                            input_metadata[key].append(out.metadata)
 
 
         # Then, tokenize the prompt and let the model augment/transform the

@@ -27,6 +27,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
     top_level_entities,
 )
+from mstar.model.media_limits import VideoBudget, read_image
 from mstar.model.multimodal import PromptPart
 
 DECODE = "decode"
@@ -750,10 +751,8 @@ class Model(ABC):
         pass
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
-        import torchvision
-
-        img = torchvision.io.decode_image(filepath).to(device)  # uint8 CxHxW
-        img = img.float() / 255.0
+        img = read_image(filepath).to(device)  # uint8 CxHxW
+        img = img.float().div_(255.0)
 
         return TensorAndMetadata(img)
 
@@ -768,7 +767,14 @@ class Model(ABC):
         from torchcodec.decoders import VideoDecoder
 
         decoder = VideoDecoder(filepath, device=device)
-        video = torch.stack([frame for frame in decoder]).float() / 255.0
+        budget = VideoBudget()
+        frames = []
+        for frame in decoder:
+            budget.add(*frame.shape[-2:])
+            frames.append(frame)
+        video = torch.stack(frames)
+        del frames
+        video = video.float().div_(255.0)
         return TensorAndMetadata(data=video, metadata=video_metadata_dict(decoder.metadata))
 
     @abstractmethod
