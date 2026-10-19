@@ -34,6 +34,9 @@ pub struct AppState {
     /// Total per-request budget (mstar's `timeout_seconds`, default 600 s):
     /// exceeded => a terminal error + an abort to the conductor.
     pub request_timeout: Duration,
+    /// Largest `n` one `/v1/images/generations` request may ask for
+    /// (`MSTAR_MAX_IMAGES_PER_REQUEST`, default 10).
+    pub max_images_per_request: i64,
     /// Loaded when `MSTAR_TOKENIZER` points at a tokenizer.json — enables the
     /// frontend-tokenizes fast path (tokenize + incremental detok in Rust, off
     /// the GIL) for flagged adapters and `/generate?tokenize=true`.

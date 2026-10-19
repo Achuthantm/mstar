@@ -376,7 +376,7 @@ class _ImageStubAPIServer(_StubAPIServer):
 
 
 @contextlib.contextmanager
-def _model_stack(model, stub):
+def _model_stack(model, stub, env=None):
     """Launch the real mstar-server for `model` wired to `stub`."""
     import os
     import subprocess
@@ -385,7 +385,7 @@ def _model_stack(model, stub):
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_ms_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_msup_")
     proc = subprocess.Popen(
-        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ))
+        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **(env or {})))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
@@ -727,3 +727,32 @@ def test_a_duplicate_of_a_running_id_gets_a_409_and_the_running_one_completes(st
     assert [json.loads(line)["modality"] for line in lines if line.strip()] == ["text"] * 400
     assert stub.n == 1 and stub.refused == 0, "the duplicate reached the backend"
     assert stub.aborted == []
+
+
+def _image_n_error(port, n):
+    return _error_of(port, "/v1/images/generations", {"model": "cosmos3", "prompt": "x", "n": n})
+
+
+def test_images_n_outside_one_to_the_cap_is_400_before_submit():
+    """`n` below 1 or above the cap (default 10) is the Python frontend's 400,
+    and nothing reaches the backend; `n` at the cap still returns that many."""
+    stub = _ImageStubAPIServer()
+    with _model_stack("cosmos3", stub) as (port, _up):
+        for n in (0, -1, 11):
+            assert _image_n_error(port, n) == {
+                "message": f"n must be between 1 and 10, got {n}",
+                "type": "invalid_request_error", "code": 400}
+        assert not stub.submitted
+        out = _post_json(port, "/v1/images/generations",
+                         {"model": "cosmos3", "prompt": "x", "n": 10})
+        assert len(out["data"]) == 10 and len(stub.submitted) == 10
+
+
+def test_images_n_cap_follows_the_env():
+    stub = _ImageStubAPIServer()
+    with _model_stack("cosmos3", stub, env={"MSTAR_MAX_IMAGES_PER_REQUEST": "2"}) as (port, _up):
+        assert _image_n_error(port, 3)["message"] == "n must be between 1 and 2, got 3"
+        assert not stub.submitted
+        out = _post_json(port, "/v1/images/generations",
+                         {"model": "cosmos3", "prompt": "x", "n": 2})
+        assert len(out["data"]) == 2

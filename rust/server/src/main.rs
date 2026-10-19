@@ -85,6 +85,9 @@ async fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(600),
     );
+    // Same variable and default as serving_images.max_images_per_request.
+    let max_images_per_request =
+        parse_max_images(std::env::var("MSTAR_MAX_IMAGES_PER_REQUEST").ok().as_deref());
 
     let bridge = socket_dir.map(|dir| {
         eprintln!("bridging to conductor at {dir}");
@@ -110,6 +113,7 @@ async fn main() {
         allow_remote,
         sample_rate,
         request_timeout,
+        max_images_per_request,
         tok,
         bridge,
     };
@@ -638,7 +642,10 @@ async fn images_generations(
     // matching serving_images.create_images. Seeded requests follow the seed
     // contract — image i uses seed + i (i > 0), so image 0 is bit-identical to
     // the same request with n=1; unseeded requests draw independent seeds.
-    let n = req.n.unwrap_or(1).max(1);
+    let n = match image_count(req.n, st.max_images_per_request) {
+        Ok(n) => n,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
     let seed = base.model_kwargs.get("seed").and_then(Value::as_i64);
     let futs = (0..n).map(|i| {
         let mut args = base.clone();
@@ -659,6 +666,29 @@ async fn images_generations(
         }
     }
     Json(images_response(all)).into_response()
+}
+
+/// The request's `n`, 1 when omitted; outside `1..=limit` the 400 message,
+/// matching serving_images.image_count.
+/// `MSTAR_MAX_IMAGES_PER_REQUEST` as Python's `max_images_per_request` reads
+/// it: an ASCII integer, surrounding whitespace allowed, at least 1; anything
+/// else is the default 10.
+fn parse_max_images(raw: Option<&str>) -> i64 {
+    raw.map(str::trim)
+        .filter(|s| {
+            let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|s| s.parse::<i64>().ok())
+        .map_or(10, |n| n.max(1))
+}
+
+fn image_count(n: Option<i64>, limit: i64) -> Result<i64, String> {
+    match n {
+        None => Ok(1),
+        Some(n) if (1..=limit).contains(&n) => Ok(n),
+        Some(n) => Err(format!("n must be between 1 and {limit}, got {n}")),
+    }
 }
 
 // ---- POST /v1/videos/generations (Cosmos3) -------------------------------
@@ -1059,4 +1089,34 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
     .to_string();
     s.push('\n');
     s.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_count_refuses_n_outside_one_to_limit() {
+        assert_eq!(image_count(None, 10), Ok(1));
+        assert_eq!(image_count(Some(1), 10), Ok(1));
+        assert_eq!(image_count(Some(10), 10), Ok(10));
+        for n in [0, -1, 11, i64::MAX] {
+            assert_eq!(
+                image_count(Some(n), 10),
+                Err(format!("n must be between 1 and 10, got {n}"))
+            );
+        }
+        assert_eq!(image_count(Some(3), 2), Err("n must be between 1 and 2, got 3".to_string()));
+    }
+
+    #[test]
+    fn max_images_parses_as_python_does() {
+        for (raw, cap) in [
+            (None, 10), (Some("2"), 2), (Some(" 2 "), 2), (Some("2\n"), 2), (Some("+3"), 3),
+            (Some("0"), 1), (Some("-1"), 1), (Some(""), 10), (Some("abc"), 10), (Some("2_0"), 10),
+            (Some("1.5"), 10), (Some("\u{ff12}"), 10),
+        ] {
+            assert_eq!(parse_max_images(raw), cap, "{raw:?}");
+        }
+    }
 }

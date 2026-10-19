@@ -126,3 +126,4 @@ test/modular/test_dropped_row_stream_stop.py
 test/distributed/test_fanout_shapes.py
 test/modular/test_empty_tensor_transport.py
 test/modular/test_orpheus_snac_stream.py
+test/modular/test_images_n_cap.py
