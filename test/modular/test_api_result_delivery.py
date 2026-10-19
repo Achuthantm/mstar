@@ -9,13 +9,14 @@ success.
 """
 
 import asyncio
-import collections
 import queue
 import threading
 import time
 
+from api_server_helpers import make_test_api_server
+
 from mstar.api_server.data_worker import PreprocessWorkerThread
-from mstar.api_server.entrypoint import APIServer, PendingRequest
+from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -160,18 +161,7 @@ def _pending_request():
 
 
 def _api_server_stub(preprocess_worker):
-    server = object.__new__(APIServer)
-    server.recently_completed = collections.OrderedDict()
-    server._recently_completed_ttl = 15.0
-    server.pending_requests = {}
-    server.preprocess_worker = preprocess_worker
-    server.log_stats = False
-    server.request_lock = threading.Lock()
-    server.timeout_seconds = 5.0
-    server.enable_nvtx = False
-    server._live = {}
-    server._client_ids = {}
-    return server
+    return make_test_api_server(preprocess_worker=preprocess_worker)
 
 
 def _register(server, rid, req):

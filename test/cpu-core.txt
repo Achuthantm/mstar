@@ -37,6 +37,7 @@ test/modular/test_ingest_unpersist.py
 test/modular/test_api_result_delivery.py
 test/modular/test_api_completion_guard.py
 test/modular/test_images_n_release.py
+test/modular/test_api_server_helpers.py
 test/modular/test_speech_chunking.py
 test/modular/test_openai_realtime.py
 test/modular/test_speculation_external_inputs.py

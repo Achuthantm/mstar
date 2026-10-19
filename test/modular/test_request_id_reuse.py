@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import itertools
 import json
 import queue
 import threading
@@ -29,13 +28,14 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from api_server_helpers import make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
 
 from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
-from mstar.api_server.entrypoint import APIServer, request_id_in_use
+from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -109,21 +109,7 @@ class _TensorManager:
 
 
 def _api_server(preprocess_worker):
-    s = APIServer.__new__(APIServer)
-    s.request_lock = threading.Lock()
-    s.fatal_error = None
-    s.pending_requests = {}
-    s.recently_completed = {}
-    s._recently_completed_ttl = 15.0
-    s._live = {}
-    s._client_ids = {}
-    s._id_waiters = set()
-    s._generation = itertools.count(1)
-    s.timeout_seconds = 5
-    s.log_stats = False
-    s.enable_nvtx = False
-    s.preprocess_worker = preprocess_worker
-    return s
+    return make_test_api_server(preprocess_worker=preprocess_worker)
 
 
 class _Rig:

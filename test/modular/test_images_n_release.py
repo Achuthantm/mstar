@@ -10,16 +10,13 @@ request lifecycle against a scripted engine.
 
 import asyncio
 import base64
-import collections
-import itertools
-import threading
 import time
 from types import SimpleNamespace
 
 import pytest
+from api_server_helpers import make_test_api_server
 from fastapi import HTTPException
 
-from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai.serving_images import create_images
 from mstar.api_server.request_types import ResultChunk
 
@@ -75,20 +72,7 @@ class _ScriptedEngine:
 
 
 def _api(plan, timeout_seconds=5.0):
-    api = object.__new__(APIServer)
-    api.request_lock = threading.Lock()
-    api.pending_requests = {}
-    api.recently_completed = collections.OrderedDict()
-    api._recently_completed_ttl = 15.0
-    api._live = {}
-    api._client_ids = {}
-    api._id_waiters = set()
-    api._generation = itertools.count(1)
-    api.fatal_error = None
-    api.timeout_seconds = timeout_seconds
-    api.log_stats = False
-    api.enable_nvtx = False
-    api.upload_dir = "/tmp"
+    api = make_test_api_server(timeout_seconds=timeout_seconds)
     engine = _ScriptedEngine(api, plan)
     api.preprocess_worker = engine
     return api, engine

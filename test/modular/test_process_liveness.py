@@ -7,7 +7,6 @@ waiting client gets a 503 naming the dead process instead of sitting out the
 request timeout, new requests are refused, and the processes exit non-zero.
 """
 
-import collections
 import os
 import queue
 import signal
@@ -17,9 +16,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from api_server_helpers import make_test_api_server
 from fastapi import HTTPException
 
-from mstar.api_server.entrypoint import APIServer, DeadConductorError, PendingRequest
+from mstar.api_server.entrypoint import DeadConductorError, PendingRequest
 from mstar.api_server.request_types import APIServerMessage
 from mstar.conductor.conductor import (
     Conductor,
@@ -323,19 +323,13 @@ def _pending_request():
 
 
 def _api_server(conductor_proc, inbox=()):
-    server = object.__new__(APIServer)
-    server.pending_requests = {}
-    server.recently_completed = collections.OrderedDict()
-    server._recently_completed_ttl = 15.0
-    server.request_lock = threading.Lock()
-    server.running = True
-    server.conductor_proc = conductor_proc
-    server.fatal_error = None
-    server.on_fatal = None
-    server._liveness_interval_s = 0.0
-    server.communicator = SimpleNamespace(get_all_new_messages=_inbox(inbox))
-    server.preprocess_worker = SimpleNamespace(
-        get_profile_updates=lambda: [], get_result_chunks=lambda: []
+    server = make_test_api_server(
+        conductor_proc=conductor_proc,
+        _liveness_interval_s=0.0,
+        communicator=SimpleNamespace(get_all_new_messages=_inbox(inbox)),
+        preprocess_worker=SimpleNamespace(
+            get_profile_updates=lambda: [], get_result_chunks=lambda: []
+        ),
     )
     server.started = []
     server._msg_thread = SimpleNamespace(start=lambda: server.started.append(True))

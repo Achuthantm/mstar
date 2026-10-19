@@ -342,6 +342,27 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
         )
 
+        self._init_request_state()
+
+        # ZMQ channel shared with conductor / workers
+        self.communicator = make_communicator(
+            my_id="api_server",
+            push_ids=["conductor"],
+            ipc_socket_path_prefix=socket_path_prefix,
+        )
+
+        # Background thread that drains results from the conductor. Started by
+        # finalize_setup() once the workers report ready — before that there's
+        # no traffic to drain and the HTTP server isn't up yet.
+        self._msg_thread = threading.Thread(
+            target=self._process_messages, daemon=True
+        )
+
+    def _init_request_state(self) -> None:
+        """Set the in-memory request bookkeeping. It must stay free of
+        processes, sockets and files: tests that skip ``__init__`` call it to
+        get every one of these fields (see test/modular/api_server_helpers.py).
+        """
         # Concurrent request tracking, keyed by each submission's internal key
         # (see submit_request), which is what the engine knows the request by.
         self.pending_requests: dict[str, PendingRequest] = {}
@@ -369,20 +390,6 @@ class APIServer:
         self.fatal_error: str | None = None
         self.on_fatal: Callable[[], None] | None = None
         self._liveness_interval_s = 0.5
-
-        # ZMQ channel shared with conductor / workers
-        self.communicator = make_communicator(
-            my_id="api_server",
-            push_ids=["conductor"],
-            ipc_socket_path_prefix=socket_path_prefix,
-        )
-
-        # Background thread that drains results from the conductor. Started by
-        # finalize_setup() once the workers report ready — before that there's
-        # no traffic to drain and the HTTP server isn't up yet.
-        self._msg_thread = threading.Thread(
-            target=self._process_messages, daemon=True
-        )
 
     def finalize_setup(self) -> None:
         """Block until the conductor signals that every worker has finished
