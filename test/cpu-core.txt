@@ -32,6 +32,7 @@ test/modular/test_accelerator_graph_capture.py
 test/modular/test_binary_framing.py
 test/modular/test_video_frame_protocol.py
 test/modular/test_client_sdk.py
+test/modular/test_api_key.py
 test/modular/test_request_failure_propagation.py
 test/modular/test_ingest_unpersist.py
 test/modular/test_api_result_delivery.py
