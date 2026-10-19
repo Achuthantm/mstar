@@ -157,3 +157,4 @@ test/modular/test_cosmos3_graph_switch.py
 test/modular/test_pi05_model.py
 test/modular/test_media_decode_limits.py
 test/modular/test_image_load_rgb.py
+test/modular/test_request_media_totals.py

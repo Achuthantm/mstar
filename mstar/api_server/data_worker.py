@@ -32,7 +32,13 @@ from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.model.base import Model, PrefixStream, ProcessPromptOutput, Span
-from mstar.model.media_limits import RequestMediaBudget, check_media_limits
+from mstar.model.media_limits import (
+    RequestMediaBudget,
+    charge_decoded_audio,
+    check_audio_duration,
+    check_file_counts,
+    check_media_limits,
+)
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -526,7 +532,9 @@ class PreprocessWorkerThread:
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
         if input.file_paths is not None:
-            budget = RequestMediaBudget(sum(len(paths) for paths in input.file_paths.values()))
+            counts = {modality: len(paths) for modality, paths in input.file_paths.items()}
+            check_file_counts(counts, self.model.max_input_files())
+            budget = RequestMediaBudget(sum(counts.values()))
             for modality in input.file_paths:
                 key = f"{modality}_inputs"
                 tensors[key] = []
@@ -547,7 +555,9 @@ class PreprocessWorkerThread:
 
                         # ---- Audio ----
                         elif modality == "audio":
+                            check_audio_duration(filepath)
                             out = self.model.load_audio(filepath, self.device)
+                            charge_decoded_audio(out.data, out.metadata["sample_rate"])
                             tensors[key].append(out.data)
                             input_metadata[key].append(out.metadata)
 

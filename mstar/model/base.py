@@ -750,6 +750,13 @@ class Model(ABC):
         """
         pass
 
+    def max_input_files(self) -> dict[str, int]:
+        """Most files of each input modality one request may attach, e.g.
+        ``{"audio": 1}``. The data worker refuses a request over it before
+        decoding any file; a modality left out is held only to
+        ``MSTAR_MAX_MEDIA_FILES``."""
+        return {}
+
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         # RGB whatever the file holds: image processors cannot place the
         # channel axis of a 4-channel (RGBA or CMYK) image.
