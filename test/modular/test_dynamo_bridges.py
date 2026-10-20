@@ -5,6 +5,7 @@ aren't installed."""
 
 import asyncio
 import base64
+import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -282,6 +283,60 @@ def test_realtime_full_turn(tmp_path):
     assert server.aborted  # release runs even on clean completion
 
 
+def _committed_pcm(server) -> list[bytes]:
+    out = []
+    for sub in server.submitted:
+        with wave.open(sub["file_paths"]["audio"][0], "rb") as wf:
+            out.append(wf.readframes(wf.getnframes()))
+    return out
+
+
+def _append(raw: bytes) -> dict:
+    return {"type": "input_audio_buffer.append", "audio": base64.b64encode(raw).decode("ascii")}
+
+
+def test_realtime_joins_samples_split_across_appends(tmp_path):
+    """Odd-length appends (a byte stream forwarded as it is read) are joined,
+    not dropped; a commit takes whole samples and the byte of a sample split
+    across it starts the next turn."""
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    tone = (np.sin(np.arange(4800) * 0.05) * 8000).astype("<i2").tobytes()
+    first, second = tone[:4800], tone[4800:]
+    events = [{"type": "session.update", "session": {"type": "realtime", "model": "q3o"}}]
+    events += [_append(first[:-1][i:i + 1001]) for i in range(0, len(first) - 1, 1001)]
+    events += [_append(first[-1:] + second[:1]), {"type": "input_audio_buffer.commit"}]
+    events += [_append(second[1:]), {"type": "input_audio_buffer.commit"}]
+    out = _run_connection(server, events)
+    assert [e["type"] for e in out].count("input_audio_buffer.committed") == 2
+    assert "error" not in [e["type"] for e in out]
+    assert _committed_pcm(server) == [first, second]
+
+
+def test_realtime_malformed_append_is_a_client_error(tmp_path):
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
+        {"type": "input_audio_buffer.append", "audio": "%%%"},
+        _append(PCM),
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert out[1]["type"] == "error" and out[1]["error"]["code"] == "invalid_audio"
+    assert _committed_pcm(server) == [PCM]
+
+
+def test_realtime_line_wrapped_base64_is_accepted(tmp_path):
+    """``base64.encodebytes`` wraps lines every 76 characters, as main accepted."""
+    server = _FakeRealtimeServer([_chunk("text", b"ok")], tmp_path)
+    tone = (np.sin(np.arange(1600) * 0.05) * 8000).astype("<i2").tobytes()
+    out = _run_connection(server, [
+        {"type": "session.update", "session": {"type": "realtime", "model": "q3o"}},
+        {"type": "input_audio_buffer.append", "audio": base64.encodebytes(tone).decode("ascii")},
+        {"type": "input_audio_buffer.commit"},
+    ])
+    assert "error" not in [e["type"] for e in out]
+    assert _committed_pcm(server) == [tone]
+
+
 def test_realtime_empty_commit_errors(tmp_path):
     server = _FakeRealtimeServer([], tmp_path)
     out = _run_connection(server, [
@@ -329,9 +384,9 @@ def test_realtime_bad_input_is_survivable(tmp_path):
             "type": "realtime", "model": "q3o",
             "audio": {"input": {"format": {"type": "audio/pcmu"}}},
         }},
-        # Odd-length payload: dropped, so the buffer stays empty.
+        # Half a sample: nothing whole to commit yet.
         {"type": "input_audio_buffer.append",
-         "audio": base64.b64encode(b"\x00\x10\x20").decode("ascii")},
+         "audio": base64.b64encode(b"\x00").decode("ascii")},
         {"type": "input_audio_buffer.commit"},
     ])
     types = [e["type"] for e in out]

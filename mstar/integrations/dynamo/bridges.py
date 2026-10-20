@@ -507,20 +507,19 @@ def _event_id() -> str:
 
 
 def _decode_pcm16_b64(audio_b64) -> bytes | None:
-    """Base64 PCM16 append payload -> raw bytes; None when empty or malformed.
+    """Base64 PCM16 append payload -> raw bytes; None when malformed.
 
-    PCM16 is 2-byte aligned; a bad frame is dropped rather than tearing down
-    the whole session.
+    The length may be odd: a sample split across two appends is joined in
+    the session's byte buffer, and a commit takes whole samples only.
     """
-    if not audio_b64 or not isinstance(audio_b64, str):
+    if not isinstance(audio_b64, str):
         return None
     try:
-        raw = base64.b64decode(audio_b64)
-    except Exception:  # noqa: BLE001 — drop the malformed chunk, keep the session
+        # whitespace is allowed (base64.encodebytes wraps lines), as on the API
+        # server; translate stays linear where split() would build a list
+        return base64.b64decode(audio_b64.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
+    except Exception:  # noqa: BLE001 — refuse the malformed chunk, keep the session
         return None
-    if not raw or len(raw) % 2:
-        return None
-    return raw
 
 
 def _drain(queue: asyncio.Queue) -> None:
@@ -795,25 +794,31 @@ class RealtimeBridge:
                     elif etype == "input_audio_buffer.append":
                         raw = _decode_pcm16_b64(event.get("audio", ""))
                         if raw is None:
-                            logger.warning("realtime: dropping malformed audio append")
+                            out_stream.put_nowait(self._error(
+                                "audio is not base64",
+                                etype="invalid_request_error",
+                                code="invalid_audio"))
                         else:
                             pcm.extend(raw)
                     elif etype == "input_audio_buffer.commit":
-                        if not pcm:
+                        # whole samples only: an odd trailing byte waits for
+                        # the rest of its sample in the next append
+                        whole = len(pcm) - len(pcm) % 2
+                        if not whole:
                             out_stream.put_nowait(self._error(
                                 "input audio buffer is empty",
                                 etype="invalid_request_error",
                                 code="input_audio_buffer_commit_empty"))
                             continue
                         try:
-                            args = self._utterance_args(session, bytes(pcm))
+                            args = self._utterance_args(session, bytes(pcm[:whole]))
                         except Exception as exc:  # noqa: BLE001 — keep the session usable
                             logger.exception("realtime: building the utterance request failed")
                             out_stream.put_nowait(self._error(
                                 str(exc), etype="invalid_request_error"))
-                            pcm = bytearray()
+                            pcm = pcm[whole:]
                             continue
-                        pcm = bytearray()
+                        pcm = pcm[whole:]
                         await slots.acquire()
                         turn = _RealtimeTurn()
                         turns.append(turn)

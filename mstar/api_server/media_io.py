@@ -499,8 +499,11 @@ def split_windows(
 
 
 def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
-    """Float waveform -> 16-bit PCM WAV file at ``path``."""
-    pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    """Float waveform -> 16-bit PCM WAV file at ``path``. The inverse of
+    reading PCM16 as ``int16 / 32768``, so 16-bit audio comes back sample for
+    sample."""
+    scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
+    pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
     Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 

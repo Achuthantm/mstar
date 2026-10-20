@@ -133,6 +133,9 @@ class RealtimeSession:
     # error ids of this item's distinct step failures (at most
     # MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item
     failures: tuple[str, dict] = ("", {})
+    # the first byte of a sample whose second byte is in the next append;
+    # kept across commit (the byte stream goes on), dropped by clear
+    odd_byte: bytes = b""
 
     @property
     def chunk_samples(self) -> int:
@@ -174,11 +177,17 @@ class RealtimeSession:
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
 
-def pcm16_to_float(payload: str) -> np.ndarray:
-    """Base64 PCM16 (little-endian, mono) -> float32 in [-1, 1). Strict
-    decoding: a malformed payload is an error, not silence."""
-    raw = base64.b64decode(payload, validate=True)
-    return np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype="<i2").astype(np.float32) / 32768.0
+def pcm16_to_float(payload: str, carry: bytes = b"") -> tuple[np.ndarray, bytes]:
+    """Base64 PCM16 (little-endian, mono) -> (float32 in [-1, 1), the odd
+    trailing byte). ``carry`` is the previous append's odd byte, so a sample
+    split across two appends is joined instead of shifting every sample after
+    it. Strict decoding: a malformed payload is an error, not silence."""
+    # whitespace is allowed (base64.encodebytes wraps lines); anything else
+    # outside the alphabet is an error. translate stays linear in the payload
+    # where split() would build a list of its pieces
+    raw = carry + base64.b64decode(payload.encode("ascii").translate(None, b" \t\n\r\v\f"), validate=True)
+    whole = len(raw) - len(raw) % 2
+    return np.frombuffer(raw[:whole], dtype="<i2").astype(np.float32) / 32768.0, raw[whole:]
 
 
 def _excerpt(value) -> str:
@@ -403,18 +412,19 @@ class RealtimeTranscription:
                 return
             await self.send(_event("transcription_session.updated", session=self._session_view()))
         elif kind == "input_audio_buffer.append":
+            s = self.session
             try:
-                audio = pcm16_to_float(event.get("audio") or "")
+                audio, odd_byte = pcm16_to_float(event.get("audio") or "", s.odd_byte)
             except Exception:  # noqa: BLE001 — bad base64
                 await self.send(_error("audio is not base64"))
                 return
-            s = self.session
             if s.item_samples() + audio.size > s.max_item_seconds * SAMPLE_RATE:
                 await self.send(_error(
                     f"the item would pass {s.max_item_seconds:g} s of audio; "
                     "commit or clear the input audio buffer first",
                 ))
                 return
+            s.odd_byte = odd_byte
             s.append(audio)
             if (chunk := s.take_chunk()) is not None:
                 await self.step(chunk)
@@ -433,6 +443,7 @@ class RealtimeTranscription:
             self.session.clear()
         elif kind == "input_audio_buffer.clear":
             self.session.clear()
+            self.session.odd_byte = b""
             await self.send(_event("input_audio_buffer.cleared"))
         else:
             await self.send(_error(f"unknown event {_excerpt(kind)}"))
