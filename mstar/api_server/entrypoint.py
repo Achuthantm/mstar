@@ -1608,6 +1608,11 @@ async def generate(
     if api_server is None:
         raise HTTPException(status_code=503, detail="Server not ready")
 
+    # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
+    # HTML checkbox) instead of its declared default, for Optional[bool] too.
+    if "streaming" not in await request.form():
+        streaming = True
+
     out_mods = [m.strip() for m in output_modalities.split(",") if m.strip()]
     streaming_only = STREAMING_ONLY_MODALITIES.intersection(out_mods)
     if streaming_only and not streaming:
