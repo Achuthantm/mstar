@@ -257,8 +257,8 @@ class RequestData:
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
     partition_definitions: dict[str, PartitionDefinition] = field(default_factory=dict)
 
-    # Per-streaming-connection state (keyed by "from_partition->to_partition")
-    streaming_connections: dict[str, StreamingConnectionState] = field(default_factory=dict)
+    # Per-streaming-connection state, keyed by (from_partition, to_partition, edge_name)
+    streaming_connections: dict[tuple[str, str, str], StreamingConnectionState] = field(default_factory=dict)
 
     # for api server recv bookeeping
     final_outputs: dict[str, NestedLoopIndices] = field(default_factory=dict)
@@ -776,7 +776,9 @@ class Conductor:
         per dest, which the consumer's fan-in path consolidates.
         """
         inputs_per_worker: dict[str, list[GraphEdge]] = defaultdict(list)
-        for edge in inputs:
+        # fanned-out edge -> (input, index) of each descriptor, for the rejoin
+        positions: dict[int, list[tuple[int, int]]] = {}
+        for e_idx, edge in enumerate(inputs):
             if not edge.tensor_info:
                 # Signal-only — broadcast to every dest worker.
                 dest_workers = sharding_config.node_to_worker.get(
@@ -786,18 +788,18 @@ class Conductor:
                     inputs_per_worker[dest_worker].append(edge.clone())
                 continue
 
-            groups: dict[tuple, list[TensorPointerInfo]] = defaultdict(list)
-            for info in edge.tensor_info:
+            groups: dict[tuple, list[int]] = defaultdict(list)
+            for i, info in enumerate(edge.tensor_info):
                 key = (
                     info.source_tp_rank,
                     info._source_node_name,
                     info._source_graph_walk,
                 )
-                groups[key].append(info)
+                groups[key].append(i)
 
-            for (src_rank, src_node, src_walk), infos in groups.items():
+            for (src_rank, src_node, src_walk), idxs in groups.items():
                 sub_edge = edge.clone()
-                sub_edge.tensor_info = infos
+                sub_edge.tensor_info = [edge.tensor_info[i] for i in idxs]
                 fanout = sharding_config.fanout_graph_edges(
                     sub_edge,
                     source_node=src_node,
@@ -806,6 +808,8 @@ class Conductor:
                     source_tp_rank=src_rank,
                 )
                 for dest_worker, sliced_edge in fanout.items():
+                    # fan-out keeps one descriptor per input descriptor, in order
+                    positions[id(sliced_edge)] = [(e_idx, i) for i in idxs]
                     inputs_per_worker[dest_worker].append(sliced_edge)
         # The split above yields one edge per (rank, node, walk), so a name
         # produced across walks arrives as several. The consumer would take the
@@ -815,6 +819,7 @@ class Conductor:
         for dest_worker, edges in inputs_per_worker.items():
             merged: list[GraphEdge] = []
             first_by_key: dict[tuple[str, str, int], GraphEdge] = {}
+            joined: dict[int, list[tuple[int, int]]] = {}
             for edge in edges:
                 if not edge.tensor_info:
                     merged.append(edge)  # signal-only, nothing to join
@@ -832,9 +837,20 @@ class Conductor:
                         f"fan-in ({first._total_fanin} vs {edge._total_fanin})"
                     )
                     first.tensor_info = first.tensor_info + edge.tensor_info
+                    joined.setdefault(id(first), list(positions[id(first)])).extend(
+                        positions[id(edge)]
+                    )
                     continue
                 first_by_key[key] = edge
                 merged.append(edge)
+            for edge in merged:
+                order = joined.get(id(edge))
+                if order is not None:
+                    edge.tensor_info = [
+                        info for _, info in sorted(
+                            zip(order, edge.tensor_info, strict=True), key=lambda p: p[0],
+                        )
+                    ]
             inputs_per_worker[dest_worker] = merged
         return inputs_per_worker
 
@@ -1013,9 +1029,10 @@ class Conductor:
             )
 
         # Build per-connection streaming state
-        streaming_connections: dict[str, StreamingConnectionState] = {}
+        streaming_connections: dict[tuple[str, str, str], StreamingConnectionState] = {}
         for conn in topology.connections:
-            key = f"{conn.from_partition}->{conn.to_partition}"
+            # a tuple: names may hold ":" or "->" ("C:x" + "y" vs "C" + "x:y")
+            key = (conn.from_partition, conn.to_partition, conn.edge_name)
             streaming_connections[key] = StreamingConnectionState(
                 from_partition=conn.from_partition,
                 to_partition=conn.to_partition,
@@ -1554,11 +1571,15 @@ class Conductor:
 
         if fwd_args.request_done:
             pstate.is_done = True
-            # Signal producer_done to all outgoing connections
+            # Signal producer_done to all outgoing connections, once per
+            # consumer partition however many edges lead there
+            consumers: set[str] = set()
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
-                    self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
+                    if conn.to_partition not in consumers:
+                        consumers.add(conn.to_partition)
+                        self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
         elif fwd_args.inputs:
             # Partition has inputs to send — conductor-driven
             self._send_partition_inputs(request_id, partition_name, fwd_args)
