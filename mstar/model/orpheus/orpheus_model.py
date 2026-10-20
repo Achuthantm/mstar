@@ -291,8 +291,11 @@ class OrpheusModel(Model):
         **kwargs,
     ) -> NameToTensorList:
         # Orpheus is text-only; raw multimodal tensors are unused.
-        if prompt is None:
-            return {}
+        # Refused here, where it is a 400 before admission: the LLM's prefill
+        # has no input without text, and blank text would generate from the voice
+        # prefix alone.
+        if prompt is None or not prompt.strip():
+            raise ValueError("Orpheus requires a non-empty text prompt")
 
         # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)
