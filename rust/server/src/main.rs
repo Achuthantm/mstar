@@ -30,6 +30,7 @@ mod auth;
 mod bridge;
 mod media;
 mod protocol;
+mod refusals;
 mod serving;
 mod tokenizer;
 
@@ -112,6 +113,7 @@ async fn main() {
         Arc::new(t)
     });
 
+    let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
         model_name: model_name.clone(),
         upload_dir,
@@ -121,6 +123,7 @@ async fn main() {
         max_images_per_request,
         tok,
         bridge,
+        refusals: refusals.clone(),
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration.
@@ -156,6 +159,8 @@ async fn main() {
     // The key check sits inside CORS: CORS answers browser preflights (which
     // carry no credentials) and still stamps its headers on a 401. It is
     // outside admission, so an unauthenticated request never takes a permit.
+    // The refusal counter sits between the two, so it sees the 401 and not
+    // the preflights.
     let app = Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics))
@@ -166,6 +171,7 @@ async fn main() {
             api_key,
             auth::require_api_key,
         ))
+        .layer(axum::middleware::from_fn_with_state(refusals, refusals::count_refusals))
         .layer(cors)
         .with_state(state);
 
@@ -226,14 +232,16 @@ async fn admission(
     let permit = match permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            return (
+            let mut resp = (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error": {
                     "message": "server saturated: too many concurrent requests",
                     "type": "overloaded_error"
                 }})),
             )
-                .into_response()
+                .into_response();
+            resp.extensions_mut().insert(refusals::CapRefusal);
+            return resp;
         }
     };
     // Hold the permit until the RESPONSE BODY is fully sent, not just until
@@ -428,6 +436,8 @@ async fn health(State(st): State<AppState>) -> Response {
 
 /// Prometheus metrics: the text the API server renders from its one
 /// registry, asked over the bridge, so both frontends serve the same names.
+/// The request carries this frontend's refusal counts, which the API server
+/// exports as `mstar_http_refusals_total`.
 /// 404 when the server runs without `--enable-metrics` (and in mock mode,
 /// which has no registry), with the Python route's body; 503 when the bridge
 /// does not answer.
@@ -436,7 +446,7 @@ async fn metrics(State(st): State<AppState>) -> Response {
     let Some(bridge) = &st.bridge else {
         return off();
     };
-    let Some(reply) = bridge.metrics(BRIDGE_PROBE_TIMEOUT).await else {
+    let Some(reply) = bridge.metrics(&st.refusals.snapshot(), BRIDGE_PROBE_TIMEOUT).await else {
         return detail_error(503, "backend bridge unreachable");
     };
     match reply.metadata.get("content_type").and_then(Value::as_str) {
@@ -1200,6 +1210,7 @@ mod tests {
             max_images_per_request: 10,
             tok: None,
             bridge,
+            refusals: Arc::new(refusals::Refusals::default()),
         }
     }
 
@@ -1208,6 +1219,8 @@ mod tests {
     struct FakeBackend {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        /// Every `metrics` request it answered.
+        asked: Arc<std::sync::Mutex<Vec<Value>>>,
     }
 
     impl FakeBackend {
@@ -1224,6 +1237,8 @@ mod tests {
             let peer = RawZmqCommunicator::bind("bridge", dir).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stopping = stop.clone();
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asking = asked.clone();
             let thread = std::thread::spawn(move || {
                 while !stopping.load(Ordering::Relaxed) {
                     let Some(frame) = peer.recv_timeout(std::time::Duration::from_millis(20)) else {
@@ -1233,6 +1248,7 @@ mod tests {
                     if msg["t"] != "metrics" {
                         continue;
                     }
+                    asking.lock().unwrap().push(msg.clone());
                     let reply = Reply {
                         t: "metrics",
                         rid: msg["rid"].as_str().unwrap(),
@@ -1243,7 +1259,7 @@ mod tests {
                     peer.send("frontend", &rmp_serde::to_vec_named(&reply).unwrap()).unwrap();
                 }
             });
-            Self { stop, thread: Some(thread) }
+            Self { stop, thread: Some(thread), asked }
         }
     }
 
@@ -1285,6 +1301,28 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(ct.as_deref(), Some(content_type));
         assert_eq!(data, text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_ask_the_backend_with_this_frontend_s_refusal_counts() {
+        let dir = socket_dir();
+        let backend = FakeBackend::start(&dir, b"", json!({"content_type": "text/plain"}));
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+        let st = state(Some(bridge));
+        st.refusals.count("/generate", 409);
+        st.refusals.count("unmatched", 404);
+        st.refusals.count("/generate", 409);
+
+        assert_eq!(body(metrics(State(st.clone())).await).await.0, StatusCode::OK);
+        st.refusals.count("/generate", 409);
+        assert_eq!(body(metrics(State(st)).await).await.0, StatusCode::OK);
+
+        let asked: Vec<Value> = backend.asked.lock().unwrap().iter().map(|m| m["refusals"].clone()).collect();
+        assert_eq!(asked, [
+            json!({"route": ["/generate", "unmatched"], "status": [409, 404], "count": [2, 1]}),
+            json!({"route": ["/generate", "unmatched"], "status": [409, 404], "count": [3, 1]}),
+        ]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

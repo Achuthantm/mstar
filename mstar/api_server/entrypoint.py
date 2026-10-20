@@ -40,7 +40,13 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
-from mstar.observability.metrics import INSTALL_HINT, MISSING_DEPENDENCY, ServingMetrics
+from mstar.observability.metrics import (
+    INSTALL_HINT,
+    MISSING_DEPENDENCY,
+    RefusalMiddleware,
+    ServingMetrics,
+    mark_submitted,
+)
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
@@ -567,6 +573,8 @@ class APIServer:
                 ),
                 request_id=request_id,
             )
+        if self.metrics is not None:
+            mark_submitted()
 
         self.preprocess_worker.new_request(PreprocessInput(
             request_id=key,
@@ -1394,6 +1402,14 @@ app.add_middleware(BodyLimitMiddleware)
 # is read.
 api_key_guard = APIKeyGuard(resolve_api_key())
 app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
+# Outside the key check and the body limit, which refuse before routing, and
+# inside CORS, so a browser preflight is not counted. ``routes`` must list
+# every included router's routes (test_serving_metrics checks each route).
+app.add_middleware(
+    RefusalMiddleware,
+    metrics=lambda: getattr(api_server, "metrics", None),
+    routes=lambda: (*app.router.routes, *openai_router.routes),
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

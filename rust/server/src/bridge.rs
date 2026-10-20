@@ -16,15 +16,18 @@
 //!       input_modalities, output_modalities, model_kwargs, prompt_parts,
 //!       streaming}, `prompt_parts` present for a chat only
 //!                        | {t:"abort", rid, sub}
-//!                        | {t:"ping" | "metrics", rid, sub}
+//!                        | {t:"ping", rid, sub}
+//!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
 //!
-//! A `metrics` reply carries the API server's rendered Prometheus text in
-//! `data` and its `content_type` in `metadata`; `metadata` has no
-//! `content_type` when the server runs without `--enable-metrics`.
+//! A `metrics` request carries this frontend's cumulative refusal counts
+//! (`refusals.rs`) as three parallel lists, for the API server to export. Its
+//! reply carries the API server's rendered Prometheus text in `data` and its
+//! `content_type` in `metadata`; `metadata` has no `content_type` when the
+//! server runs without `--enable-metrics`.
 //!
 //! `sub` names one submission and is never reused; `rid` is the client's id,
 //! which a client may reuse as soon as it drops a stream (that stream's `done`
@@ -44,6 +47,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::adapters::{Part, SubmitArgs};
+use crate::refusals::Snapshot;
 
 /// One chunk of generated output, matching mstar's `ResultChunk`.
 #[derive(Debug, Clone)]
@@ -91,6 +95,16 @@ struct SubmitMsg<'a> {
 
 fn no_parts(parts: &&[Part]) -> bool {
     parts.is_empty()
+}
+
+/// A `ping` or `metrics` request; only `metrics` carries `refusals`.
+#[derive(Serialize)]
+struct ProbeMsg<'a> {
+    t: &'a str,
+    rid: &'a str,
+    sub: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusals: Option<&'a Snapshot>,
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -297,12 +311,17 @@ impl Bridge {
     /// Send `{t}` to the bridge loop and wait for its one reply (routed like
     /// a completed request). None on timeout: the bridge loop or the backend
     /// behind it is gone.
-    async fn round_trip(&self, t: &str, timeout: Duration) -> Option<StreamItem> {
+    async fn round_trip(
+        &self,
+        t: &str,
+        refusals: Option<&Snapshot>,
+        timeout: Duration,
+    ) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = serde_json::json!({"t": t, "rid": rid, "sub": sub});
+        let msg = ProbeMsg { t, rid: &rid, sub, refusals };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -314,13 +333,14 @@ impl Bridge {
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
     /// wait for the backend's pong. False on timeout.
     pub async fn ping(&self, timeout: Duration) -> bool {
-        self.round_trip("ping", timeout).await.is_some()
+        self.round_trip("ping", None, timeout).await.is_some()
     }
 
-    /// The API server's `/metrics` reply: the rendered text in `data` and,
-    /// when metrics are on, its `content_type` in `metadata`. None on timeout.
-    pub async fn metrics(&self, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("metrics", timeout).await? {
+    /// The API server's `/metrics` reply, asked with this frontend's refusal
+    /// counts: the rendered text in `data` and, when metrics are on, its
+    /// `content_type` in `metadata`. None on timeout.
+    pub async fn metrics(&self, refusals: &Snapshot, timeout: Duration) -> Option<ResultChunk> {
+        match self.round_trip("metrics", Some(refusals), timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
@@ -540,6 +560,23 @@ mod tests {
         assert_eq!(chunk.data, reply.data);
         assert_eq!(chunk.metadata, reply.metadata);
         assert!(routes.lock().unwrap().routes.is_empty(), "the reply left its route behind");
+    }
+
+    #[test]
+    fn only_a_metrics_request_carries_the_refusal_counts() {
+        let encode = |msg: &ProbeMsg| -> Value {
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(msg).unwrap()).unwrap()
+        };
+        let snap = Snapshot { route: vec!["/generate".into()], status: vec![401], count: vec![3] };
+        assert_eq!(
+            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap) }),
+            json!({"t": "metrics", "rid": "m", "sub": 4,
+                   "refusals": {"route": ["/generate"], "status": [401], "count": [3]}})
+        );
+        assert_eq!(
+            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None }),
+            json!({"t": "ping", "rid": "p", "sub": 5})
+        );
     }
 
     #[test]

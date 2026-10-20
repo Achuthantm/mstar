@@ -294,11 +294,157 @@ def test_the_rust_bridge_answers_metrics_with_what_the_python_route_serves(serve
 
 
 def test_the_rust_bridge_answers_metrics_off_when_they_are_off(tmp_path):
-    """Empty metadata is how ``mstar-server`` knows to answer 404."""
+    """Empty metadata is how ``mstar-server`` knows to answer 404; the
+    frontend's refusal counts are ignored then."""
     sent = []
+    refusals = {"route": ["/generate"], "status": [401], "count": [2]}
     _serve_bridge(make_test_api_server(upload_dir=tmp_path),
-                  [[{"t": "metrics", "rid": "metrics-a", "sub": 5}]], sent)
+                  [[{"t": "metrics", "rid": "metrics-a", "sub": 5, "refusals": refusals}]], sent)
     assert sent == [{"t": "metrics", "rid": "metrics-a", "sub": 5, "data": b"", "metadata": {}}]
+
+
+def _refusals(samples) -> dict:
+    return {(dict(k[1])["route"], dict(k[1])["status"]): v
+            for k, v in samples.items() if k[0] == "mstar_http_refusals_total"}
+
+
+def test_the_rust_bridge_exports_the_frontend_s_refusal_counts(served):
+    """``mstar-server`` sends its cumulative counts with each scrape; they
+    come back in the registry's text, and a count from an older scrape that
+    crossed a newer one never lowers it."""
+    sent = []
+    _serve_bridge(served.server, [
+        [{"t": "metrics", "rid": "metrics-a", "sub": 2, "refusals": {
+            "route": ["/generate", "unmatched"], "status": [401, 404], "count": [3, 1]}}],
+        [{"t": "metrics", "rid": "metrics-b", "sub": 3, "refusals": {
+            "route": ["/generate", "/generate"], "status": [401, 409], "count": [2, 1]}}],
+    ], sent)
+
+    first, second = (_refusals(_parse(m["data"].decode())) for m in sent)
+    assert first == {("/generate", "401"): 3, ("unmatched", "404"): 1}
+    assert second == {("/generate", "401"): 3, ("/generate", "409"): 1, ("unmatched", "404"): 1}
+    assert _refusals(served.scrape()) == second
+
+
+_KEY = {"Authorization": "Bearer s3cret-key"}
+_CHAT = {"model": "dummy", "messages": [{"role": "user", "content": "hi"}]}
+
+
+@pytest.fixture
+def refusing(served, monkeypatch):
+    """The served app with an API key and a 1 MiB body limit."""
+    from mstar.api_server import auth
+
+    monkeypatch.setenv("MSTAR_MAX_BODY_MB", "1")
+    # BodyLimitMiddleware reads the limit when the stack is built.
+    monkeypatch.setattr(entrypoint.app, "middleware_stack", entrypoint.app.build_middleware_stack())
+    entrypoint.api_key_guard.set("s3cret-key")
+    yield TestClient(entrypoint.app)
+    entrypoint.api_key_guard.set(auth.resolve_api_key())
+
+
+def _chunked(total: int):
+    for _ in range(total // 2**16):
+        yield b"x" * 2**16
+
+
+def _in_flight_id(served, client):
+    served.server.submit_request(text="x", request_id="X", streaming=False, **TEXT)
+    return client.post("/generate", data={"text": "hi", "request_id": "X"}, headers=_KEY)
+
+
+@pytest.mark.parametrize("send,status,route", [
+    (lambda s, c: c.post("/generate", data={"text": "hi"}), 401, "/generate"),
+    (lambda s, c: c.post("/no/such/route"), 401, "unmatched"),
+    # Declared Content-Length: refused before routing; chunked: while the route reads it.
+    (lambda s, c: c.post("/v1/chat/completions", content=b"x" * 2**21,
+                         headers={**_KEY, "content-type": "application/json"}), 413, "/v1/chat/completions"),
+    (lambda s, c: c.post("/generate", content=_chunked(2**21),
+                         headers={**_KEY, "content-type": "multipart/form-data; boundary=b"}), 413, "/generate"),
+    (lambda s, c: c.post("/v1/chat/completions", json={"messages": "hi"}, headers=_KEY), 422, "/v1/chat/completions"),
+    (lambda s, c: c.post("/generate", data={"text": "hi", "model_kwargs": "{"}, headers=_KEY), 400, "/generate"),
+    (_in_flight_id, 409, "/generate"),
+    (lambda s, c: c.get("/no/such/route", headers=_KEY), 404, "unmatched"),
+    # The served model has no OpenAI adapter.
+    (lambda s, c: c.post("/v1/chat/completions", json=_CHAT, headers=_KEY), 404, "/v1/chat/completions"),
+    (lambda s, c: c.get("/generate", headers=_KEY), 405, "/generate"),
+], ids=["401", "401-unmatched", "413-declared", "413-chunked", "422", "400", "409", "404-unmatched",
+        "404-no-adapter", "405"])
+def test_a_request_refused_before_the_api_server_counts_by_route_template_and_status(
+        served, refusing, send, status, route):
+    assert send(served, refusing).status_code == status
+    assert _refusals(served.scrape()) == {(route, str(status)): 1}
+    assert len(served.data_worker.inputs) == (1 if status == 409 else 0)
+
+
+def test_every_route_keeps_its_template_when_refused_before_routing(served, refusing):
+    """The API key refuses before the router picks a route; the refusal still
+    carries the route's template, for every route the app serves (a router
+    included later must also be listed in ``RefusalMiddleware``'s routes)."""
+    from mstar.api_server.auth import UNAUTHENTICATED_PATHS
+
+    paths = {path: next(iter(ops)) for path, ops in entrypoint.app.openapi()["paths"].items()
+             if path not in UNAUTHENTICATED_PATHS}
+    assert {"/generate", "/v1/chat/completions", "/v1/images/edits"} <= set(paths)
+    for path, method in paths.items():
+        assert refusing.request(method, path).status_code == 401, path
+    assert _refusals(served.scrape()) == {(path, "401"): 1 for path in paths}
+
+
+def test_a_request_the_engine_fails_is_not_a_refusal_but_one_refused_first_is(served, refusing):
+    """Both answer 400. The submitted one is counted once, as an error in
+    ``mstar_requests_total``; only the other is a refusal."""
+
+    async def run():
+        transport = httpx.ASGITransport(app=entrypoint.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test", headers=_KEY) as client:
+            pending = asyncio.create_task(client.post("/generate", data={"text": "hi", "streaming": "false"}))
+            while not served.data_worker.inputs:
+                await asyncio.sleep(0.005)
+            served.fail(served.key(), status=400)
+            failed = await pending
+            refused = await client.post("/generate", data={"text": "hi", "model_kwargs": "[1]"})
+            return failed, refused
+
+    failed, refused = asyncio.run(run())
+
+    assert (failed.status_code, refused.status_code) == (400, 400)
+    samples = served.scrape()
+    assert _refusals(samples) == {("/generate", "400"): 1}
+    assert _count(samples, "error") == 1
+
+
+def test_a_served_request_is_not_a_refusal(served):
+    async def run():
+        transport = httpx.ASGITransport(app=entrypoint.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            pending = asyncio.create_task(client.post("/generate", data={"text": "hi", "streaming": "false"}))
+            while not served.data_worker.inputs:
+                await asyncio.sleep(0.005)
+            served.answer(served.key())
+            return await pending
+
+    assert asyncio.run(run()).status_code == 200
+    samples = served.scrape()
+    assert "mstar_http_refusals_total" in TestClient(entrypoint.app).get("/metrics").text
+    assert _refusals(samples) == {}
+    assert _count(samples, "success") == 1
+
+
+def test_refusals_count_from_when_metrics_are_turned_on(monkeypatch):
+    from mstar.api_server import auth
+
+    server = make_test_api_server(preprocess_worker=_DataWorker())
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    client = TestClient(entrypoint.app)
+    entrypoint.api_key_guard.set("s3cret-key")
+    try:
+        assert client.post("/generate", data={"text": "hi"}).status_code == 401
+        server.enable_metrics()
+        assert client.post("/generate", data={"text": "hi"}).status_code == 401
+    finally:
+        entrypoint.api_key_guard.set(auth.resolve_api_key())
+    assert _refusals(_parse(client.get("/metrics").text)) == {("/generate", "401"): 1}
 
 
 def _engine_fails(served):

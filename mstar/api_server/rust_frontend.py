@@ -10,15 +10,19 @@ protocol are untouched):
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
                           prompt_parts, streaming} | {t:"abort", rid, sub}
-                       | {t:"ping", rid, sub} | {t:"metrics", rid, sub}
+                       | {t:"ping", rid, sub}
+                       | {t:"metrics", rid, sub, refusals:{route, status, count}}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
 
-A ``metrics`` reply is what ``GET /metrics`` serves on the Python frontend:
-the text rendered from ``APIServer.metrics`` with its ``content_type`` in
-``metadata``, or empty ``metadata`` when metrics are off (a 404).
+A ``metrics`` request carries the frontend's cumulative refusal counts as
+three parallel lists (route template, status, count), which the API server
+exports as ``mstar_http_refusals_total``. The reply is what ``GET /metrics``
+serves on the Python frontend: the text rendered from ``APIServer.metrics``
+with its ``content_type`` in ``metadata``, or empty ``metadata`` when metrics
+are off (a 404; the counts are then ignored).
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -207,6 +211,10 @@ class RustFrontendBridge:
         reply = {"t": "metrics", "rid": msg["rid"], "sub": msg.get("sub"),
                  "data": b"", "metadata": {}}
         if metrics is not None:
+            refusals = msg.get("refusals")
+            if refusals is not None:
+                metrics.refusals.update_rust(
+                    refusals["route"], refusals["status"], refusals["count"])
             reply["data"] = metrics.render()
             reply["metadata"] = {"content_type": metrics.content_type}
         self._send(reply)
