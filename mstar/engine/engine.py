@@ -1657,6 +1657,28 @@ class Engine:
                     rid, batch.node_name, batch.step_context.graph_walk,
                 )
                 batch.register_failure(rid, error)
+        if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
+            live = [
+                (rid, node_inputs)
+                for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True)
+                if rid not in batch.failed_requests
+            ]
+            if not live:
+                return
+            rids = [rid for rid, _ in live]
+            try:
+                submodule.batch_postprocess(
+                    outputs,
+                    {rid: batch.per_request_info_wrapped[rid] for rid in rids},
+                    [node_inputs for _, node_inputs in live],
+                )
+            except Exception as error:
+                logger.exception(
+                    "batch_postprocess failed for requests %s (node=%s, walk=%s)",
+                    rids, batch.node_name, batch.step_context.graph_walk,
+                )
+                for rid in rids:
+                    batch.register_failure(rid, error)
 
     def exec_and_postprocess(
         self, batch: ExecutingBatch
@@ -1676,7 +1698,6 @@ class Engine:
                 self.postprocess_batch(batch, outputs)
             else:
                 submodule = self._submodules[batch.node_name].submodule
-                # no submodule overrides it as of now
                 if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
                     submodule.batch_postprocess(
                         outputs, batch.per_request_info_wrapped, batch.inputs,

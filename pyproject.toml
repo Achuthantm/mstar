@@ -91,6 +91,13 @@ eval = [
     "transformers",
 ]
 
+# Optional: the opt-in AudioSeal watermark on generated speech
+# (``audio_watermark`` in a deployment's model_kwargs; MIT code and weights).
+# 0.3 may change the streaming layers mstar.model.audio_watermark drives.
+audioseal = [
+    "audioseal>=0.2,<0.3",
+]
+
 # Optional: serve a deployment as a NVIDIA Dynamo backend
 # (python -m mstar.integrations.dynamo). Nothing outside
 # mstar/integrations/dynamo/ imports these.
@@ -370,6 +377,7 @@ all = [
     "misaki>=0.9.4",
     "spacy>=3.8",
     "num2words",
+    "audioseal>=0.2,<0.3",  # see the audioseal extra
     # omnivoice is intentionally omitted for the same reason as flash-attn: it
     # has to come from git, which PyPI will not accept in requires_dist.
     # See docs/installation.rst.
