@@ -232,6 +232,8 @@ def _judge_session(ck: dict, f: dict) -> tuple[str, str]:
     """(verdict, detail) of one session's facts against the (already widened) check."""
     if "missing" in f:   # head alone produced nothing where base did: a failure, not a gap
         return ("FAIL" if f["missing"] == ["head"] else "incomplete"), f"outputs missing ({', '.join(f['missing'])})"
+    if f.get("unexercised"):   # base never reached the state the case is about: nothing was tested
+        return "incomplete", f"not exercised on {f['unexercised']}"
     if f.get("only_base"):
         return "FAIL", f"head lacks {len(f['only_base'])} outputs base returned ({', '.join(f['only_base'][:3])})"
     if f.get("head_undecodable"):
@@ -474,11 +476,35 @@ class _Arms:
                     out[arm] = float(case.get("cap_s") or 0)
         return out
 
+    def health(self, case_id: str) -> dict[str, dict[str, str]]:
+        """Per arm, the worker health findings after this case in any session (``arm.health_after``), by kind."""
+        out: dict[str, dict[str, str]] = {"base": {}, "head": {}}
+        for arm in ("base", "head"):
+            for p in sorted((self.md / arm).glob("s*/startup.json")):
+                case = _read(p, {}, {}).get("cases", {}).get(case_id) or {}
+                for x in case.get("health") or []:
+                    out[arm].setdefault(_finding_kind(x), x)
+        return out
+
     def files(self, case_id: str) -> dict[str, list[Path]]:
         """Each arm's results files for a case; a file that is not a complete mstar-eval result (a client that died
         while writing it) does not count, so its point shows up as missing."""
         return {arm: [f for f in sorted((self.md / arm).glob(f"s*/{case_id}/*-c*.json")) if _complete(f)]
                 for arm in ("base", "head")}
+
+
+def _finding_kind(finding: str) -> str:
+    """``/dev/shm +3 entries`` -> ``/dev/shm leak``: findings compare by kind, not count."""
+    if finding.startswith("/dev/shm"):
+        return "/dev/shm leak"
+    if finding.endswith("server process(es) exited"):
+        return "server process exited"
+    if finding.endswith("server did not start"):
+        return "server did not start"
+    return finding
+
+
+CRASH_KINDS = ("server process exited", "log: segfault", "server did not start")
 
 
 def _complete(f: Path) -> bool:
@@ -584,6 +610,19 @@ def _row(a: _Arms, m: Model, c: Case, status: dict, gpu: str, calibration: dict)
         elif hung["head"] is not None:
             corr, detail = "FAIL", (f"head hung: still running after the {hung['head']:.0f} s case cap; base finished "
                                     "(stacks in head/s*/" + c.id + "/stacks.txt)")
+        health = a.health(c.id)
+        head_only = [health["head"][k] for k in health["head"] if k not in health["base"]]
+        base_crash = [health["base"][k] for k in CRASH_KINDS if k in health["base"]]
+        if m.health and any(alive["base"] is False for alive in a.alive_after(c.id).values()):
+            base_crash = base_crash or ["server stopped answering"]
+        if base_crash and hung["base"] is None:   # nothing to judge head against, timings included
+            corr, detail = "base broken", f"base worker crashed: {', '.join(base_crash)}; {detail}"
+            for p in (lat, thru, *extra):
+                if p:
+                    p.verdict = "n/a"
+        elif head_only and corr != "base broken" and hung["head"] is None:
+            seen = ", ".join(health["base"].values()) or "none"
+            corr, detail = "FAIL", f"head worker health: {', '.join(head_only)} (base: {seen}); {detail}"
     with_data = [p for p in (lat, thru) if p and p.base.mean is not None and p.head.mean is not None]
     rp = scrub((a.compare.get(c.id) or [None])[0]) if c.driver in ("rp", "invariants") else None
     note, detail = _public(note), _public(detail)   # reasons can quote server errors: no paths or addresses

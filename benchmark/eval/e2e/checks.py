@@ -177,6 +177,11 @@ def rp_facts(a: Path, b: Path) -> dict:
     ja, jb = _rp(a), _rp(b)
     if ja is None or jb is None:
         return {"missing": [arm for arm, j in (("base", ja), ("head", jb)) if j is None]}
+    # A cancel case whose request was never cancelled tested nothing: on base for any reason, on head only when its
+    # request simply finished first (``_completed``); a head error instead is a changed outcome, judged below.
+    for arm, j in (("base", ja), ("head", jb)):
+        if j.get("_unexercised") and (arm == "base" or j.get("_completed")):
+            return {"unexercised": f"{arm}: {j['_unexercised']}"}
     diffs = []
     keys = sorted(k for k in set(ja) | set(jb) if not k.startswith("_"))
     for k in keys:
