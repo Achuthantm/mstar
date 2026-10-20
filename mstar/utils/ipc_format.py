@@ -287,8 +287,8 @@ class FailRequests(MessageBody):
 @dataclass
 class WorkerStatus(MessageBody):
     """A worker's engine metrics, sent once per status interval only while
-    metrics are on: cumulative or current values per graph node, never
-    per-request data."""
+    metrics are on: cumulative or current values per graph node or tensor
+    edge, never per-request data."""
     worker_id: str
     metrics: list[MetricSnapshot]
 

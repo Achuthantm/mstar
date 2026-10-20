@@ -666,16 +666,21 @@ class Worker:
                 model.get_graph_walk_graphs(),
             )
 
-        # Metrics on: record the steps of the nodes this rank leads, and send
-        # the conductor a WorkerStatus every status interval.
-        if status_interval_s is not None and self.parallel_leader_nodes:
-            self._metrics = WorkerMetrics(
-                worker_id, status_interval_s, frozenset(self.parallel_leader_nodes),
-                self.engine_manager.engine, self.scheduler,
-                send=lambda status: self.communicator.send("conductor", ConductorMessage(
-                    message_type=ConductorMessageType.WORKER_STATUS, body=status,
-                )),
-            )
+        if status_interval_s is not None:
+            self._metrics = self._start_metrics(status_interval_s)
+
+    def _start_metrics(self, interval_s: float) -> WorkerMetrics:
+        """Metrics on: record the steps of the nodes this rank leads and the
+        tensors every rank reads, and send the conductor a WorkerStatus every
+        ``interval_s``."""
+        return WorkerMetrics(
+            self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
+            self.engine_manager.engine, self.scheduler,
+            send=lambda status: self.communicator.send("conductor", ConductorMessage(
+                message_type=ConductorMessageType.WORKER_STATUS, body=status,
+            )),
+            transfers=self.tensor_manager.enable_transfer_metrics(),
+        )
 
     @staticmethod
     def _build_innermost_loop_cache(

@@ -1901,8 +1901,9 @@ class Conductor:
         states.set(("draining",), len(self.draining))
         for node, count in in_flight.items():
             self._in_flight_gauge.set((node,), count)
-        # Summed across workers: a node's replicas each report their own; the
-        # other ranks of a lockstep instance report nothing.
+        # Summed across workers: a node's replicas each report their own; for
+        # the engine families the other ranks of a lockstep instance report
+        # nothing, while every rank counts the tensor transfers it reads.
         by_family: dict[str, list[MetricSnapshot]] = {}
         for snapshots in self._worker_metrics.values():
             for snap in snapshots:

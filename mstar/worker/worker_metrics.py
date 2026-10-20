@@ -1,13 +1,15 @@
 """The engine worker's metrics, built only while metrics are on.
 
 Steps are recorded on the main thread as they finish (two histogram bumps, no
-per-request work). Everything else is sampled at most once per status
+per-request work), and the tensor manager records each edge it reads
+(``EdgeTransfers``). Everything else is sampled at most once per status
 interval, when the worker sends the conductor one ``WorkerStatus`` with
 cumulative snapshots; the conductor forwards them to the API server.
 
-Only nodes this rank leads are reported (``components``): the other ranks of a
-lockstep instance run the same steps over the same page counts, and recording
-never changes what any rank runs.
+Engine families cover only the nodes this rank leads (``components``): the
+other ranks of a lockstep instance run the same steps over the same page
+counts. Transfers are every rank's own reads (each reads its slice).
+Recording never changes what any rank runs.
 """
 
 from __future__ import annotations
@@ -18,7 +20,13 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from mstar.observability import catalog
-from mstar.observability.recorders import Counter, Gauge, Histogram, MetricSnapshot
+from mstar.observability.recorders import (
+    Counter,
+    EdgeTransfers,
+    Gauge,
+    Histogram,
+    MetricSnapshot,
+)
 from mstar.utils.ipc_format import WorkerStatus
 
 if TYPE_CHECKING:
@@ -38,6 +46,8 @@ class WorkerMetrics:
         engine: Engine,
         scheduler: MicroScheduler,
         send: Callable[[WorkerStatus], None],
+        *,
+        transfers: EdgeTransfers,
     ):
         self.worker_id = worker_id
         self.components = components
@@ -46,6 +56,7 @@ class WorkerMetrics:
         self._report_failed = False
         self._scheduler = scheduler
         self._send = send
+        self._transfers = transfers
         # (resource key, its reported nodes, cache); a cache only follower
         # nodes use is left to their lead rank
         self._kv = [
@@ -115,12 +126,13 @@ class WorkerMetrics:
             # the caches keep cumulative totals, so these are set, not added
             self._prefix_query.set((node,), queried)
             self._prefix_hit.set((node,), hit)
-        pending = self._scheduler.pending_rows()
+        # a rank leading no node reports only its transfers
+        pending = self._scheduler.pending_rows() if self.components else {}
         for node in self.components:
             self._pending.set((node,), pending.get(node, 0))
         return [
             self._kv_used.snapshot(), self._kv_total.snapshot(), self._kv_cached.snapshot(),
             self._step_seconds.snapshot(), self._batch_size.snapshot(),
             self._prefix_query.snapshot(), self._prefix_hit.snapshot(),
-            self._pending.snapshot(),
+            self._pending.snapshot(), *self._transfers.snapshot(),
         ]

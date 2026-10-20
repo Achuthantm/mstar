@@ -39,6 +39,8 @@ from mstar.model.media_limits import (
     check_file_counts,
     check_media_limits,
 )
+from mstar.observability.catalog import STATUS_INTERVAL_S
+from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.utils import profiler
 from mstar.utils.ipc_format import (
@@ -381,6 +383,11 @@ class PreprocessWorker:
         """
         return self.tensor_manager.get_rx_info(request_id)
 
+    def enable_transfer_metrics(self) -> EdgeTransfers:
+        """Count the tensors this data worker reads (the request's results)
+        from now on; the API server exports the thread's published counts."""
+        return self.tensor_manager.enable_transfer_metrics()
+
     def cleanup_request(self, request_id: str):
         self.cleanup_request_queue.put(request_id)
         self._signal()
@@ -427,6 +434,10 @@ class RequestOutputState:
 
 
 class PreprocessWorkerThread:
+    # next time the thread publishes its transfer counts; class-level so a
+    # thread built without __init__ has one
+    _next_transfer_publish = 0.0
+
     def __init__(
         self,
         in_queue: queue.Queue, # for preprocessing
@@ -1231,6 +1242,15 @@ class PreprocessWorkerThread:
             self._finish_reading(*self.reads_done_queue.get())
         return did_work
 
+    def _publish_transfers(self, transfers: EdgeTransfers) -> None:
+        """Hand the API server this thread's transfer counts (``latest``) once
+        per status interval, from the thread that records them."""
+        now = time.perf_counter()
+        if now < self._next_transfer_publish:
+            return
+        self._next_transfer_publish = now + STATUS_INTERVAL_S
+        transfers.publish()
+
     def _idle_wait(self):
         """How a pass that found nothing waits: on the communicator's poll,
         ended by a message, a producer's signal or a finished read, with
@@ -1330,6 +1350,10 @@ class PreprocessWorkerThread:
             except Exception:
                 logger.exception("PreprocessWorkerThread error")
 
+            # getattr: tests drive this loop with stand-in tensor managers
+            transfers = getattr(self.tensor_manager, "transfer_stats", None)
+            if transfers is not None:
+                self._publish_transfers(transfers)
             if not did_work:
                 idle_wait()
 

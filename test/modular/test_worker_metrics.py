@@ -34,7 +34,7 @@ from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
-from mstar.observability.recorders import MetricSnapshot  # noqa: E402
+from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, WorkerStatus  # noqa: E402
 from mstar.worker import worker_metrics  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
@@ -122,7 +122,7 @@ def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None) -> WorkerM
         scheduler = SimpleNamespace(pending_rows=lambda: {})
     return WorkerMetrics(
         "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler,
-        send=(sent if sent is not None else []).append,
+        send=(sent if sent is not None else []).append, transfers=EdgeTransfers("SHM"),
     )
 
 
@@ -338,7 +338,8 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
 
     w._handle_main_loop_error = fail_loudly
     w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
-                               SimpleNamespace(pending_rows=dict), send=sent.append)
+                               SimpleNamespace(pending_rows=dict), send=sent.append,
+                               transfers=EdgeTransfers("SHM"))
     return w, sent, postprocessed, iteration
 
 
@@ -537,6 +538,7 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
         SimpleNamespace(pending_rows=lambda: {NODE: pending}), send=None,
+        transfers=EdgeTransfers("SHM"),
     )
     for submitted, done in steps:
         clock.now = done

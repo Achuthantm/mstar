@@ -506,9 +506,14 @@ class APIServer:
 
         ``main()`` calls this after the warmup requests, so their first-shape
         compile times stay out of the latency histograms."""
+        # The data worker reads every result, so it is the dst of the edges
+        # out of the graph; workers report the rest through the conductor.
+        transfers = (self.preprocess_worker.enable_transfer_metrics()
+                     if self.preprocess_worker is not None else None)
         self.metrics = ServingMetrics(
             self.model_name, in_flight=lambda: len(self.pending_requests),
             data_worker_queue_depth=self.preprocess_worker.queue_depth,
+            local_status=(lambda: transfers.latest) if transfers is not None else None,
         )
         self.preprocess_worker.report_preprocess_finish()
 
