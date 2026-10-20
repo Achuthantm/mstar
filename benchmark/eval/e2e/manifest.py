@@ -14,7 +14,7 @@ DEFAULT = Path(__file__).with_name("cases.yaml")
 DRIVERS = ("suite", "client", "rp", "invariants")
 SUITES = ("tts", "asr", "duplex")
 CLIENT_KINDS = ("chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "image", "video", "video_i2v",
-                "gen_clone", "pi05", "frames")
+                "gen_clone", "pi05", "frames", "world")
 CHECKS = {
     "text_match": {"min_match"},
     "wer": {"max_increase"},

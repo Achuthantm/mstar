@@ -1,8 +1,9 @@
 # A/A noise floors and correctness swings per GPU type (benchmark/eval/e2e/calibrate.py); written by
 # `python -m benchmark.eval calibrate`.
-_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, run-aa4]
+_runs: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main, 577-cosyvoice3-b3922414,
+  577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, run-aa4]
 _runs_correct: [20261017-011012-main, 20261017-014824-main, 20261017-031729-main, 20261017-165629-main, 20261018-211808-main,
-  run-aa4]
+  577-cosyvoice3-b3922414, 577-lingbot_world_1_3b-a6377f82, 577-omnilingual_asr_ctc_300m-89dce5fc, 577-voxcpm2-5ef294e8, run-aa4]
 b200:bagel/image_in/correct:
   kind: text_match
   swings: [0.0]
@@ -333,6 +334,19 @@ h200:cosmos3_edge/t2i/lat_p50_s@c1:
   deltas: [-2.754]
 h200:cosmos3_edge/t2i/req_per_s@c8:
   deltas: [-0.943]
+h200:cosyvoice3/clone/audio_s_per_s@c8:
+  deltas: [0.242]
+h200:cosyvoice3/clone/correct:
+  kind: wer
+  swings: [0.0]
+h200:cosyvoice3/clone/e2e_s_p50@c1:
+  deltas: [-1.688]
+h200:cosyvoice3/clone/rtf_mean@c1:
+  deltas: [-2.052]
+h200:cosyvoice3/clone/sim_mean@c1:
+  deltas: [0.0]
+h200:cosyvoice3/clone/ttfa_ms_p50@c1:
+  deltas: [-2.885]
 h200:kokoro/tts/audio_s_per_s@c8:
   deltas: [-4.001, -1.166, 6.504]
 h200:kokoro/tts/correct:
@@ -346,6 +360,12 @@ h200:kokoro/tts/rtf_mean@c1:
   deltas: [0.128, 0.838, -1.288]
 h200:kokoro/tts/ttfa_ms_p50@c1:
   deltas: [0.029, 0.604, -0.043]
+h200:lingbot_world_1_3b/world/lat_p50_s@c1:
+  deltas: [0.09]
+h200:lingbot_world_1_3b/world/req_per_s@c1:
+  deltas: [0.152]
+h200:lingbot_world_1_3b/world/ttft_p50_s@c1:
+  deltas: [0.466]
 h200:nemotron_duplex/duplex/correct:
   kind: duplex
   swings: [0.0]
@@ -357,6 +377,15 @@ h200:nemotron_duplex/duplex/take_turn_rate@c1:
   deltas: [0.0]
 h200:nemotron_duplex/duplex/wall_ms_per_frame_p50@c1:
   deltas: [2.643]
+h200:omnilingual_asr_ctc_300m/upload/correct:
+  kind: wer
+  swings: [0.0]
+h200:omnilingual_asr_ctc_300m/upload/e2e_s_p50@c1:
+  deltas: [-0.136]
+h200:omnilingual_asr_ctc_300m/upload/req_per_s@c16:
+  deltas: [-5.825]
+h200:omnilingual_asr_ctc_300m/upload/rtfx@c1:
+  deltas: [-0.194]
 h200:omnivoice/clone_upload/correct:
   kind: audio_len
   swings: [0.0]
@@ -493,6 +522,37 @@ h200:qwen3_tts/tts/rtf_mean@c1:
   deltas: [-0.454, 0.555]
 h200:qwen3_tts/tts/ttfa_ms_p50@c1:
   deltas: [-0.58, -2.351]
+h200:voxcpm2/clone/audio_s_per_s@c8:
+  deltas: [-1.136]
+h200:voxcpm2/clone/correct:
+  kind: wer
+  swings: [0.0]
+h200:voxcpm2/clone/e2e_s_p50@c1:
+  deltas: [-0.754]
+h200:voxcpm2/clone/sim_mean@c1:
+  deltas: [-0.004]
+h200:voxcpm2/clone/ttfa_ms_p50@c1:
+  deltas: [-1.655]
+h200:voxcpm2/design/audio_s_per_s@c8:
+  deltas: [-0.779]
+h200:voxcpm2/design/correct:
+  kind: wer
+  swings: [0.0]
+h200:voxcpm2/design/e2e_s_p50@c1:
+  deltas: [-1.381]
+h200:voxcpm2/design/ttfa_ms_p50@c1:
+  deltas: [-1.973]
+h200:voxcpm2/tts/audio_s_per_s@c8:
+  deltas: [-1.067]
+h200:voxcpm2/tts/correct:
+  kind: wer
+  swings: [0.0]
+h200:voxcpm2/tts/e2e_s_p50@c1:
+  deltas: [0.013]
+h200:voxcpm2/tts/rtf_mean@c1:
+  deltas: [-0.105]
+h200:voxcpm2/tts/ttfa_ms_p50@c1:
+  deltas: [-0.385]
 h200:whisper_large/sse/correct:
   kind: wer
   swings: [0.0, 0.0]

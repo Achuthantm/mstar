@@ -7,7 +7,8 @@
 # Case drivers:
 #   suite: tts | asr | duplex    the eval suites (`python -m benchmark.eval run <suite>`), on a dataset below
 #   client: <kind>               the `e2e` suite (`run e2e --kind <kind>`): chat_text, chat_image, chat_audio,
-#                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames
+#                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames,
+#                                world (image to world video along a seeded camera path)
 #   rp: whisper | omni           request-path cases (status codes per request), `--rp` only
 #   invariants: chat | speech    served invariants (AGENTS.md), `--rp` only
 #
@@ -613,6 +614,90 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  # ---------------- newer models (optional until their PRs are on main) ----------------
+  # Each adds an engine path none of the models above covers (#577). Base must serve the model too, so these stay
+  # optional (out of `all`, select with `tag:new-model` or by name) until the model's PR is on main; until then
+  # compare them with a base that has the model, e.g. `--base 515 --head <a PR stacked on it>`. No entry yet for
+  # Fish S2-Pro (#491: its PR #492 is closed) or MiniCPM-o (#382 serves it on /generate only, with no chat adapter).
+  cosyvoice3:            # #495: speech codes streamed into a flow-matching decoder at 24 kHz; clone from an upload
+    serve: cosyvoice3
+    optional: true
+    family: TTS
+    tags: [new-model, tts, speech-out, clone]
+    requires: [soundfile]
+    est_min: 8
+    cases:
+      - id: clone
+        modality: tts (voice clone, streamed)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean, sim_mean]}
+
+  voxcpm2:               # #496: tokenizer-free latent patches; 48 kHz streamed audio
+    serve: voxcpm2
+    optional: true
+    family: TTS
+    tags: [new-model, tts, speech-out, clone]
+    requires: [soundfile, soxr]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts
+        suite: tts
+        data: tts
+        args: [--seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+      - id: clone
+        modality: tts (voice clone)
+        suite: tts
+        data: clone
+        args: [--clone, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
+      - id: design
+        modality: tts (voice design)
+        suite: tts
+        data: tts
+        args: [--instructions, "A calm, warm female voice speaking at a moderate pace", --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50]}
+
+  omnilingual_asr_ctc_300m:   # #515: CTC (non-autoregressive) ASR, no decode loop
+    serve: omnilingual_asr_ctc_300m
+    optional: true
+    family: ASR
+    tags: [new-model, asr, speech-in, multipart, small]
+    est_min: 4
+    conc: [1, 16]
+    cases:
+      - id: upload
+        modality: asr (multipart upload)
+        suite: asr
+        data: asr
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: e2e_s_p50, throughput: req_per_s, extra: [rtfx]}
+
+  lingbot_world_1_3b:    # #455: rolling sink plus window K/V inside a rollout loop; chunked video stream
+    serve: lingbot_world_1_3b
+    optional: true
+    family: World
+    tags: [new-model, world, frames, image-in, streaming]
+    requires: [ftfy, scipy, flash_attn]
+    est_min: 10
+    cases:
+      - id: world
+        modality: image to world, seeded camera path
+        client: world
+        n: 4
+        conc: [1]
+        repeats: 2
+        warmup: 1
+        check: {kind: psnr, min_db: 25}
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   # ---------------- robotics ----------------
