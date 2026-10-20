@@ -363,9 +363,20 @@ def decode_audio(path: str, sample_rate: int = 16000):
     return audio
 
 
+def window_stop(start: int, total: int, step: int, balanced: bool) -> int:
+    """Nominal end of the window starting at ``start``: ``step`` samples on,
+    or, ``balanced``, an equal share of what is left over the fewest windows
+    of at most ``step`` (so the last window is never a sliver)."""
+    if not balanced:
+        return min(total, start + step)
+    remaining = total - start
+    windows = -(-remaining // step)
+    return start + -(-remaining // windows)
+
+
 def split_windows(
     audio, window_seconds: float, sample_rate: int = 16000,
-    search_seconds: float = 0.0, frame_seconds: float = 0.02,
+    search_seconds: float = 0.0, frame_seconds: float = 0.02, balanced: bool = False,
 ) -> list:
     """Cut a waveform into consecutive windows of at most ``window_seconds``;
     concatenating them gives the input back sample for sample.
@@ -373,7 +384,8 @@ def split_windows(
     With ``search_seconds`` a cut is moved back from its nominal boundary to
     the end of the quietest ``frame_seconds`` frame within that span (the
     last such frame on a tie, so silence cuts at the boundary): the cut lands
-    in a pause rather than on a word when there is one to find.
+    in a pause rather than on a word when there is one to find. ``balanced``
+    places the nominal boundaries as :func:`window_stop` does.
     """
     audio = np.asarray(audio)
     step = int(round(window_seconds * sample_rate))
@@ -381,7 +393,7 @@ def split_windows(
     frame = max(1, int(round(frame_seconds * sample_rate)))
     pieces, start = [], 0
     while start < len(audio):
-        stop = min(len(audio), start + step)
+        stop = window_stop(start, len(audio), step, balanced)
         if stop < len(audio) and search > 0:
             num_frames = (min(search, stop - start - frame)) // frame
             if num_frames > 0:

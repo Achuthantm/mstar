@@ -76,10 +76,14 @@ TEMPERATURE_FALLBACK = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 PROMPT_RESET_TEMPERATURE = 0.5
 # a seek shorter than this re-hears too much for too little, so take the window
 MIN_SEEK_SECONDS = 1.0
-# parallel mode: how far before a fixed boundary to look for the quietest cut
+# parallel mode: how far before a fixed boundary to look for the quietest cut,
+# and the frame length compared
 CUT_SEARCH_SECONDS = 2.0
+CUT_FRAME_SECONDS = 0.02
 # parallel mode: windows on the engine at once for one upload
 PARALLEL_INFLIGHT = 8
+# shortest window a request may ask for (``window_seconds``)
+MIN_WINDOW_SECONDS = 5.0
 # longest upload the route accepts, in seconds and in bytes
 MAX_DURATION_SECONDS = 30 * 60
 MAX_UPLOAD_BYTES = 512 * 2**20
@@ -146,16 +150,26 @@ class WindowPlanner:
     """Cuts an upload into windows for a model with a clip bound.
 
     ``fixed()`` cuts the whole file up front (parallel mode), moving each cut
-    to the quietest moment within :data:`CUT_SEARCH_SECONDS` before its
-    nominal boundary. ``window_at(offset)`` cuts one window from ``offset``
-    on (sequential mode, where the previous window decides where the next
-    starts). A file the model can hear whole is a single window either way
-    and is never re-encoded.
+    to the quietest frame within ``search_seconds`` before its nominal
+    boundary. ``window_at(offset)`` cuts one window from ``offset`` on
+    (sequential mode, where the previous window decides where the next
+    starts). A file of at most ``whole_seconds`` (default: the window
+    length) is a single window either way and is never re-encoded.
     """
 
-    def __init__(self, audio_path: str, max_seconds: float | None, upload_dir: Path):
+    def __init__(
+        self, audio_path: str, max_seconds: float | None, upload_dir: Path, *,
+        balanced: bool = False, search_seconds: float = CUT_SEARCH_SECONDS,
+        frame_seconds: float = CUT_FRAME_SECONDS, whole_seconds: float | None = None,
+    ):
         self.audio_path = audio_path
         self.max_seconds = max_seconds
+        self.whole_seconds = max_seconds if whole_seconds is None else whole_seconds
+        self.balanced = balanced
+        # a cut moves back at most a third of a window, so short windows a
+        # request asks for keep most of their length
+        self.search_seconds = search_seconds if max_seconds is None else min(search_seconds, max_seconds / 3)
+        self.frame_seconds = frame_seconds
         self.upload_dir = Path(upload_dir)
         self.duration = audio_duration_seconds(audio_path)
         self.files = [audio_path]
@@ -164,7 +178,7 @@ class WindowPlanner:
 
     @property
     def single(self) -> bool:
-        return self.max_seconds is None or self.duration is None or self.duration <= self.max_seconds
+        return self.max_seconds is None or self.duration is None or self.duration <= self.whole_seconds
 
     def whole(self) -> Window:
         return Window(path=self.audio_path, offset=0.0, duration=self.duration or 0.0)
@@ -182,7 +196,8 @@ class WindowPlanner:
         if self.single:
             return [self.whole()]
         pieces = media_io.split_windows(
-            self._decoded(), self.max_seconds, SAMPLE_RATE, search_seconds=CUT_SEARCH_SECONDS,
+            self._decoded(), self.max_seconds, SAMPLE_RATE,
+            search_seconds=self.search_seconds, frame_seconds=self.frame_seconds, balanced=self.balanced,
         )
         windows, offset = [], 0.0
         for piece in pieces:
@@ -195,7 +210,7 @@ class WindowPlanner:
             return self.whole()
         audio = self._decoded()
         start = int(round(offset * SAMPLE_RATE))
-        stop = min(len(audio), start + int(round(self.max_seconds * SAMPLE_RATE)))
+        stop = media_io.window_stop(start, len(audio), int(round(self.max_seconds * SAMPLE_RATE)), self.balanced)
         return self._write(audio[start:stop], offset)
 
     def _decoded(self):
@@ -223,11 +238,45 @@ def plan_windows(audio_path: str, max_seconds: float | None, upload_dir: Path) -
     return WindowPlanner(audio_path, max_seconds, upload_dir).fixed()
 
 
+def planner_for(adapter, audio_path: str, upload_dir: Path, window_seconds: float | None = None) -> WindowPlanner:
+    """The adapter's window policy for one upload; ``window_seconds`` (a
+    request's override) sets the window and the longest upload heard whole."""
+    if window_seconds is None:
+        window_seconds = adapter.window_seconds or adapter.max_audio_seconds
+        whole_seconds = adapter.whole_seconds
+    else:
+        whole_seconds = window_seconds
+    return WindowPlanner(
+        audio_path, window_seconds, upload_dir,
+        balanced=adapter.balanced_windows,
+        search_seconds=CUT_SEARCH_SECONDS if adapter.window_search_seconds is None else adapter.window_search_seconds,
+        frame_seconds=CUT_FRAME_SECONDS if adapter.window_frame_seconds is None else adapter.window_frame_seconds,
+        whole_seconds=whole_seconds,
+    )
+
+
 def _long_form_mode(adapter, req) -> str:
     mode = (getattr(req, "model_extra", None) or {}).get("long_form") or adapter.long_form
     if mode not in LONG_FORM_MODES:
         raise HTTPException(status_code=400, detail=f"long_form must be one of {list(LONG_FORM_MODES)}; got {mode!r}")
     return mode
+
+
+def _window_seconds(adapter, req) -> float | None:
+    """The request's ``window_seconds`` (extra_body), checked against the
+    model's clip bound, or None when the request leaves it to the adapter."""
+    cap = adapter.max_audio_seconds
+    value = (getattr(req, "model_extra", None) or {}).get("window_seconds")
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        value = math.nan
+    if cap is None or not MIN_WINDOW_SECONDS <= value <= cap:
+        bound = f"between {MIN_WINDOW_SECONDS:g} and {cap:g}" if cap is not None else "unset (no clip bound)"
+        raise HTTPException(status_code=400, detail=f"window_seconds must be {bound} for this model")
+    return value
 
 
 def _window_request(req, language: str | None, carry_over: str | None, *, timestamps: bool = False):
@@ -266,6 +315,7 @@ def _attempts(req, carry_over: str | None) -> list[tuple[float, str | None]]:
 def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[str]) -> str:
     args = adapter.transcription_to_request(req, window.path)
     args.model_kwargs.pop("long_form", None)
+    args.model_kwargs.pop("window_seconds", None)
     request_id = rid("transcr")
     api.submit_request(
         text=args.text,
@@ -414,8 +464,9 @@ async def create_transcription(
         adapter.transcription_to_request(req, "")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+    window = _window_seconds(adapter, req)
     audio_path = save_upload(audio_bytes, filename, api.upload_dir)
-    planner = WindowPlanner(audio_path, adapter.max_audio_seconds, api.upload_dir)
+    planner = planner_for(adapter, audio_path, api.upload_dir, window)
     if planner.duration is not None and planner.duration > MAX_DURATION_SECONDS:
         planner.cleanup()
         raise HTTPException(
