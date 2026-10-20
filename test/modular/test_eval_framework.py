@@ -777,3 +777,35 @@ def test_server_info_names_the_tree_the_server_python_imports(tmp_path, monkeypa
     assert set(info["versions"]) == {"mstar-ai", "torch", "transformers"}
     assert str(tmp_path) not in json.dumps(info)
     assert ManagedServer("m", command=["x"]).info()["git"] == {}
+
+
+@pytest.mark.parametrize("clone", [False, True])
+def test_speaker_similarity_is_scored_only_for_cloned_requests(tmp_path, monkeypatch, clone):
+    import argparse
+
+    import numpy as np
+
+    from benchmark.eval import judges
+    from benchmark.eval.audio import write_wav
+    from benchmark.eval.datasets import Item
+    from benchmark.eval.suites.tts import TTSSuite
+
+    class FakeSim:
+        calls = 0
+
+        def similarity(self, out, ref):
+            FakeSim.calls += 1
+            return 0.5
+
+    monkeypatch.setattr(judges, "sim_judge", lambda *a, **k: FakeSim())
+    write_wav(tmp_path / "ref.wav", np.zeros(1600, dtype=np.float32), 16000)
+    parser = argparse.ArgumentParser()
+    TTSSuite.add_args(parser)
+    args = parser.parse_args(["--asr-judge", "none"] + (["--clone"] if clone else []))
+    items = [Item(id="a", text="hi", ref_audio=str(tmp_path / "ref.wav"), ref_text="hi")]
+    row = {"id": "a", "ok": True, "error": None, "ttfa_s": 0.1, "e2e_s": 0.5, "audio_s": 1.0, "rtf": 0.5,
+           "chunks": 1, "stalls": 0, "stall_s": 0.0, "sample_rate": 16000,
+           "_audio": np.zeros(16000, dtype=np.float32)}
+    metrics = TTSSuite(args).score(items, [row], 1.0, None)
+    assert (metrics.get("sim_mean") == 0.5) is clone and FakeSim.calls == int(clone)
+    assert ("sim" in row) is clone
