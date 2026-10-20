@@ -45,6 +45,8 @@ Both UIs listen on `127.0.0.1` only. Nothing in these files is a secret.
   `prom`), pointing at the `prometheus` service.
 - `grafana/provisioning/dashboards/mstar.yml`: loads every dashboard JSON in
   `grafana/dashboards/` into an `M*` folder.
+- `grafana/dashboards/mstar.json`: the `M* serving` dashboard, one row per component
+  with a panel for every metric family.
 
 ## Reaching the host from the containers
 
