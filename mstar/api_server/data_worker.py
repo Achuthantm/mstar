@@ -839,7 +839,7 @@ class PreprocessWorkerThread:
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
-        sequence: int | None = None,
+        sequence: int | None = None, abort: bool = True,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -851,6 +851,9 @@ class PreprocessWorkerThread:
         ``sequence`` is the output slot the failed tensor held. Its error chunk
         takes that slot in the reorder buffer; put straight on ``out_queue`` it
         would leave every later sequence held in ``pending`` until the TTL.
+
+        ``abort`` (False for a request the conductor has not seen) stops the
+        request's walk, since its client already has its answer.
         """
         logger.exception("%s failed for request %s", stage, request_id)
         status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
@@ -867,6 +870,37 @@ class PreprocessWorkerThread:
             self._queue_completed_output(request_id, sequence, chunks.pop())
         for chunk in chunks:
             self.out_queue.put(chunk)
+        if abort:
+            self._abort_failed_request(request_id)
+
+    def _abort_failed_request(self, request_id: str) -> None:
+        """Stop the walk of a request this thread failed. Left running, it
+        would produce every remaining output only for each to be read and
+        dropped. Skipped for a request already being torn down, or already
+        handed back by the API server (whose own abort or finish covers it)."""
+        if (
+            request_id in self._draining_rids
+            or request_id in self._reads_done_sent
+            or request_id not in self.in_flight_requests
+        ):
+            return
+        logger.info("Aborting request %s: one of its outputs failed", request_id)
+        self._send_abort(request_id)
+
+    def _send_abort(self, request_id: str) -> None:
+        self.communicator.send(
+            "conductor",
+            ConductorMessage(
+                message_type=ConductorMessageType.ABORT_REQUEST,
+                body=AbortRequest(request_id=request_id),
+            ),
+        )
+        # Begin draining our own reads immediately, overlapping with the
+        # conductor round-trip (it also sends a DrainRequest).
+        # None live: already removed, or still queued in in_queue,
+        # where the abort above makes the conductor drop it.
+        if request_id in self._live_requests:
+            self._begin_drain(request_id)
 
     def _sequence_unanswered(self, request_id: str, sequence: int) -> bool:
         """True if no chunk has been queued for ``sequence`` yet."""
@@ -1150,20 +1184,7 @@ class PreprocessWorkerThread:
         did_work = False
         while not self.abort_request_queue.empty():
             did_work = True
-            rid = self.abort_request_queue.get()
-            self.communicator.send(
-                "conductor",
-                ConductorMessage(
-                    message_type=ConductorMessageType.ABORT_REQUEST,
-                    body=AbortRequest(request_id=rid),
-                ),
-            )
-            # Begin draining our own reads immediately, overlapping with
-            # the conductor round-trip (it also sends a DrainRequest).
-            # None live: already removed, or still queued in in_queue,
-            # where the abort above makes the conductor drop it.
-            if rid in self._live_requests:
-                self._begin_drain(rid)
+            self._send_abort(self.abort_request_queue.get())
         while not self.reads_done_queue.empty():
             did_work = True
             self._finish_reading(*self.reads_done_queue.get())
@@ -1252,7 +1273,7 @@ class PreprocessWorkerThread:
                         # error chunk instead of leaving the client to hit the
                         # server timeout.
                         self._fail_request(
-                            pre_input.request_id, exc, "preprocessing",
+                            pre_input.request_id, exc, "preprocessing", abort=False,
                         )
                         # Never reached the conductor, so there are no remote
                         # readers to race: hard-drop the (possibly persisted)

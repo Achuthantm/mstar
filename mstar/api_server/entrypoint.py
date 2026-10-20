@@ -199,6 +199,15 @@ def _client_text(text: str, key: str, request_id: str | None) -> str:
     return text if request_id is None else text.replace(key, request_id)
 
 
+def _until_error(chunks: list[ResultChunk]) -> tuple[list[ResultChunk], bool]:
+    """``chunks`` up to and including the first error chunk, which ends the
+    response, and whether there was one."""
+    for i, chunk in enumerate(chunks):
+        if chunk.modality == "error":
+            return chunks[:i + 1], True
+    return list(chunks), False
+
+
 def request_id_in_use(request_id: str) -> str:
     """The 409 detail for a ``request_id`` that still has a request in flight."""
     return (
@@ -915,6 +924,11 @@ class APIServer:
     ):
         start = time.time()
         finished = False
+        # An error chunk ends the response: whatever follows it for this
+        # request (a second error, a late output) is not part of the answer.
+        # The message thread sets req.event in the same request_lock block
+        # that appends an error chunk, so a read that sees one is also done.
+        errored = False
         # Woken by the message thread (PendingRequest.notify) when a chunk or
         # the completion lands; the timeout below is only a backstop.
         wake = asyncio.Event()
@@ -944,6 +958,7 @@ class APIServer:
                         done = True
 
                 if new_chunks:
+                    new_chunks, errored = _until_error(new_chunks)
                     if self.enable_nvtx:
                         for _ in new_chunks:
                             profiler.mark("apiserver.chunk_available")
@@ -957,19 +972,25 @@ class APIServer:
                     with self.request_lock:
                         req = self.pending_requests.get(key)
                         if req:
-                            remaining = req.chunks[req.consumed_chunks:]
+                            if not errored:
+                                remaining = req.chunks[req.consumed_chunks:]
                             finished_req = self.pending_requests.pop(key, None)
                             self._retire(key)
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
                         self._finalize_profile(finished_req)
-                    tail = list(remaining)
+                    tail, tail_errored = _until_error(remaining)
+                    errored = errored or tail_errored
                     # A request can fail after the stream is already open
                     # (preprocess error, result-delivery timeout); the HTTP
                     # status is committed by then, so the error must travel
-                    # in-band as the final chunk.
-                    if finished_req is not None and finished_req.error is not None:
+                    # in-band as the final chunk, once.
+                    if (
+                        not errored
+                        and finished_req is not None
+                        and finished_req.error is not None
+                    ):
                         tail.append(ResultChunk(
                             request_id=request_id,
                             modality="error",
