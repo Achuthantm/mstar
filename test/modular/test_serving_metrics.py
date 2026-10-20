@@ -8,6 +8,7 @@ real ones send. Each test scrapes ``/metrics`` and reads the samples back.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import queue
 import sys
@@ -21,15 +22,20 @@ from api_server_helpers import make_test_api_server
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+import mstar.communication.wire_types  # noqa: F401  (registers the wire tags)
 from mstar.api_server import entrypoint
 from mstar.api_server.request_types import (
     APIServerMessage,
+    ConductorStatus,
     DataWorkerProfile,
     RequestComplete,
     RequestFailed,
     ResultChunk,
 )
+from mstar.communication import wire
+from mstar.observability import catalog
 from mstar.observability import metrics as metrics_module
+from mstar.observability.recorders import Counter, Gauge, Histogram, MetricSnapshot
 
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
@@ -87,9 +93,11 @@ class _Conductor:
         self.inbox = queue.Queue()
 
     def get_all_new_messages(self):
+        """Everything queued; a queued list arrives as one batch."""
         out = []
         while not self.inbox.empty():
-            out.append(self.inbox.get())
+            item = self.inbox.get()
+            out.extend(item if isinstance(item, list) else [item])
         return out
 
     def send(self, entity, msg):
@@ -103,18 +111,19 @@ class _Served:
     def key(self, i=0):
         return self.data_worker.inputs[i].request_id
 
-    def answer(self, key, data=b"hi", chunks=None, ingest=None, finish=None):
+    def answer(self, key, data=b"hi", chunks=None, ingest=None, finish=None, **stamps):
         """The engine's result chunks (one text chunk unless given), then its
         completion, as the real data worker and conductor deliver them.
-        ``ingest`` and ``finish`` are the conductor's perf_counter stamps."""
+        ``ingest`` and ``finish`` are the conductor's perf_counter stamps;
+        ``stamps`` are further ``RequestComplete`` fields (its arrival stamp)."""
         chunks = chunks or [ResultChunk(request_id=key, modality="text", data=data)]
         for chunk in chunks:
             self.data_worker.chunks.put(chunk)
         finish = time.perf_counter() if finish is None else finish
+        fields = {"conductor_ingest_time": finish if ingest is None else ingest,
+                  "conductor_finish_time": finish, **stamps}
         self.conductor.inbox.put(APIServerMessage("request_complete", RequestComplete(
-            request_id=key, output_chunk_counts={"out": len(chunks)},
-            conductor_ingest_time=finish if ingest is None else ingest,
-            conductor_finish_time=finish,
+            request_id=key, output_chunk_counts={"out": len(chunks)}, **fields,
         )))
 
     def fail(self, key, status=500):
@@ -129,6 +138,14 @@ class _Served:
         return _parse(r.text)
 
 
+def _complete(key, conductor_ingest_time=0.0, conductor_finish_time=0.0, **kwargs):
+    return APIServerMessage("request_complete", RequestComplete(
+        request_id=key, output_chunk_counts={"text": 1},
+        conductor_ingest_time=conductor_ingest_time, conductor_finish_time=conductor_finish_time,
+        **kwargs,
+    ))
+
+
 def _parse(text: str) -> dict:
     from prometheus_client.parser import text_string_to_metric_families
 
@@ -139,24 +156,42 @@ def _parse(text: str) -> dict:
     return samples
 
 
-@pytest.fixture
-def served(monkeypatch, tmp_path):
-    pytest.importorskip("prometheus_client")
+@contextlib.contextmanager
+def _serve(monkeypatch, tmp_path, metrics=True):
     data_worker, conductor = _DataWorker(), _Conductor()
     server = make_test_api_server(
         preprocess_worker=data_worker, communicator=conductor, upload_dir=tmp_path,
     )
-    server.enable_metrics()
+    if metrics:
+        server.enable_metrics()
     monkeypatch.setattr(entrypoint, "api_server", server)
     thread = threading.Thread(target=server._process_messages, daemon=True)
     thread.start()
-    yield _Served(server, data_worker, conductor)
-    server.running = False
-    thread.join(timeout=5)
+    try:
+        yield _Served(server, data_worker, conductor)
+    finally:
+        server.running = False
+        thread.join(timeout=5)
+
+
+@pytest.fixture
+def served(monkeypatch, tmp_path):
+    pytest.importorskip("prometheus_client")
+    with _serve(monkeypatch, tmp_path) as s:
+        yield s
 
 
 def _labels(**kv):
     return tuple(sorted({"model_name": "dummy", **kv}.items()))
+
+
+AGE = ("mstar_conductor_status_age_seconds", _labels())
+
+
+def _without_age(samples: dict) -> dict:
+    """Every sample but the status age, which moves between two scrapes."""
+    assert AGE in samples
+    return {k: v for k, v in samples.items() if k != AGE}
 
 
 def _count(samples, outcome, modalities="text"):
@@ -290,7 +325,7 @@ def test_the_rust_bridge_answers_metrics_with_what_the_python_route_serves(serve
     after = _parse(replies[3]["data"].decode())
     assert after[("mstar_requests_in_flight", _labels())] == 0
     assert _count(after, "success") == 1
-    assert replies[3]["data"] == TestClient(entrypoint.app).get("/metrics").content
+    assert _without_age(after) == _without_age(served.scrape())
 
 
 def test_the_rust_bridge_answers_metrics_off_when_they_are_off(tmp_path):
@@ -690,6 +725,161 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     assert updates[0].inputs == []
 
 
+# ── conductor status ─────────────────────────────────────────────────────────
+
+def _status(waiting=0, running=0, draining=0, **in_flight):
+    """A status message as the conductor builds it, after the wire codec."""
+    states, components = Gauge(catalog.CONDUCTOR_REQUESTS), Gauge(catalog.COMPONENT_IN_FLIGHT)
+    for state, n in (("waiting", waiting), ("running", running), ("draining", draining)):
+        states.set((state,), n)
+    for node, n in in_flight.items():
+        components.set((node,), n)
+    message = APIServerMessage("conductor_status", ConductorStatus(
+        [states.snapshot(), components.snapshot()]))
+    return wire.decode(wire.encode(message))
+
+
+def _conductor_samples(samples):
+    states = {dict(k[1])["state"]: v for k, v in samples.items() if k[0] == "mstar_conductor_requests"}
+    in_flight = {dict(k[1])["component"]: v for k, v in samples.items()
+                 if k[0] == "mstar_component_in_flight"}
+    return states, in_flight
+
+
+def _scrape_until(served, pred):
+    """Scrape until ``pred(samples)``: the message thread applies what is queued
+    on its next pass."""
+    _wait(lambda: pred(served.scrape()))
+    return served.scrape()
+
+
+def test_the_conductor_gauges_follow_its_latest_status(served):
+    before = served.scrape()
+    assert _conductor_samples(before) == ({}, {})
+    assert before[AGE] >= 0
+
+    served.conductor.inbox.put(_status(waiting=2, running=1, enc=1, llm=0))
+    after = _scrape_until(served, lambda s: _conductor_samples(s)[0])
+    assert _conductor_samples(after) == (
+        {"waiting": 2, "running": 1, "draining": 0}, {"enc": 1, "llm": 0})
+
+    served.conductor.inbox.put(_status(running=3, draining=1, enc=2, llm=3))
+    after = _scrape_until(served, lambda s: _conductor_samples(s)[0]["running"] == 3)
+    assert _conductor_samples(after) == (
+        {"waiting": 0, "running": 3, "draining": 1}, {"enc": 2, "llm": 3})
+
+
+def test_status_age_counts_from_enabling_metrics_then_from_each_status(served):
+    first = served.scrape()[AGE]
+    time.sleep(0.1)
+    waited = served.scrape()[AGE]
+    assert waited >= first + 0.1
+
+    served.conductor.inbox.put(_status())
+    fresh = _scrape_until(served, lambda s: s[AGE] < waited)[AGE]
+    time.sleep(0.1)
+    assert served.scrape()[AGE] >= fresh + 0.1
+
+
+def test_admission_wait_is_observed_on_a_completed_request(served):
+    labels = _labels(output_modalities="text")
+    family = "mstar_request_queue_seconds"
+
+    async def run(rid, **times):
+        served.server.submit_request(text="x", request_id=rid, streaming=False, **TEXT)
+        served.answer(served.key(len(served.data_worker.inputs) - 1), **times)
+        await served.server.collect_results(rid)
+
+    asyncio.run(run("queued", conductor_arrival_time=10.0, conductor_ingest_time=10.25))
+    # no arrival stamp: a conductor running without metrics
+    asyncio.run(run("unstamped", conductor_ingest_time=3.0))
+
+    samples = served.scrape()
+    assert _count(samples, "success") == 2
+    assert samples[(f"{family}_count", labels)] == 1
+    assert samples[(f"{family}_sum", labels)] == 0.25
+    assert samples[(f"{family}_bucket", _labels(output_modalities="text", le="0.1"))] == 0
+    assert samples[(f"{family}_bucket", _labels(output_modalities="text", le="0.25"))] == 1
+
+
+@pytest.mark.parametrize("metrics", [True, False], ids=["metrics-on", "metrics-off"])
+def test_a_status_message_never_costs_the_messages_after_it(monkeypatch, tmp_path, metrics):
+    """Before enable_metrics() (warmups) a status is dropped; either way the
+    rest of its batch is still applied."""
+    pytest.importorskip("prometheus_client")
+    with _serve(monkeypatch, tmp_path, metrics=metrics) as served:
+        served.server.timeout_seconds = 2.0
+
+        async def run():
+            served.server.submit_request(text="x", request_id="r", streaming=False, **TEXT)
+            served.data_worker.chunks.put(ResultChunk(request_id=served.key(), modality="text", data=b"hi"))
+            served.conductor.inbox.put([_status(running=1), _complete(served.key())])
+            return await served.server.collect_results("r")
+
+        assert [c.data for c in asyncio.run(run())] == [b"hi"]
+        if metrics:
+            assert _conductor_samples(served.scrape())[0]["running"] == 1
+
+
+def test_a_malformed_snapshot_is_dropped_and_the_rest_still_exported(served):
+    good = _status(waiting=1, enc=1).body.metrics
+    served.conductor.inbox.put(APIServerMessage("conductor_status", ConductorStatus([
+        good[0],
+        MetricSnapshot("mstar_component_in_flight", [["enc", "extra"]], [1.0]),
+        MetricSnapshot("mstar_not_in_the_catalog", [[]], [1.0]),
+    ])))
+    after = _scrape_until(served, lambda s: _conductor_samples(s)[0])
+    assert _conductor_samples(after) == ({"waiting": 1, "running": 0, "draining": 0}, {})
+
+
+def test_counter_and_histogram_snapshots_render_as_prometheus_client_would(monkeypatch):
+    """The kinds workers and transports will send: rendered from a snapshot,
+    they match prometheus_client's own Counter and Histogram fed the same
+    values."""
+    prometheus_client = pytest.importorskip("prometheus_client")
+    counter = catalog.Family("mstar_test_things_total", catalog.COUNTER, "Things.", ("component",))
+    histogram = catalog.Family("mstar_test_step_seconds", catalog.HISTOGRAM, "Steps.",
+                               ("component",), buckets=(0.1, 1.0))
+    monkeypatch.setattr(catalog, "STATUS_FAMILIES", {f.name: f for f in (counter, histogram)})
+    observed = {"a": [0.1, 0.5, 5.0], "b": [0.05]}
+
+    things, steps = Counter(counter), Histogram(histogram)
+    reference = prometheus_client.CollectorRegistry()
+    ref_things = prometheus_client.Counter(
+        "mstar_test_things", "Things.", ["model_name", "component"], registry=reference)
+    ref_steps = prometheus_client.Histogram(
+        "mstar_test_step_seconds", "Steps.", ["model_name", "component"], buckets=(0.1, 1.0),
+        registry=reference)
+    for component, values in observed.items():
+        for v in values:
+            things.inc((component,))
+            steps.observe((component,), v)
+            ref_things.labels("dummy", component).inc()
+            ref_steps.labels("dummy", component).observe(v)
+
+    server = make_test_api_server(preprocess_worker=_DataWorker())
+    server.enable_metrics()
+    server.metrics.conductor_status(ConductorStatus([things.snapshot(), steps.snapshot()]))
+    ours = {k: v for k, v in _parse(server.metrics.render().decode()).items()
+            if k[0].startswith("mstar_test_")}
+    theirs = {k: v for k, v in _parse(prometheus_client.generate_latest(reference).decode()).items()
+              if not k[0].endswith("_created")}
+    assert ours == theirs
+    assert ours[("mstar_test_step_seconds_bucket", _labels(component="a", le="0.1"))] == 1
+
+
+def test_the_rust_bridge_serves_the_conductor_families(served):
+    served.conductor.inbox.put(_status(waiting=1, running=2, enc=2))
+    python_route = _scrape_until(served, lambda s: _conductor_samples(s)[0])
+    sent = []
+    _serve_bridge(served.server, [[{"t": "metrics", "rid": "metrics-a", "sub": 1}]], sent)
+
+    (reply,) = sent
+    bridged = _parse(reply["data"].decode())
+    assert _conductor_samples(bridged) == ({"waiting": 1, "running": 2, "draining": 0}, {"enc": 2})
+    assert _without_age(bridged) == _without_age(python_route)
+
+
 class _StopError(Exception):
     pass
 
@@ -778,6 +968,64 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     entrypoint.main(["--config", cfg, "--enable-metrics"])
 
     assert events == ["setup", "warmup", "metrics", "bind"]
+
+
+def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
+    """The keyword arguments ``mstar-serve`` spawns the conductor process with."""
+    spawned = []
+
+    class _Server:
+        fatal_error = None
+
+        def __init__(self, **kwargs):
+            pass
+
+        def finalize_setup(self):
+            raise _StopError
+
+        def cleanup(self):
+            pass
+
+    cfg = _config(monkeypatch, tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", entrypoint.api_server)
+    monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    monkeypatch.setattr(entrypoint, "APIServer", _Server)
+    monkeypatch.setattr(entrypoint.mp, "get_context", lambda method: types.SimpleNamespace(
+        Process=lambda **kw: spawned.append(kw) or types.SimpleNamespace(pid=1, start=lambda: None)))
+    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
+    with pytest.raises(_StopError):
+        entrypoint.main(["--config", cfg, *argv])
+    (kw,) = spawned
+    return kw.get("kwargs", {})
+
+
+def test_the_conductor_gets_a_status_interval_only_with_metrics_on(monkeypatch, tmp_path):
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path, "--enable-metrics") == {"status_interval_s": 1.0}
+    assert _conductor_spawn_kwargs(monkeypatch, tmp_path).get("status_interval_s") is None
+
+
+def test_the_conductor_process_hands_the_status_interval_to_the_conductor(monkeypatch, tmp_path):
+    import mstar.conductor.conductor as conductor_mod
+
+    built = []
+
+    class _Conductor:
+        def __init__(self, **kwargs):
+            built.append(kwargs)
+
+        def run(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    cfg = _config(monkeypatch, tmp_path)
+    monkeypatch.setattr(conductor_mod, "Conductor", _Conductor)
+    monkeypatch.setattr(entrypoint, "watch_parent", lambda *a, **k: None)
+    monkeypatch.setattr(entrypoint.logging, "basicConfig", lambda **k: None)
+    monkeypatch.setattr(entrypoint.signal, "signal", lambda *a: None)
+    entrypoint._conductor_process_target("fake", cfg, str(tmp_path), status_interval_s=0.5)
+    assert [b["status_interval_s"] for b in built] == [0.5]
 
 
 def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeypatch, tmp_path, capsys):

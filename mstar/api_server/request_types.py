@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.multimodal import PromptPart
+from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
@@ -52,6 +53,9 @@ class RequestComplete:
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)
+    # When the conductor took the request in (queued or admitted), in the same
+    # clock as conductor_ingest_time. Only stamped while metrics are on.
+    conductor_arrival_time: float | None = None
 
 
 @dataclass
@@ -66,14 +70,27 @@ class RequestFailed:
     status: int = 500
 
 
-# what an ``APIServerMessage`` carries; None for ``setup_done``
-APIServerMessageBody = ResultTensors | ResultTokens | RequestComplete | RequestFailed | None
+@dataclass
+class ConductorStatus:
+    """The conductor's periodic status, sent only while metrics are on: one
+    snapshot per family in ``catalog.STATUS_FAMILIES``, current or cumulative
+    values only, never per-request data."""
+    metrics: list[MetricSnapshot]
+
+
+# what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
+# tries branches in order and takes the first whose required fields are all
+# present, so a body must lack a required field of every branch before it.
+APIServerMessageBody = (
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus | None
+)
 
 
 @dataclass
 class APIServerMessage:
     """Envelope for messages received by the API server."""
-    # "result_tensors" | "result_tokens" | "request_complete" | "request_failed" | "setup_done"
+    # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
+    # | "conductor_status" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 

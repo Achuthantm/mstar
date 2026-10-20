@@ -10,8 +10,10 @@ a fixed set.
 
 Only the API server process imports ``prometheus_client`` and renders
 ``/metrics``. Other processes (data worker, conductor, workers) send plain
-numbers on messages they already send the API server, which records them
-here; no multiprocess directory, which would only aggregate one host.
+numbers on messages they already send the API server, plus the conductor's
+periodic status message, and the API server records them here; no
+multiprocess directory, which would only aggregate one host. Families whose
+values come from another process are defined in :mod:`.catalog`.
 
 ``prometheus_client`` is optional (``pip install 'mstar[metrics]'``) and only
 needed when metrics are on.
@@ -19,6 +21,7 @@ needed when metrics are on.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -33,7 +36,12 @@ try:
         Histogram,
         generate_latest,
     )
-    from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily
+    from prometheus_client.core import (
+        CounterMetricFamily,
+        GaugeMetricFamily,
+        HistogramMetricFamily,
+    )
+    from prometheus_client.utils import floatToGoString
 except ModuleNotFoundError as e:
     # Only a missing package means "not installed"; a broken install must
     # still raise.
@@ -43,8 +51,14 @@ except ModuleNotFoundError as e:
 else:
     MISSING_DEPENDENCY = None
 
+from mstar.observability import catalog
+from mstar.observability.recorders import MetricSnapshot
+
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import PendingRequest
+    from mstar.api_server.request_types import ConductorStatus
+
+logger = logging.getLogger(__name__)
 
 INSTALL_HINT = "--enable-metrics needs prometheus_client: pip install 'mstar[metrics]'"
 
@@ -112,6 +126,83 @@ class _RequestSeries(NamedTuple):
     preprocess: Any
     engine: Any
     delivery: Any
+    queue: Any
+
+
+def _fits(family: catalog.Family, snap: MetricSnapshot) -> bool:
+    """Whether ``snap`` has the shape ``family`` exports."""
+    rows = len(snap.label_values)
+    if any(len(row) != len(family.labels) for row in snap.label_values):
+        return False
+    if family.kind != catalog.HISTOGRAM:
+        return len(snap.values) == rows
+    width = len(family.buckets) + 1
+    return (len(snap.sums) == rows and len(snap.bucket_counts) == rows
+            and all(len(counts) == width for counts in snap.bucket_counts))
+
+
+class _ConductorStatus:
+    """The families in the conductor's latest status message
+    (``catalog.STATUS_FAMILIES``), and ``mstar_conductor_status_age_seconds``.
+
+    The message thread swaps in each message's snapshots whole and a scrape
+    reads them whole, so neither needs a lock.
+    """
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self._snapshots: dict[str, MetricSnapshot] = {}
+        # Until the first message, the age counts from enabling metrics, so a
+        # conductor that never reports shows a growing age, not a missing one.
+        self._received = time.monotonic()
+        self._warned: set[str] = set()
+        self._le = {
+            f.name: [floatToGoString(b) for b in f.buckets] + ["+Inf"]
+            for f in catalog.STATUS_FAMILIES.values() if f.kind == catalog.HISTOGRAM
+        }
+
+    def update(self, status: ConductorStatus) -> None:
+        snapshots = {}
+        for snap in status.metrics:
+            family = catalog.STATUS_FAMILIES.get(snap.name)
+            # Only a sender bug gets here; dropping the snapshot keeps it from
+            # failing every scrape.
+            if family is None or not _fits(family, snap):
+                if snap.name not in self._warned:
+                    self._warned.add(snap.name)
+                    logger.warning("Dropping conductor status for unknown or malformed "
+                                   "family %r", snap.name)
+                continue
+            snapshots[snap.name] = snap
+        self._snapshots = snapshots
+        self._received = time.monotonic()
+
+    def collect(self):
+        age = GaugeMetricFamily(
+            "mstar_conductor_status_age_seconds",
+            "Seconds since the API server received the conductor's last status "
+            "message (since metrics were enabled, before the first one).",
+            labels=["model_name"],
+        )
+        age.add_metric([self.model_name], time.monotonic() - self._received)
+        yield age
+        snapshots = self._snapshots
+        for family in catalog.STATUS_FAMILIES.values():
+            labels = ["model_name", *family.labels]
+            snap = snapshots.get(family.name) or MetricSnapshot(family.name, [])
+            if family.kind == catalog.HISTOGRAM:
+                out = HistogramMetricFamily(family.name, family.help, labels=labels)
+                le = self._le[family.name]
+                for row, counts, total in zip(
+                        snap.label_values, snap.bucket_counts, snap.sums, strict=True):
+                    out.add_metric([self.model_name, *row], list(zip(le, counts, strict=True)),
+                                   sum_value=total)
+            else:
+                cls = CounterMetricFamily if family.kind == catalog.COUNTER else GaugeMetricFamily
+                out = cls(family.name, family.help, labels=labels)
+                for row, value in zip(snap.label_values, snap.values, strict=True):
+                    out.add_metric([self.model_name, *row], value)
+            yield out
 
 
 class _Refusals:
@@ -276,9 +367,16 @@ class ServingMetrics:
             buckets=FIRST_OUTPUT_BUCKETS,
             registry=self.registry,
         )
+        queue = catalog.REQUEST_QUEUE_SECONDS
+        self.queue_time = Histogram(
+            queue.name, queue.help, ["model_name", *queue.labels],
+            buckets=queue.buckets, registry=self.registry,
+        )
         self.registry.register(_InFlight(model_name, in_flight))
         self.refusals = _Refusals(model_name)
         self.registry.register(self.refusals)
+        self._conductor = _ConductorStatus(model_name)
+        self.registry.register(self._conductor)
 
         # Where a successful request's time went, from the timestamps it
         # carries. The conductor's perf_counter is compared with this
@@ -344,9 +442,14 @@ class ServingMetrics:
                 preprocess=self.preprocess_latency.labels(*labels),
                 engine=self.engine_latency.labels(*labels),
                 delivery=self.delivery_latency.labels(*labels),
+                queue=self.queue_time.labels(*labels),
             )
             self._request_series[modalities] = series
         return series
+
+    def conductor_status(self, status: ConductorStatus) -> None:
+        """Export the conductor's latest status message."""
+        self._conductor.update(status)
 
     def record(self, req: PendingRequest, outcome: str) -> None:
         """Count one request that left the API server's table."""
@@ -366,6 +469,10 @@ class ServingMetrics:
         if timing.conductor_finish_time is not None and now >= timing.conductor_finish_time:
             series.engine.observe(timing.conductor_finish_time - timing.conductor_ingest_time)
             series.delivery.observe(now - timing.conductor_finish_time)
+        # Both come on the conductor's RequestComplete; only a conductor spawned
+        # with metrics on stamps the arrival.
+        if timing.conductor_arrival_time is not None:
+            series.queue.observe(timing.conductor_ingest_time - timing.conductor_arrival_time)
         for modality, first in req.first_chunk_times.items():
             first_chunk = self._first_chunk_series.get(modality)
             if first_chunk is None:

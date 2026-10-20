@@ -239,6 +239,11 @@ def _get(port, path, headers=None):
         return e.code, e.headers, e.read()
 
 
+def _without_status_age(text: bytes) -> list[bytes]:
+    return [line for line in text.splitlines()
+            if not line.startswith(b"mstar_conductor_status_age_seconds{")]
+
+
 def test_metrics_relay_the_api_server_registry_open_like_health():
     """``/metrics`` on ``mstar-server`` is the text the API server's registry
     renders, with its content type, and needs no key while the request
@@ -259,7 +264,8 @@ def test_metrics_relay_the_api_server_registry_open_like_health():
             status, resp_headers, body = _get(port, "/metrics", headers)
             assert status == 200, body
             assert resp_headers["Content-Type"] == stub.metrics.content_type
-            assert body == stub.metrics.render()
+            # The status age is computed at scrape, so it differs between renders.
+            assert _without_status_age(body) == _without_status_age(stub.metrics.render())
         from prometheus_client.parser import text_string_to_metric_families
 
         samples = {(s.name, tuple(sorted(s.labels.items()))): s.value

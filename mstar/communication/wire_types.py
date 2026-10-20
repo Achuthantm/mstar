@@ -9,6 +9,7 @@ breaks compatibility with a peer running the old build.
 """
 from mstar.api_server.request_types import (
     APIServerMessage,
+    ConductorStatus,
     DataWorkerProfile,
     PreprocessInput,
     PromptPart,
@@ -83,6 +84,7 @@ _TYPES: dict[str, type] = {
     "result_tokens": ResultTokens,
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
+    "conductor_status": ConductorStatus,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,

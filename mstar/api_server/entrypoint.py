@@ -40,6 +40,7 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
+from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.metrics import (
     INSTALL_HINT,
     MISSING_DEPENDENCY,
@@ -97,9 +98,11 @@ def _conductor_process_target(
     log_level: str = "INFO",
     cache_dir: str | None = None,
     tensor_comm_protocol=CommProtocol.RDMA,
-    tcp_transfer_device=""
+    tcp_transfer_device="",
+    status_interval_s: float | None = None,
 ):
-    """Runs DummyConductor.run() in a spawned process."""
+    """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
+    turns on the conductor's status message (metrics on)."""
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -151,7 +154,8 @@ def _conductor_process_target(
         enable_prof=enable_prof,
         log_level=log_level,
         tensor_comm_protocol=tensor_comm_protocol,
-        tcp_transfer_device=tcp_transfer_device
+        tcp_transfer_device=tcp_transfer_device,
+        status_interval_s=status_interval_s,
     )
     try:
         conductor.run()
@@ -744,6 +748,14 @@ class APIServer:
                             self.preprocess_worker.wake()
                         continue
 
+                    if message.message_type == "conductor_status":
+                        # Sent only with --enable-metrics, from before the
+                        # warmups; dropped until enable_metrics() runs.
+                        metrics = self.metrics
+                        if metrics is not None:
+                            metrics.conductor_status(message.body)
+                        continue
+
                     rid = message.body.request_id
 
                     with self.request_lock:
@@ -797,6 +809,8 @@ class APIServer:
                                     message.body.conductor_ingest_time
                                 req.profile.timing.conductor_finish_time = \
                                     message.body.conductor_finish_time
+                                req.profile.timing.conductor_arrival_time = \
+                                    message.body.conductor_arrival_time
                                 req.profile.graph_timings = list(message.body.graph_timings.values())
                                 # Conductor-merged worker-side transfers; extend
                                 # so they combine with the data worker's own
@@ -1997,6 +2011,8 @@ def main(argv: list[str] | None = None):
             CommProtocol(args.tensor_comm_protocol),
             args.tcp_transfer_device
         ),
+        # The API server drops these until enable_metrics(), after the warmups.
+        kwargs={"status_interval_s": STATUS_INTERVAL_S if args.enable_metrics else None},
     )
     conductor_proc.start()
     logger.info("Conductor process started (pid=%d, model=%s)", conductor_proc.pid, model_name)
