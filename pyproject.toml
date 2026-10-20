@@ -77,6 +77,11 @@ audio = [
     "soundfile",
 ]
 
+# Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
+metrics = [
+    "prometheus-client>=0.20",
+]
+
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset

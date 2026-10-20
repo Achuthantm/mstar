@@ -22,7 +22,7 @@ import msgpack
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from mstar.api_server import media_io
@@ -40,6 +40,7 @@ from mstar.api_server.request_types import APIServerMessage, PreprocessInput, Re
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.model.multimodal import PromptPart
 from mstar.model.registry import model_init_kwargs
+from mstar.observability.metrics import INSTALL_HINT, MISSING_DEPENDENCY, ServingMetrics
 from mstar.profile.display import pretty_print_profile
 from mstar.profile.format import OutputInfo, RequestProfile, RequestTiming
 from mstar.utils import profiler
@@ -341,6 +342,8 @@ class APIServer:
         # (optional) appends the report to a file instead of only stdout.
         self.log_stats = log_stats
         self.log_stats_file = log_stats_file
+        # Prometheus metrics; None until enable_metrics().
+        self.metrics: ServingMetrics | None = None
 
         # Kept so the OpenAI-compatible layer can look up the per-model adapter
         # (``model_name``) and query model-level metadata such as the audio
@@ -485,6 +488,15 @@ class APIServer:
             fatal = self.fatal_error is not None
         if fatal:
             callback()
+
+    def enable_metrics(self) -> None:
+        """Count requests from now on and serve them at ``/metrics``.
+
+        ``main()`` calls this after the warmup requests, so their first-shape
+        compile times stay out of the latency histograms."""
+        self.metrics = ServingMetrics(
+            self.model_name, in_flight=lambda: len(self.pending_requests),
+        )
 
     # ----------------------------------------------------------
     # Submitting a request
@@ -929,6 +941,7 @@ class APIServer:
         # The message thread sets req.event in the same request_lock block
         # that appends an error chunk, so a read that sees one is also done.
         errored = False
+        timed_out = False
         # Woken by the message thread (PendingRequest.notify) when a chunk or
         # the completion lands; the timeout below is only a backstop.
         wake = asyncio.Event()
@@ -939,6 +952,7 @@ class APIServer:
         try:
             while True:
                 if time.time() - start > self.timeout_seconds:
+                    timed_out = True
                     raise HTTPException(status_code=500, detail="Request timed out")
 
                 # Cleared before the read: a notification that lands after
@@ -979,6 +993,7 @@ class APIServer:
                     # Profiling (incl. the optional file write) runs outside the
                     # lock; the popped request is no longer shared with other threads.
                     if finished_req is not None:
+                        self._record_end(finished_req, "success")
                         self._finalize_profile(finished_req)
                     tail, tail_errored = _until_error(remaining)
                     errored = errored or tail_errored
@@ -1010,7 +1025,7 @@ class APIServer:
                     pass
         finally:
             if not finished:
-                self.abort_submission(key)
+                self.abort_submission(key, outcome="timeout" if timed_out else "abort")
 
     def async_stream_results(self, request_id: str, binary: bool = False):
         """Yield the serialized body of ``/generate`` one piece at a time.
@@ -1102,7 +1117,7 @@ class APIServer:
             if done:
                 break
             if time.time() - start > self.timeout_seconds:
-                self.abort_submission(key)
+                self.abort_submission(key, outcome="timeout")
                 raise HTTPException(status_code=500, detail="Request timed out")
             if raw_request is not None and await raw_request.is_disconnected():
                 self.abort_submission(key)
@@ -1114,6 +1129,7 @@ class APIServer:
             self._retire(key)
         if req is None:
             return []
+        self._record_end(req, "success")
         if req.error is not None:
             raise HTTPException(
                 status_code=req.error_status, detail=req.error
@@ -1122,6 +1138,16 @@ class APIServer:
         # popped request is no longer shared with other threads.
         self._finalize_profile(req)
         return list(req.chunks)
+
+    def _record_end(self, req: PendingRequest, outcome: str) -> None:
+        """Count a request that just left ``pending_requests``. Only the
+        caller whose ``pop`` returned it calls this, so each request counts
+        once; callers must NOT hold ``request_lock``."""
+        if self.metrics is None:
+            return
+        if req.error is not None:
+            outcome = "error"
+        self.metrics.record(req, outcome)
 
     def _finalize_profile(self, req: PendingRequest) -> None:
         """Stamp the finish time, aggregate output sizes, and emit the report.
@@ -1159,9 +1185,10 @@ class APIServer:
             key = self._live.get(request_id)
         self.abort_submission(key)
 
-    def abort_submission(self, key: str | None) -> None:
+    def abort_submission(self, key: str | None, outcome: str = "abort") -> None:
         """:meth:`abort_request` for one submission, by its key
-        (:meth:`submission_key`); a newer submission under the id is untouched."""
+        (:meth:`submission_key`); a newer submission under the id is untouched.
+        ``outcome`` is what the metrics count it as (``abort`` or ``timeout``)."""
         if key is None:
             return
         with self.request_lock:
@@ -1169,9 +1196,11 @@ class APIServer:
                 key in self.pending_requests
                 or key in self.recently_completed
             )
-            self.pending_requests.pop(key, None)
+            req = self.pending_requests.pop(key, None)
             self.recently_completed.pop(key, None)
             self._retire(key)
+        if req is not None:
+            self._record_end(req, outcome)
         if not active:
             return
         logger.info("Client cancelled request %s; releasing resources", key)
@@ -1187,7 +1216,9 @@ class APIServer:
             if finished:
                 self.pending_requests.pop(key)
                 self._retire(key)
-        if not finished:
+        if finished:
+            self._record_end(req, "abort")
+        else:
             self.abort_submission(key)
 
     # ----------------------------------------------------------
@@ -1762,6 +1793,17 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/metrics", include_in_schema=False)
+async def metrics():
+    """Prometheus metrics, when the server runs with ``--enable-metrics``."""
+    if api_server is None or api_server.metrics is None:
+        raise HTTPException(
+            status_code=404,
+            detail="metrics are off; start the server with --enable-metrics",
+        )
+    return Response(api_server.metrics.render(), media_type=api_server.metrics.content_type)
+
+
 @app.on_event("shutdown")
 async def shutdown_event():
     if api_server is not None:
@@ -1800,8 +1842,8 @@ def main(argv: list[str] | None = None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--api-key", type=str, default=None,
-        help=f"Require 'Authorization: Bearer <key>' on every route except /health "
-             f"(default: {API_KEY_ENV}; unset means no check). Prefer the environment "
+        help=f"Require 'Authorization: Bearer <key>' on every route except /health and "
+             f"/metrics (default: {API_KEY_ENV}; unset means no check). Prefer the environment "
              f"variable: a flag shows in the process list",
     )
     parser.add_argument("--mooncake-port", type=int, default=8080)
@@ -1850,6 +1892,10 @@ def main(argv: list[str] | None = None):
         help="Append per-request profiling stats to this file (implies --log-stats)",
     )
     parser.add_argument(
+        "--enable-metrics", action="store_true",
+        help="Serve Prometheus metrics at /metrics (needs mstar[metrics])",
+    )
+    parser.add_argument(
         "--rust-frontend", action="store_true",
         help="Serve HTTP from the Rust mstar-server binary instead of "
              "uvicorn/FastAPI; the Python process keeps preprocessing "
@@ -1861,6 +1907,11 @@ def main(argv: list[str] | None = None):
              "$PATH, then rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    if args.enable_metrics and MISSING_DEPENDENCY is not None:
+        parser.error(INSTALL_HINT)
+    if args.enable_metrics and args.rust_frontend:
+        parser.error("--enable-metrics is not served by the Rust frontend yet; "
+                     "drop --rust-frontend or --enable-metrics")
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)
 
@@ -1941,6 +1992,8 @@ def main(argv: list[str] | None = None):
         if warmups:
             logger.info("Running %d warmup request(s) before binding", len(warmups))
             _run_warmup_requests(api_server, warmups)
+        if args.enable_metrics:
+            api_server.enable_metrics()
         if args.rust_frontend:
             import tempfile
 
