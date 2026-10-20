@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 try:
     from prometheus_client import (
@@ -59,6 +59,14 @@ E2E_BUCKETS = (
     0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0,
     15.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0,
 )
+# Preprocess and delivery: under a millisecond for a short text prompt, up to
+# seconds for a long video upload or a large final payload.
+STAGE_BUCKETS = (
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+    1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+)
+# 16-bit PCM: the data worker emits audio as headerless s16le.
+_AUDIO_BYTES_PER_SAMPLE = 2
 
 
 def require_prometheus_client() -> None:
@@ -88,6 +96,17 @@ class _InFlight:
         )
         family.add_metric([self.model_name], self.count())
         yield family
+
+
+class _RequestSeries(NamedTuple):
+    """One output-modality set's labeled series, looked up once: a
+    ``labels()`` call costs about as much as the observation itself."""
+    outcomes: dict[str, Any]
+    e2e: Any
+    first_output: Any
+    preprocess: Any
+    engine: Any
+    delivery: Any
 
 
 class ServingMetrics:
@@ -120,27 +139,117 @@ class ServingMetrics:
             registry=self.registry,
         )
         self.registry.register(_InFlight(model_name, in_flight))
-        self._seen_modalities: set[str] = set()
+
+        # Where a successful request's time went, from the timestamps it
+        # carries. The conductor's perf_counter is compared with this
+        # process's: both read the host's monotonic clock.
+        stages = ["model_name", "output_modalities"]
+        self.preprocess_latency = Histogram(
+            "mstar_request_preprocess_seconds",
+            "Successful requests: submission to the data worker handing the "
+            "request to the conductor, including its wait in the data worker's queue.",
+            stages, buckets=STAGE_BUCKETS, registry=self.registry,
+        )
+        self.engine_latency = Histogram(
+            "mstar_request_engine_seconds",
+            "Successful requests: conductor ingest to conductor finish.",
+            stages, buckets=E2E_BUCKETS, registry=self.registry,
+        )
+        self.delivery_latency = Histogram(
+            "mstar_request_delivery_seconds",
+            "Successful requests: conductor finish to the result leaving the API server.",
+            stages, buckets=STAGE_BUCKETS, registry=self.registry,
+        )
+
+        # Output volume, counted per chunk as it reaches the API server, for
+        # every request; modality names come from the model's graph.
+        self.output_chunks = Counter(
+            "mstar_output_chunks",
+            "Result chunks that reached the API server, by modality.",
+            ["model_name", "modality"], registry=self.registry,
+        )
+        self.output_bytes = Counter(
+            "mstar_output_bytes",
+            "Bytes of result chunks that reached the API server, by modality.",
+            ["model_name", "modality"], registry=self.registry,
+        )
+        self.output_audio_seconds = Counter(
+            "mstar_output_audio_seconds",
+            "Seconds of audio in the result chunks that reached the API server.",
+            ["model_name"], registry=self.registry,
+        ).labels(model_name)
+        self.time_to_first_chunk = Histogram(
+            "mstar_time_to_first_chunk_seconds",
+            "Successful requests: submission to the first result chunk of each "
+            "output modality reaching the API server.",
+            ["model_name", "modality"], buckets=FIRST_OUTPUT_BUCKETS, registry=self.registry,
+        )
+        # Label lookups resolved once per modality set or modality. Two
+        # threads may resolve the same key at once; labels() returns the same
+        # series to both, so the race is harmless.
+        self._request_series: dict[str, _RequestSeries] = {}
+        self._first_chunk_series: dict[str, Any] = {}
+        self._chunk_series: dict[str, tuple] = {}
+
+    def _series(self, modalities: str) -> _RequestSeries:
+        series = self._request_series.get(modalities)
+        if series is None:
+            labels = (self.model_name, modalities)
+            series = _RequestSeries(
+                # Exported at 0 from here on: rate() and increase() miss the
+                # first increment of a series that appears at 1.
+                outcomes={o: self.requests.labels(*labels, o) for o in OUTCOMES},
+                e2e=self.e2e_latency.labels(*labels),
+                first_output=self.time_to_first_output.labels(*labels),
+                preprocess=self.preprocess_latency.labels(*labels),
+                engine=self.engine_latency.labels(*labels),
+                delivery=self.delivery_latency.labels(*labels),
+            )
+            self._request_series[modalities] = series
+        return series
 
     def record(self, req: PendingRequest, outcome: str) -> None:
         """Count one request that left the API server's table."""
         now = time.perf_counter()
-        modalities = modalities_label(req.output_modalities)
-        if modalities not in self._seen_modalities:
-            # rate() and increase() miss the first increment of a series that
-            # appears at 1, so every outcome is exported at 0 from here on.
-            for o in OUTCOMES:
-                self.requests.labels(self.model_name, modalities, o)
-            self._seen_modalities.add(modalities)
-        self.requests.labels(self.model_name, modalities, outcome).inc()
+        series = self._series(modalities_label(req.output_modalities))
+        series.outcomes[outcome].inc()
         if outcome != "success":
             return
         timing = req.profile.timing
-        self.e2e_latency.labels(self.model_name, modalities).observe(
-            now - timing.recv_time)
+        series.e2e.observe(now - timing.recv_time)
         if timing.first_chunk_time is not None:
-            self.time_to_first_output.labels(self.model_name, modalities).observe(
-                timing.first_chunk_time - timing.recv_time)
+            series.first_output.observe(timing.first_chunk_time - timing.recv_time)
+        if timing.preprocess_finish_time is not None:
+            series.preprocess.observe(timing.preprocess_finish_time - timing.recv_time)
+        # Every successful request got its RequestComplete, which carries
+        # both; a value from another host's clock would come out negative.
+        if timing.conductor_finish_time is not None and now >= timing.conductor_finish_time:
+            series.engine.observe(timing.conductor_finish_time - timing.conductor_ingest_time)
+            series.delivery.observe(now - timing.conductor_finish_time)
+        for modality, first in req.first_chunk_times.items():
+            first_chunk = self._first_chunk_series.get(modality)
+            if first_chunk is None:
+                first_chunk = self.time_to_first_chunk.labels(self.model_name, modality)
+                self._first_chunk_series[modality] = first_chunk
+            first_chunk.observe(first - timing.recv_time)
+
+    def record_chunk(self, modality: str, data: bytes, metadata: dict | None) -> None:
+        """Count one result chunk that reached the API server (not an error chunk)."""
+        series = self._chunk_series.get(modality)
+        if series is None:
+            series = (self.output_chunks.labels(self.model_name, modality),
+                      self.output_bytes.labels(self.model_name, modality))
+            self._chunk_series[modality] = series
+        chunks, nbytes = series
+        chunks.inc()
+        nbytes.inc(len(data))
+        if modality == "audio" and metadata:
+            # Chunks from the result-token path carry no sample rate.
+            rate = metadata.get("sample_rate")
+            if rate:
+                channels = metadata.get("num_channels") or 1
+                self.output_audio_seconds.inc(
+                    len(data) / (_AUDIO_BYTES_PER_SAMPLE * channels * rate))
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

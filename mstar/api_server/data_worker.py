@@ -160,6 +160,8 @@ class PreprocessWorker:
         self.discard_tensor_queue = queue.Queue()
         self.output_queue = queue.Queue()
         self.profile_queue = queue.Queue()
+        # Set by report_preprocess_finish(); read by the worker thread.
+        self.timing_requested = threading.Event()
         self.stop_event = threading.Event()
         # Wakes the thread's idle wait: every producer below signals it.
         self.wakeup = EventWakeup()
@@ -205,11 +207,17 @@ class PreprocessWorker:
                 tensor_manager=self.tensor_manager,
                 model=model,
                 enable_prof=enable_prof,
+                timing_requested=self.timing_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
             )
         )
         self.thread.start()
+
+    def report_preprocess_finish(self) -> None:
+        """Put each request's preprocess-finish time on the profile queue
+        without ``--log-stats`` too (``mstar_request_preprocess_seconds``)."""
+        self.timing_requested.set()
 
     def _signal(self):
         """End the thread's idle wait: new work is queued. getattr: tests
@@ -432,6 +440,7 @@ class PreprocessWorkerThread:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
+        timing_requested: threading.Event | None = None,
     ):
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
@@ -466,6 +475,8 @@ class PreprocessWorkerThread:
         self.device = device
         self.model = model
         self.enable_prof = enable_prof
+        # Preprocess-finish times are reported when enable_prof or this is set.
+        self.timing_requested = timing_requested if timing_requested is not None else threading.Event()
         # This thread turns each output tensor into client-ready bytes. At 720p
         # that is an 11 MiB SHM read plus a postprocess copy per engine step,
         # downstream of the last worker-side NVTX range.
@@ -644,11 +655,11 @@ class PreprocessWorkerThread:
         # the *raw* inputs. ``perf_counter`` is consistent here because the worker
         # runs as a thread inside the API server process. (tx/rx are snapshotted
         # directly by the main thread at request completion — see APIServer.)
-        if self.enable_prof:
+        if self.enable_prof or self.timing_requested.is_set():
             self.profile_queue.put(DataWorkerProfile(
                 request_id=input.request_id,
                 preprocess_finish_time=time.perf_counter(),
-                inputs=self._summarize_inputs(input),
+                inputs=self._summarize_inputs(input) if self.enable_prof else [],
             ))
 
     def _prefix_keys(

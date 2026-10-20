@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 from mstar.api_server import entrypoint
 from mstar.api_server.request_types import (
     APIServerMessage,
+    DataWorkerProfile,
     RequestComplete,
     RequestFailed,
     ResultChunk,
@@ -34,15 +35,25 @@ TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
 
 class _DataWorker:
-    """What the API server calls on its data worker."""
+    """What the API server calls on its data worker. Like the real one, it
+    reports each request's preprocess-finish time once asked to."""
 
     def __init__(self):
         self.inputs = []
         self.aborted = []
         self.chunks = queue.Queue()
+        self.profiles = queue.Queue()
+        self.reporting = False
+
+    def report_preprocess_finish(self):
+        self.reporting = True
 
     def new_request(self, inp):
         self.inputs.append(inp)
+        if self.reporting:
+            self.profiles.put(DataWorkerProfile(
+                request_id=inp.request_id, preprocess_finish_time=time.perf_counter(),
+            ))
 
     def abort_request(self, key):
         self.aborted.append(key)
@@ -54,7 +65,10 @@ class _DataWorker:
         return out
 
     def get_profile_updates(self):
-        return []
+        out = []
+        while not self.profiles.empty():
+            out.append(self.profiles.get())
+        return out
 
     def has_pending_tensors(self, key):
         return False
@@ -89,13 +103,18 @@ class _Served:
     def key(self, i=0):
         return self.data_worker.inputs[i].request_id
 
-    def answer(self, key, data=b"hi"):
-        """The engine's result chunk, then its completion, as the real data
-        worker and conductor deliver them."""
-        self.data_worker.chunks.put(ResultChunk(request_id=key, modality="text", data=data))
+    def answer(self, key, data=b"hi", chunks=None, ingest=None, finish=None):
+        """The engine's result chunks (one text chunk unless given), then its
+        completion, as the real data worker and conductor deliver them.
+        ``ingest`` and ``finish`` are the conductor's perf_counter stamps."""
+        chunks = chunks or [ResultChunk(request_id=key, modality="text", data=data)]
+        for chunk in chunks:
+            self.data_worker.chunks.put(chunk)
+        finish = time.perf_counter() if finish is None else finish
         self.conductor.inbox.put(APIServerMessage("request_complete", RequestComplete(
-            request_id=key, output_chunk_counts={"text": 1},
-            conductor_ingest_time=0.0, conductor_finish_time=0.0,
+            request_id=key, output_chunk_counts={"out": len(chunks)},
+            conductor_ingest_time=finish if ingest is None else ingest,
+            conductor_finish_time=finish,
         )))
 
     def fail(self, key, status=500):
@@ -358,6 +377,171 @@ def test_every_outcome_is_exported_at_zero_once_its_modalities_are_seen(served):
                 if ("mstar_requests_total", _labels(output_modalities="text", outcome=o)) in samples}
     assert exported == {"success": 0, "error": 0, "abort": 1, "timeout": 0}
     assert ("mstar_requests_total", _labels(output_modalities="audio", outcome="error")) not in samples
+
+
+def _hist(samples, name, **labels):
+    """(count, sum) of one histogram series."""
+    key = _labels(**labels)
+    return samples.get((f"{name}_count", key), 0), samples.get((f"{name}_sum", key), 0.0)
+
+
+def test_a_request_s_stages_are_observed_from_its_timestamps(served):
+    """Preprocess ends at the data worker's handoff; engine and delivery split
+    at the conductor's finish stamp on RequestComplete."""
+    stamps = {}
+
+    async def run():
+        transport = httpx.ASGITransport(app=entrypoint.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            pending = asyncio.create_task(client.post("/generate", data={"text": "hi"}))
+            while not served.data_worker.inputs:
+                await asyncio.sleep(0.005)
+            stamps["ingest"] = time.perf_counter()
+            await asyncio.sleep(0.05)
+            stamps["finish"] = time.perf_counter()
+            served.answer(served.key(), ingest=stamps["ingest"], finish=stamps["finish"])
+            return await pending
+
+    assert asyncio.run(run()).status_code == 200
+
+    s = served.scrape()
+    e2e_n, e2e = _hist(s, "mstar_e2e_request_latency_seconds", output_modalities="text")
+    pre_n, pre = _hist(s, "mstar_request_preprocess_seconds", output_modalities="text")
+    eng_n, eng = _hist(s, "mstar_request_engine_seconds", output_modalities="text")
+    dlv_n, dlv = _hist(s, "mstar_request_delivery_seconds", output_modalities="text")
+    assert e2e_n == pre_n == eng_n == dlv_n == 1
+    assert eng == pytest.approx(stamps["finish"] - stamps["ingest"])
+    assert pre > 0 and dlv > 0
+    # The three stages do not overlap, so together they fit in the request.
+    assert pre + eng + dlv <= e2e
+
+
+def test_output_is_counted_per_modality_and_each_first_chunk_is_timed(served):
+    pcm = b"\0\0" * 2400  # 0.1 s of 24 kHz mono 16-bit PCM
+    served.server.submit_request(text="x", request_id="r", streaming=False,
+                                 input_modalities=["text"], output_modalities=["text", "audio"])
+    key = served.key()
+    served.answer(key, chunks=[
+        ResultChunk(request_id=key, modality="text", data=b"hello"),
+        ResultChunk(request_id=key, modality="audio", data=pcm,
+                    metadata={"sample_rate": 24000, "num_channels": 1}),
+        ResultChunk(request_id=key, modality="audio", data=pcm * 2,
+                    metadata={"sample_rate": 24000, "num_channels": 2}),
+        ResultChunk(request_id=key, modality="text", data=b"!"),
+    ])
+    assert len(asyncio.run(served.server.collect_results("r"))) == 4
+    # A dropped stream's chunk is output too, but only successful requests
+    # are timed; an error chunk is neither.
+    async def drop():
+        served.server.submit_request(text="x", request_id="d", **TEXT)
+        stream = served.server.iter_result_chunks("d")
+        served.data_worker.chunks.put(ResultChunk(request_id=served.key(1), modality="text", data=b"a"))
+        assert (await stream.__anext__()).data == b"a"
+        await stream.aclose()
+
+    asyncio.run(drop())
+    served.server.submit_request(text="y", request_id="e", streaming=False, **TEXT)
+    served.data_worker.chunks.put(ResultChunk(
+        request_id=served.key(2), modality="error", data=b"bad image", metadata={"status": 400}))
+    with pytest.raises(HTTPException):
+        asyncio.run(served.server.collect_results("e"))
+
+    s = served.scrape()
+    assert s[("mstar_output_chunks_total", _labels(modality="text"))] == 3
+    assert s[("mstar_output_bytes_total", _labels(modality="text"))] == len(b"hello!a")
+    assert s[("mstar_output_chunks_total", _labels(modality="audio"))] == 2
+    assert s[("mstar_output_bytes_total", _labels(modality="audio"))] == 3 * len(pcm)
+    assert s[("mstar_output_audio_seconds_total", _labels())] == pytest.approx(0.2)
+    assert not any(k[0].startswith("mstar_output") and ("modality", "error") in k[1] for k in s)
+    text_n, text_first = _hist(s, "mstar_time_to_first_chunk_seconds", modality="text")
+    audio_n, audio_first = _hist(s, "mstar_time_to_first_chunk_seconds", modality="audio")
+    assert (text_n, audio_n) == (1, 1)
+    assert 0 < text_first <= audio_first
+
+
+def test_with_metrics_off_no_chunk_is_timed(tmp_path):
+    data_worker, conductor = _DataWorker(), _Conductor()
+    server = make_test_api_server(
+        preprocess_worker=data_worker, communicator=conductor, upload_dir=tmp_path,
+    )
+    thread = threading.Thread(target=server._process_messages, daemon=True)
+    thread.start()
+    try:
+        server.submit_request(text="x", request_id="r", streaming=False, **TEXT)
+        key = data_worker.inputs[0].request_id
+        data_worker.chunks.put(ResultChunk(request_id=key, modality="text", data=b"a"))
+        _wait(lambda: server.pending_requests[key].chunks)
+        assert server.pending_requests[key].first_chunk_times == {}
+        assert not data_worker.reporting
+    finally:
+        server.running = False
+        thread.join(timeout=5)
+
+
+def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
+    """The real data worker thread stamps the handoff without ``--log-stats``
+    once ``report_preprocess_finish`` is called, and skips the input summary."""
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.request_types import PreprocessInput
+
+    class _Model:
+        def process_prompt(self, *args, **kwargs):
+            return None
+
+    class _TensorManager:
+        def store_and_return_tensor_info(self, request_id, tensors):
+            return {}
+
+        def register_for_send(self, request_id, tensor_infos):
+            pass
+
+        def get_ready_tensors(self):
+            return {}
+
+        def has_inflight_reads(self, request_id):
+            return False
+
+        def force_cleanup_request(self, request_id):
+            pass
+
+    sent = []
+    facade = PreprocessWorker.__new__(PreprocessWorker)
+    facade.timing_requested = threading.Event()
+    facade.profile_queue = queue.Queue()
+    stop = threading.Event()
+    worker = PreprocessWorkerThread(
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        profile_queue=facade.profile_queue, cleanup_request_queue=queue.Queue(),
+        abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
+        discard_tensor_queue=queue.Queue(), stop_event=stop,
+        communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
+                                           send=lambda entity, msg: sent.append(msg)),
+        tensor_manager=_TensorManager(), model=_Model(),
+        timing_requested=facade.timing_requested,
+    )
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+
+    def preprocess(key):
+        before = time.perf_counter()
+        worker.in_queue.put(PreprocessInput(
+            request_id=key, client_request_id=key, text="hi", file_paths=None,
+            model_kwargs={}, **TEXT))
+        _wait(lambda: len(sent) == int(key[-1]))
+        return before
+
+    try:
+        preprocess("k1")
+        facade.report_preprocess_finish()
+        before = preprocess("k2")
+        updates = facade.get_profile_updates()
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+    assert [u.request_id for u in updates] == ["k2"]
+    assert before < updates[0].preprocess_finish_time < time.perf_counter()
+    assert updates[0].inputs == []
 
 
 class _StopError(Exception):

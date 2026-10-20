@@ -245,13 +245,15 @@ def test_metrics_relay_the_api_server_registry_open_like_health():
     routes keep it."""
     pytest.importorskip("prometheus_client")
     from mstar.observability.metrics import ServingMetrics
+    from mstar.profile.format import RequestTiming
 
     with _running_stack(api_key="s3cret") as (port, stub, _bridge, _proc):
         stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 3)
         now = time.perf_counter()
-        timing = types.SimpleNamespace(recv_time=now - 0.4, first_chunk_time=now - 0.3)
+        timing = RequestTiming(recv_time=now - 0.4, first_chunk_time=now - 0.3)
         stub.metrics.record(types.SimpleNamespace(
             output_modalities=["text"], profile=types.SimpleNamespace(timing=timing),
+            first_chunk_times={"text": now - 0.3},
         ), "success")
         for headers in ({}, {"Authorization": "Bearer wrong"}):
             status, resp_headers, body = _get(port, "/metrics", headers)

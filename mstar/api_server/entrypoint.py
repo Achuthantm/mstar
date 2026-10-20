@@ -237,6 +237,8 @@ class PendingRequest:
     # The client's request_id. The engine knows the request by its key, so
     # the message thread restamps each chunk with this before the client sees it.
     request_id: str | None = None
+    # Output modality -> perf_counter of its first chunk; kept only with metrics on.
+    first_chunk_times: dict[str, float] = field(default_factory=dict)
 
     def notify(self) -> None:
         """Wake the streaming handler, from any thread."""
@@ -497,6 +499,7 @@ class APIServer:
         self.metrics = ServingMetrics(
             self.model_name, in_flight=lambda: len(self.pending_requests),
         )
+        self.preprocess_worker.report_preprocess_finish()
 
     # ----------------------------------------------------------
     # Submitting a request
@@ -825,6 +828,7 @@ class APIServer:
                 # the handlers are woken once per pass, after every chunk of
                 # the pass has been appended, not once per chunk
                 to_wake: dict[int, PendingRequest] = {}
+                metrics = self.metrics
                 for result_chunk in self.preprocess_worker.get_result_chunks():
                     logger.debug(
                         "Got result chunk of %s modality for request %s",
@@ -845,6 +849,8 @@ class APIServer:
                         if req.profile.timing.first_chunk_time is None:
                             req.profile.timing.first_chunk_time = now
                         req.profile.timing.last_chunk_time = now
+                        if metrics is not None and result_chunk.modality != "error":
+                            req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:
                             result_chunk.request_id = req.request_id
                         if result_chunk.modality == "error":
@@ -870,6 +876,10 @@ class APIServer:
                             # the data worker's per-request state once the
                             # client lets go of the request.
                             self.recently_completed[rid] = time.time()
+                    if metrics is not None and result_chunk.modality != "error":
+                        metrics.record_chunk(
+                            result_chunk.modality, result_chunk.data, result_chunk.metadata,
+                        )
                 if to_wake:
                     notify_many(to_wake.values())
             except Exception:
