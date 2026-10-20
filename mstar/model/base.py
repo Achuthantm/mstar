@@ -769,10 +769,12 @@ class Model(ABC):
         return TensorAndMetadata(img)
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        from torchcodec.decoders import AudioDecoder
+        # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
+        # FFmpeg build torchcodec happens to load (some base images ship a
+        # video-only one); torchcodec for the other containers.
+        from mstar.model.components.audio_features import load_audio_file
 
-        decoder = AudioDecoder(filepath, sample_rate=16000, num_channels=1)
-        audio = decoder.get_all_samples().data[0]
+        audio = load_audio_file(filepath, sample_rate=16000)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
