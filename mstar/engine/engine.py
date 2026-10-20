@@ -1647,7 +1647,8 @@ class Engine:
     def _postprocess_batch(
         self, batch: ExecutingBatch, outputs: BatchedModelOutput,
     ) -> None:
-        submodule = self._submodules[batch.node_name].submodule
+        submodule_mgmt = self._submodules[batch.node_name]
+        submodule = submodule_mgmt.submodule
         for rid, node_inputs in zip(batch.request_ids, batch.inputs, strict=True):
             try:
                 submodule.postprocess(
@@ -1676,6 +1677,7 @@ class Engine:
                     outputs,
                     {rid: batch.per_request_info_wrapped[rid] for rid in rids},
                     [node_inputs for _, node_inputs in live],
+                    piecewise_runners=submodule_mgmt.piecewise_runners,
                 )
             except Exception as error:
                 logger.exception(
@@ -1702,10 +1704,12 @@ class Engine:
             if not batch.rows_only:
                 self.postprocess_batch(batch, outputs)
             else:
-                submodule = self._submodules[batch.node_name].submodule
+                submodule_mgmt = self._submodules[batch.node_name]
+                submodule = submodule_mgmt.submodule
                 if type(submodule).batch_postprocess is not NodeSubmodule.batch_postprocess:
                     submodule.batch_postprocess(
                         outputs, batch.per_request_info_wrapped, batch.inputs,
+                        piecewise_runners=submodule_mgmt.piecewise_runners,
                     )
             for rid in batch.cached_rids:
                 self._runner.complete_cached_walk(rid, batch.node_name, batch.graph_walk)
