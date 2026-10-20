@@ -1647,6 +1647,11 @@ class TensorCommunicationManager(ABC):
         """
         self.cleanup_request(request_id, force=True)
 
+    def unlink_owned_files(self) -> None:  # noqa: B027
+        """Unlink the shared-memory files this process wrote for its peers and
+        still owns. A no-op here: only the SHM file transport (and the arena's
+        spills) writes any."""
+
 
 # ---------------------------------------------------------------------------
 # MooncakeCommunicationManager
@@ -2171,6 +2176,20 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
             except FileNotFoundError:
                 pass
         self.tensor_store.remove_tensor(uuid)
+
+    def unlink_owned_files(self) -> None:
+        """Unlink every tensor file this manager wrote that is still waiting
+        for its TENSOR_RECEIVED or REMOVE_REQUEST, for a process that is
+        stopping. A second call finds nothing left."""
+        files = self._shm_files
+        while files:
+            _, path = files.popitem()
+            try:
+                os.unlink(path)
+            except OSError:
+                # Already gone (FileNotFoundError) or not removable: either
+                # way, keep going so the rest are still reclaimed.
+                pass
 
 
 # ---------------------------------------------------------------------------
