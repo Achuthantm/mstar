@@ -11,10 +11,11 @@ Not thread-safe: update and snapshot a recorder from one thread.
 from __future__ import annotations
 
 from bisect import bisect_left
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import accumulate
 
-from mstar.observability.catalog import Family
+from mstar.observability.catalog import HISTOGRAM, Family
 
 Labels = tuple[str, ...]
 
@@ -78,3 +79,31 @@ class Histogram:
             bucket_counts=[list(accumulate(c)) for c in self._counts.values()],
             sums=list(self._sums.values()),
         )
+
+
+def merge(family: Family, snapshots: Iterable[MetricSnapshot]) -> MetricSnapshot:
+    """One snapshot of ``family`` summing the series of ``snapshots`` that
+    share label values: several processes' views of one deployment (the
+    replicas of a graph node on different workers, say)."""
+    values: dict[Labels, float] = {}
+    counts: dict[Labels, list[int]] = {}
+    sums: dict[Labels, float] = {}
+    for snap in snapshots:
+        if family.kind != HISTOGRAM:
+            for row, value in zip(snap.label_values, snap.values, strict=True):
+                key = tuple(row)
+                values[key] = values.get(key, 0.0) + value
+            continue
+        for row, row_counts, total in zip(
+                snap.label_values, snap.bucket_counts, snap.sums, strict=True):
+            key = tuple(row)
+            have = counts.get(key)
+            counts[key] = list(row_counts) if have is None else [
+                a + b for a, b in zip(have, row_counts, strict=True)]
+            sums[key] = sums.get(key, 0.0) + total
+    if family.kind != HISTOGRAM:
+        return MetricSnapshot(family.name, [list(k) for k in values], list(values.values()))
+    return MetricSnapshot(
+        family.name, [list(k) for k in counts],
+        bucket_counts=list(counts.values()), sums=list(sums.values()),
+    )

@@ -35,7 +35,7 @@ from mstar.engine.resources import KVReqConfig, ResourceReqConfig
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
-from mstar.observability.recorders import Gauge
+from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
@@ -186,8 +186,10 @@ def _worker_process_target(
     log_level: str = "INFO",
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
+    status_interval_s: float | None = None,
 ):
-    """Top-level target for spawned worker processes. Must be module-level for picklability."""
+    """Top-level target for spawned worker processes. Must be module-level for
+    picklability. ``status_interval_s`` turns on the worker's metrics."""
     # before anything in this process touches the device runtime
     apply_process_env_defaults()
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
@@ -235,6 +237,7 @@ def _worker_process_target(
             device=torch.device(device),
             tensor_comm_protocol=tensor_comm_protocol,
             tcp_transfer_device=tcp_transfer_device,
+            status_interval_s=status_interval_s,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -512,6 +515,8 @@ class Conductor:
         self._components = sorted({n for nodes in self._wg_nodes.values() for n in nodes})
         self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
         self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
+        # worker id -> its latest WorkerStatus snapshots (cumulative)
+        self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
 
         os.makedirs(socket_path_prefix, exist_ok=True)
         self._derive_worker_info()
@@ -652,7 +657,8 @@ class Conductor:
                     "device": worker_device(self.device_type, rank, self.rank_devices),
                     "log_level": self.log_level,
                     "tensor_comm_protocol": self.tensor_comm_protocol,
-                    "tcp_transfer_device": self.tcp_transfer_device
+                    "tcp_transfer_device": self.tcp_transfer_device,
+                    "status_interval_s": self._status_interval_s,
                 },
                 daemon=False,
             )
@@ -1814,6 +1820,8 @@ class Conductor:
             self._fail_requests(message.body)
         elif message.message_type == ConductorMessageType.READS_DONE:
             self._handle_reads_done(message.body)
+        elif message.message_type == ConductorMessageType.WORKER_STATUS:
+            self._worker_metrics[message.body.worker_id] = message.body.metrics
         elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
             rid = message.body.request_id
             # Draining requests linger in self.requests (concurrency
@@ -1893,7 +1901,17 @@ class Conductor:
         states.set(("draining",), len(self.draining))
         for node, count in in_flight.items():
             self._in_flight_gauge.set((node,), count)
-        return ConductorStatus(metrics=[states.snapshot(), self._in_flight_gauge.snapshot()])
+        # Summed across workers: a node's replicas each report their own; the
+        # other ranks of a lockstep instance report nothing.
+        by_family: dict[str, list[MetricSnapshot]] = {}
+        for snapshots in self._worker_metrics.values():
+            for snap in snapshots:
+                by_family.setdefault(snap.name, []).append(snap)
+        return ConductorStatus(metrics=[
+            states.snapshot(), self._in_flight_gauge.snapshot(),
+            *(merge(family, by_family.get(name, ()))
+              for name, family in catalog.WORKER_FAMILIES.items()),
+        ])
 
     def run(self):
         from mstar.utils.profiler import range_pop, range_push

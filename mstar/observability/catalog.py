@@ -55,8 +55,69 @@ REQUEST_QUEUE_SECONDS = Family(
     ),
 )
 
+KV_PAGES_USED = Family(
+    "mstar_kv_pages_used", GAUGE,
+    "Pages of a paged KV cache not on its free list: held by requests, or kept "
+    "by the prefix cache (see mstar_kv_pages_cached).",
+    ("component", "resource"),
+)
+KV_PAGES_TOTAL = Family(
+    "mstar_kv_pages_total", GAUGE,
+    "Pages of a paged KV cache that requests can hold.",
+    ("component", "resource"),
+)
+KV_PAGES_CACHED = Family(
+    "mstar_kv_pages_cached", GAUGE,
+    "Pages of a paged KV cache its prefix cache names, including pages "
+    "running requests also hold; the cache frees the others on demand.",
+    ("component", "resource"),
+)
+STEP_SECONDS = Family(
+    "mstar_step_seconds", HISTOGRAM,
+    "Engine steps: from the later of the step's hand-off to the GPU thread and "
+    "the end of the worker's previous step, to the end of this step's "
+    "postprocess. In steady state, the interval between step completions.",
+    ("component", "graph_walk"),
+    buckets=(
+        0.0005, 0.001, 0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03,
+        0.05, 0.075, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+    ),
+)
+BATCH_SIZE = Family(
+    "mstar_batch_size", HISTOGRAM,
+    "Engine steps: rows the step's forward ran.",
+    ("component", "graph_walk"),
+    buckets=(1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0),
+)
+PREFIX_CACHE_QUERY_TOKENS = Family(
+    "mstar_prefix_cache_query_tokens_total", COUNTER,
+    "Prompt tokens looked up in the prefix cache, once per request.",
+    ("component",),
+)
+PREFIX_CACHE_HIT_TOKENS = Family(
+    "mstar_prefix_cache_hit_tokens_total", COUNTER,
+    "Prompt tokens the prefix cache already held at that lookup.",
+    ("component",),
+)
+COMPONENT_PENDING_STEPS = Family(
+    "mstar_component_pending_steps", GAUGE,
+    "Requests whose next step on this graph node is ready (its inputs arrived) "
+    "but not in a running step: waiting for a batch slot, or for the worker to "
+    "schedule the node.",
+    ("component",),
+)
+
+#: Families the engine workers report to the conductor (``WorkerStatus``); the
+#: conductor sums the workers' series and forwards them in its status message.
+WORKER_FAMILIES: dict[str, Family] = {
+    f.name: f for f in (
+        KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
+        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, COMPONENT_PENDING_STEPS,
+    )
+}
+
 #: Families the conductor's status message carries, exported from the latest
 #: message.
 STATUS_FAMILIES: dict[str, Family] = {
     f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT)
-}
+} | WORKER_FAMILIES

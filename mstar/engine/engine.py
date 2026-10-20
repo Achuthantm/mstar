@@ -8,7 +8,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, NamedTuple
 
 import torch
 
@@ -70,6 +70,7 @@ from mstar.utils.profiler import (
 )
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.kv.manager import KVManager
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,13 @@ def checkpoint_identity(path: str | Path) -> bytes:
     if config.is_file():
         parts.append(config.read_bytes())
     return fingerprint(*parts)
+
+
+class PagedKVCache(NamedTuple):
+    key: str
+    # the nodes on this engine that use it
+    nodes: frozenset[str]
+    cache: "KVManager"
 
 
 @dataclass
@@ -454,6 +462,8 @@ class Engine:
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
         self._resources: dict[str, Resource] = {}
+        # resource key -> the nodes on this engine that use it
+        self._resource_nodes: dict[str, frozenset[str]] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
         self._graph_runtime = graph_runtime
@@ -543,6 +553,7 @@ class Engine:
 
             for node in relevant_nodes:
                 node_to_resources.setdefault(node, []).append(spec.resource_key)
+            self._resource_nodes[spec.resource_key] = frozenset(relevant_nodes)
 
         # rid -> (node, walk) of its last step here when that step was rows-only,
         # i.e. the sampler's slot master holds the token its next step reads
@@ -581,6 +592,16 @@ class Engine:
                     enable = getattr(resource, "enable_device_loopback_reader", None)
                     if enable is not None:
                         enable()
+
+    def paged_kv_caches(self) -> list[PagedKVCache]:
+        """Every paged KV cache this engine built, with the nodes that use it."""
+        from mstar.engine.resources.kv.manager import KVManager
+
+        return [
+            PagedKVCache(key, self._resource_nodes[key], resource)
+            for key, resource in self._resources.items()
+            if isinstance(resource, KVManager)
+        ]
 
     def _compile_submodules(self) -> None:
         """Apply torch.compile to submodule forward paths.

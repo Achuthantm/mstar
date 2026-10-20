@@ -52,6 +52,7 @@ from mstar.utils.ipc_format import (
     UnpersistTensors,
     WorkerGraphsDone,
     WorkerMessage,
+    WorkerStatus,
 )
 
 # The abstract field types; a value of one of these carries [tag, body].
@@ -79,6 +80,7 @@ _TYPES: dict[str, type] = {
     "new_request_conductor": NewRequestConductor,
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
+    "worker_status": WorkerStatus,
     # api-server bodies
     "result_tensors": ResultTensors,
     "result_tokens": ResultTokens,
