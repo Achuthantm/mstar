@@ -719,3 +719,44 @@ def test_duplex_suite_end_to_end(tmp_path, fake_cmd):
     assert 0.30 <= m["stop_latency_s_p50"] <= 0.50  # and stops 5 frames after the barge-in frame
     assert m["text_latency_s_p50"] == pytest.approx(m["response_latency_s_p50"], abs=0.1)
     assert m["barge_in_applicable_rate"] == 1.0 and m["on_time_rate"] is not None
+
+
+def test_serve_python_puts_its_own_bin_dir_first_on_the_server_path(tmp_path):
+    from benchmark.eval.server import ManagedServer
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(sys.executable)
+    srv = ManagedServer("m", python=str(venv_bin / "python"), env={"PATH": "/usr/bin"})
+    assert srv.environment()["PATH"] == os.pathsep.join([str(venv_bin), "/usr/bin"])
+    assert ManagedServer("m", env={"PATH": "/usr/bin"}).environment()["PATH"] == "/usr/bin"
+    custom = ManagedServer("m", python=str(venv_bin / "python"), command=["x"], env={"PATH": "/usr/bin"})
+    assert custom.environment()["PATH"] == "/usr/bin"
+
+
+def test_server_info_names_the_tree_the_server_python_imports(tmp_path, monkeypatch):
+    from benchmark.eval.schema import collect_metadata
+    from benchmark.eval.server import ManagedServer
+
+    other = tmp_path / "other"
+    (other / "mstar").mkdir(parents=True)
+    (other / "mstar" / "__init__.py").write_text("")
+    (other / "pyproject.toml").write_text("[project]\nname = 'mstar-ai'\n")
+    git = ["git", "-C", str(other), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(other)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "served tree"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f'#!/bin/sh\nPYTHONPATH={other} exec {sys.executable} "$@"\n')
+    python.chmod(0o755)
+    eval_commit = collect_metadata()["git"].get("commit")
+    monkeypatch.chdir(tmp_path)  # the server's cwd comes first on its sys.path
+
+    info = ManagedServer("m", python=str(python)).info()
+    assert info["git"]["commit"] == head and info["git"]["describe"].endswith("served tree")
+    assert info["git"]["commit"] != eval_commit
+    assert set(info["versions"]) == {"mstar-ai", "torch", "transformers"}
+    assert str(tmp_path) not in json.dumps(info)
+    assert ManagedServer("m", command=["x"]).info()["git"] == {}
