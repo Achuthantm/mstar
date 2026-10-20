@@ -390,11 +390,11 @@ h200:omnivoice/clone_upload/correct:
   kind: audio_len
   swings: [0.0]
 h200:omnivoice/clone_upload/lat_p50_s@c1:
-  deltas: [-3.854, -2.616]
+  deltas: [-2.616]
 h200:omnivoice/clone_upload/req_per_s@c8:
-  deltas: [-0.978, 0.252]
+  deltas: [0.252]
 h200:omnivoice/clone_upload/ttft_p50_s@c1:
-  deltas: [-3.81, -2.626]
+  deltas: [-2.626]
 h200:omnivoice/tts/audio_s_per_s@c8:
   deltas: [-2.145, 2.349]
 h200:omnivoice/tts/correct:
@@ -474,7 +474,7 @@ h200:qwen3_omni/audio_out/req_per_s@c8:
 h200:qwen3_omni/audio_out/s_per_audio_s_p50@c1:
   deltas: [-1.285]
 h200:qwen3_omni/audio_out/ttft_p50_s@c1:
-  deltas: [-1.128, 3.122, 0.621]
+  deltas: [-1.128, 0.621]
 h200:qwen3_omni/decode_fixed/correct:
   kind: text_match
   swings: [0.0, 0.0, 0.0]
