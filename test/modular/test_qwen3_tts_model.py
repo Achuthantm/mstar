@@ -351,7 +351,10 @@ def test_qwen3_tts_process_prompt_matches_official_template():
     assert result.new_input_tensors["text_inputs"][0].tolist() == ASSISTANT_PREFIX + [1000] + ASSISTANT_SUFFIX
     # CustomVoice default: whole text in the prefill (stream_text = 0); no
     # reference transcript or frames. Host values, for the prefill's step metadata.
-    assert result.metadata == {PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055}
+    assert result.metadata == {
+        PROMPT_LAYOUT_KEY: [0, 1, 0, 0, 0], SPEAKER_ID_KEY: 3065, LANGUAGE_ID_KEY: 2055,
+        Qwen3TTSModel.CODEC_STREAM_LEAD_KEY: 0,
+    }
 
 
 def test_qwen3_tts_process_prompt_rejects_a_changed_chatml_wrapper(monkeypatch):
@@ -463,7 +466,7 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     )
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
-    assert Qwen3TTSModel.CODEC_STREAM_LEAD_KEY not in xvec.metadata   # no stream lead
+    assert xvec.metadata[Qwen3TTSModel.CODEC_STREAM_LEAD_KEY] == 0   # no stream lead
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(

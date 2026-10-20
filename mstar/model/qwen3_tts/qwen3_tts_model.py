@@ -792,6 +792,9 @@ class Qwen3TTSModel(Model):
 
     # model_kwargs key: reference frames leading an in-context clone's codec stream
     CODEC_STREAM_LEAD_KEY = "codec_stream_lead_frames"
+    INTERNAL_KWARGS = (
+        PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, CODEC_STREAM_LEAD_KEY,
+    )
 
     def process_prompt(
         self,
@@ -812,9 +815,9 @@ class Qwen3TTSModel(Model):
         a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
-        request sets ``non_streaming_mode``. An in-context clone also reports,
-        as ``CODEC_STREAM_LEAD_KEY``, how many reference frames lead the codec
-        stream (context only; see ``get_initial_forward_pass_args``).
+        request sets ``non_streaming_mode``. ``CODEC_STREAM_LEAD_KEY`` reports
+        how many reference frames lead the codec stream (context only, 0
+        without an in-context clone; see ``get_initial_forward_pass_args``).
         """
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
@@ -862,13 +865,13 @@ class Qwen3TTSModel(Model):
             PROMPT_LAYOUT_KEY: [instruct_ids.numel(), text_len, int(stream_text), ref_ids.numel(), ref_frames],
             SPEAKER_ID_KEY: speaker_id,
             LANGUAGE_ID_KEY: language_id,
+            # set in every mode (0 without an in-context clone): the data worker
+            # lays this over the request's own kwargs
+            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.left_context_frames),
         }
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
-        lead = min(ref_frames, self.config.codec.left_context_frames)
-        if lead:
-            metadata[self.CODEC_STREAM_LEAD_KEY] = lead
         return ProcessPromptOutput(
             {"text_inputs": [torch.cat([instruct_ids, assistant_ids, ref_ids])]}, metadata
         )

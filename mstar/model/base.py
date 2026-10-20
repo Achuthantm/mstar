@@ -335,6 +335,11 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # Keys only this model's process_prompt sets (prompt layouts, stream
+    # leads) for the conductor to read back from model_kwargs. The data
+    # worker drops a client's values for them before process_prompt.
+    INTERNAL_KWARGS: tuple[str, ...] = ()
+
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
     # default of one per core; ``preprocess_torch_threads`` in the model's

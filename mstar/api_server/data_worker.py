@@ -575,8 +575,10 @@ class PreprocessWorkerThread:
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
         # only this worker keys a prompt: a client that sent its own could name
-        # another request's pages and be served that request's KV
-        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout"):
+        # another request's pages and be served that request's KV. Likewise
+        # only process_prompt sets the model's INTERNAL_KWARGS.
+        internal = getattr(self.model, "INTERNAL_KWARGS", ())
+        for name in ("prefix_keys", "prefix_tail", "prefix_decode", "prefix_layout", *internal):
             model_kwargs.pop(name, None)
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
