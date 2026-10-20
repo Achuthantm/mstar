@@ -5,11 +5,18 @@ that streams microphone audio and wants partial transcripts:
 
 Client events
     ``transcription_session.update``  ``{"session": {"input_audio_transcription":
-    {"model", "language", "prompt"}, "input_audio_format": "pcm16", "mstar":
-    {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``
-    ``input_audio_buffer.append``      ``{"audio": <base64 PCM16 mono 16 kHz>}``
+    {"model", "language", "prompt"}, "input_audio_format", "turn_detection": null,
+    "mstar": {"chunk_seconds", "unfixed_chunks", "unfixed_tokens"}}}``
+    ``input_audio_buffer.append``      ``{"audio": <base64 PCM16 mono>}``
     ``input_audio_buffer.commit``      end of the utterance: flush and finish
     ``input_audio_buffer.clear``       drop buffered audio and start over
+
+``input_audio_format`` is ``"pcm16"`` (16 kHz, the default) or OpenAI's
+``{"type": "audio/pcm", "rate": 24000}``; 24 kHz audio is resampled to the
+model's 16 kHz as it arrives, so partial ``audio_seconds`` stay on the
+client's timeline. The rate changes only with an empty buffer. The server
+has no turn detection: ``turn_detection`` must be null (the session echoes
+null), and the client ends each utterance with a commit.
 
 ``chunk_seconds`` below ``MIN_CHUNK_SECONDS`` is raised to it and must not
 pass the item cap, and the unfixed counts are non-negative integers; numeric
@@ -70,6 +77,11 @@ from mstar.api_server.openai.protocol import TranscriptionRequest
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
+# Input rates a session accepts; 24 kHz (OpenAI's pcm rate) is resampled to SAMPLE_RATE.
+INPUT_SAMPLE_RATES = (16000, 24000)
+# Appends up to this many input samples (4 ms at 24 kHz) cost less to resample
+# than a thread hop, so they resample on the event loop; longer ones go to a thread.
+INLINE_RESAMPLE_SAMPLES = 96
 DEFAULT_CHUNK_SECONDS = 2.0
 DEFAULT_UNFIXED_CHUNKS = 2
 DEFAULT_UNFIXED_TOKENS = 5
@@ -136,32 +148,58 @@ class RealtimeSession:
     # the first byte of a sample whose second byte is in the next append;
     # kept across commit (the byte stream goes on), dropped by clear
     odd_byte: bytes = b""
+    # the client's audio rate; anything but SAMPLE_RATE goes through resampler
+    input_rate: int = SAMPLE_RATE
+    resampler: media_io.StreamResampler | None = None
+    # samples the last chunk was short of its boundary (see take_chunk)
+    short: int = 0
 
     @property
     def chunk_samples(self) -> int:
         return int(round(self.chunk_seconds * SAMPLE_RATE))
 
+    def set_input_rate(self, rate: int) -> None:
+        self.input_rate = rate
+        self.resampler = None if rate == SAMPLE_RATE else media_io.StreamResampler(rate, SAMPLE_RATE)
+
     def append(self, audio: np.ndarray) -> None:
+        if self.resampler is not None:
+            audio = self.resampler.push(audio)
         if audio.size:
             self.pending.append(audio)
             self.pending_samples += int(audio.size)
 
-    def item_samples(self) -> int:
-        return self.pending_samples + sum(int(a.size) for a in self.heard)
+    def item_samples(self, extra: int = 0) -> int:
+        """SAMPLE_RATE samples in the item once ``extra`` more input samples
+        arrive, rounded once over the whole item (not per append), so the cap
+        does not depend on how the audio was split."""
+        held = self.resampler.held(extra) if self.resampler is not None else extra
+        return self.pending_samples + held + sum(int(a.size) for a in self.heard)
 
     def take_chunk(self) -> np.ndarray | None:
         """Every full chunk of pending audio as one array, or None until
-        enough arrived."""
-        if self.pending_samples < self.chunk_samples:
+        enough arrived. Output the resampler still holds for its lookahead
+        counts toward the chunk, so a chunk of 24 kHz input is decoded on the
+        append that completes it, not the one after; the chunk is then short
+        by those samples (``short``), which go with the next one."""
+        held = self.resampler.held() if self.resampler is not None else 0
+        k = (self.pending_samples + held - self.short) // self.chunk_samples
+        if k <= 0:
             return None
+        n = min(self.pending_samples, k * self.chunk_samples + self.short)
+        self.short = k * self.chunk_samples + self.short - n
         buf = np.concatenate(self.pending)
-        n = self.pending_samples // self.chunk_samples * self.chunk_samples
         chunk, rest = buf[:n], buf[n:]
         self.pending = [rest] if rest.size else []
         self.pending_samples = int(rest.size)
         return chunk
 
     def flush(self) -> np.ndarray | None:
+        if self.resampler is not None:
+            tail = self.resampler.flush()
+            if tail.size:
+                self.pending.append(tail)
+                self.pending_samples += int(tail.size)
         if not self.pending_samples:
             return None
         buf = np.concatenate(self.pending)
@@ -172,7 +210,9 @@ class RealtimeSession:
         return np.concatenate(self.heard) if self.heard else np.zeros(0, dtype=np.float32)
 
     def clear(self) -> None:
-        self.pending, self.pending_samples, self.heard = [], 0, []
+        if self.resampler is not None:
+            self.resampler.reset()
+        self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
         self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
@@ -235,6 +275,28 @@ def _object(value, name: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be an object")
     return value
+
+
+def _input_rate(fmt, current: int) -> int:
+    """The input rate an ``input_audio_format`` declares (``current`` when
+    absent): ``"pcm16"`` is 16 kHz, as this endpoint has always read it;
+    OpenAI's ``{"type": "audio/pcm", "rate": N}`` names its rate (24 kHz when
+    left out, OpenAI's only one)."""
+    if fmt is None:
+        return current
+    if fmt == "pcm16":
+        return SAMPLE_RATE
+    if isinstance(fmt, dict) and fmt.get("type") == "audio/pcm":
+        if extra := sorted(set(fmt) - {"type", "rate"}):
+            # channels, encoding and the like would change how the bytes read
+            raise ValueError(f"input_audio_format takes only type and rate; got {_excerpt(extra)}")
+        rate = fmt.get("rate", 24000)
+        if not isinstance(rate, bool) and rate in INPUT_SAMPLE_RATES:
+            return int(rate)
+        raise ValueError(f"input_audio_format.rate must be 16000 or 24000; got {_excerpt(rate)}")
+    raise ValueError(
+        f'input_audio_format must be "pcm16" or {{"type": "audio/pcm", "rate": 24000}}; got {_excerpt(fmt)}'
+    )
 
 
 def _number(knobs: dict, name: str, default, lo: float, hi: float = math.inf, integer: bool = False,
@@ -361,7 +423,10 @@ class RealtimeTranscription:
         return {
             "id": s.session_id,
             "object": "realtime.transcription_session",
-            "input_audio_format": "pcm16",
+            "input_audio_format": (
+                "pcm16" if s.input_rate == SAMPLE_RATE else {"type": "audio/pcm", "rate": s.input_rate}
+            ),
+            "turn_detection": None,
             "input_audio_transcription": {
                 "model": self.model_name,
                 "language": s.request.language,
@@ -372,7 +437,7 @@ class RealtimeTranscription:
                 "unfixed_chunks": s.unfixed_chunks,
                 "unfixed_tokens": s.unfixed_tokens,
                 "max_item_seconds": s.max_item_seconds,
-                "sample_rate": SAMPLE_RATE,
+                "sample_rate": s.input_rate,
             },
         }
 
@@ -418,14 +483,21 @@ class RealtimeTranscription:
             except Exception:  # noqa: BLE001 — bad base64
                 await self.send(_error("audio is not base64"))
                 return
-            if s.item_samples() + audio.size > s.max_item_seconds * SAMPLE_RATE:
+            if s.item_samples(audio.size) > s.max_item_seconds * SAMPLE_RATE:
                 await self.send(_error(
                     f"the item would pass {s.max_item_seconds:g} s of audio; "
                     "commit or clear the input audio buffer first",
                 ))
                 return
             s.odd_byte = odd_byte
-            s.append(audio)
+            if not audio.size:
+                return
+            if s.resampler is None or audio.size <= INLINE_RESAMPLE_SAMPLES:
+                s.append(audio)
+            else:
+                # off the event loop: resampling a long append takes long enough
+                # to stall every other session on this server
+                await asyncio.to_thread(s.append, audio)
             if (chunk := s.take_chunk()) is not None:
                 await self.step(chunk)
         elif kind == "input_audio_buffer.commit":
@@ -451,9 +523,20 @@ class RealtimeTranscription:
     def update(self, session: dict) -> None:
         """Apply a session update, all or nothing."""
         s = self.session
-        fmt = session.get("input_audio_format")
-        if fmt not in (None, "pcm16"):
-            raise ValueError(f"only pcm16 input is supported; got {_excerpt(fmt)}")
+        rate = _input_rate(session.get("input_audio_format"), s.input_rate)
+        if rate != s.input_rate and s.item_samples():
+            raise ValueError("commit or clear the input audio buffer before changing the input sample rate")
+        if rate != s.input_rate and s.odd_byte:
+            # a commit keeps the half sample, so only clear helps
+            raise ValueError("half a sample is pending; clear the input audio buffer before changing "
+                             "the input sample rate")
+        if session.get("turn_detection") is not None:
+            td = session["turn_detection"]
+            kind = td.get("type") if isinstance(td, dict) else None
+            raise ValueError(
+                f"turn_detection {_excerpt(kind if isinstance(kind, str) else td)} is not supported; "
+                "set turn_detection to null and end each utterance with input_audio_buffer.commit"
+            )
         knobs = _object(session.get("mstar"), "mstar")
         chunk_seconds = _number(knobs, "chunk_seconds", s.chunk_seconds, MIN_CHUNK_SECONDS, s.max_item_seconds,
                                 clamp_low=True)
@@ -473,6 +556,8 @@ class RealtimeTranscription:
         request = TranscriptionRequest.model_validate({**s.request.model_dump(), **fields}) if fields else s.request
         s.request = request
         s.chunk_seconds, s.unfixed_chunks, s.unfixed_tokens = chunk_seconds, unfixed_chunks, unfixed_tokens
+        if rate != s.input_rate:
+            s.set_input_rate(rate)
 
     def current_text(self) -> str:
         return self.adapter.parse_transcript(self.session.raw_hypothesis, self.session.request).text
@@ -494,7 +579,8 @@ class RealtimeTranscription:
             return
         # a coalesced step counts every chunk it heard, so the prefix that keeps
         # sent text fixed starts after the same audio as with one step per chunk
-        s.chunk_id += max(1, chunk.size // s.chunk_samples)
+        # (rounded: at 24 kHz a chunk can be short by the resampler's lookahead)
+        s.chunk_id += max(1, round(chunk.size / s.chunk_samples))
         text = self.current_text()
         if final or tokenizer is None:
             hold = 0

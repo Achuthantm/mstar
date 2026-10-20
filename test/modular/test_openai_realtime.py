@@ -798,3 +798,210 @@ def test_request_error_from_the_engine_keeps_only_base_names_of_server_paths(cli
         message = json.loads(ws.receive_text())["error"]["message"]
     assert message == ("preprocessing failed: ValueError: cannot decode 3f2a.wav "
                        "(see codec.json); docs at https://example.com/a/b, lang en/US")
+
+
+def test_turn_detection_is_refused_and_echoed_as_null(client_and_stub):
+    """The server has no turn detection, so a client asking for one hears so
+    instead of waiting for commits that never come; the session says null."""
+    client, _ = client_and_stub
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        assert json.loads(ws.receive_text())["session"]["turn_detection"] is None
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "turn_detection": {"type": "server_vad", "silence_duration_ms": 500},
+            "input_audio_transcription": {"language": "en"},
+        }}))
+        err = json.loads(ws.receive_text())
+        assert err["type"] == "error" and "turn_detection 'server_vad' is not supported" in err["error"]["message"]
+        for td, shown in (({}, "turn_detection {} is"), ({"type": None}, "turn_detection {'type': None} is"),
+                          (False, "turn_detection False is")):
+            ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"turn_detection": td}}))
+            assert json.loads(ws.receive_text())["error"]["message"].startswith(shown)
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"turn_detection": None}}))
+        updated = json.loads(ws.receive_text())
+    assert updated["type"] == "transcription_session.updated"
+    assert updated["session"]["turn_detection"] is None
+    assert updated["session"]["input_audio_transcription"]["language"] is None  # the refused update changed nothing
+
+
+def test_24khz_input_is_resampled_onto_the_true_timeline(client_and_stub):
+    """OpenAI's pcm rate is 24 kHz. Declared, it is resampled as it arrives,
+    so one second of audio is one second to the model and in audio_seconds."""
+    client, stub = client_and_stub
+    heard = _step_samples(stub)
+    tone_24k = (np.sin(2 * np.pi * 440 * np.arange(24000) / 24000) * 8000).astype("<i2")
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}, "mstar": {"chunk_seconds": 0.5},
+        }}))
+        updated = json.loads(ws.receive_text())
+        assert updated["session"]["input_audio_format"] == {"type": "audio/pcm", "rate": 24000}
+        assert updated["session"]["mstar"]["sample_rate"] == 24000
+        for i in range(0, tone_24k.size, 240):  # 10 ms appends
+            _append_bytes(ws, tone_24k[i:i + 240].tobytes())
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+    partials = [e["audio_seconds"] for e in events if e["type"] == "mstar.transcription.partial"]
+    assert partials[-1] == pytest.approx(1.0)
+    assert len(heard[-1]) == 16000
+    tone_16k = np.sin(2 * np.pi * 440 * np.arange(16000) / 16000) * 8000
+    assert np.abs(heard[-1][50:-50] - tone_16k[50:-50]).max() < 4
+
+
+def test_24khz_chunk_is_decoded_on_the_append_that_completes_it(client_and_stub):
+    """The resampler's 3 ms lookahead does not hold a full chunk back until
+    the client's next append: the partial comes before the next event's reply."""
+    client, stub = client_and_stub
+    heard = _step_samples(stub)
+    tone = (np.sin(2 * np.pi * 440 * np.arange(24000) / 24000) * 8000).astype("<i2")
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}, "mstar": {"chunk_seconds": 0.5}}}))
+        ws.receive_text()
+        for half in (tone[:12000], tone[12000:]):
+            _append_bytes(ws, half.tobytes())
+            ws.send_text(json.dumps({"type": "transcription_session.update", "session": {}}))
+            events = _recv_until(ws, "transcription_session.updated")
+            assert [e["type"] for e in events][0] == "mstar.transcription.partial"
+        _commit(ws)
+    assert [len(h) for h in heard] == [7952, 15952, 16000]
+
+
+def test_24khz_chunk_boundaries_stay_on_the_item_timeline(client_and_stub):
+    """The lookahead samples count toward a boundary once: appends that end
+    just short of each 0.5 s boundary decode when the input passes it, so the
+    steps stay on 8000-sample boundaries and do not drift earlier."""
+    client, stub = client_and_stub
+    heard = _step_samples(stub)
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}, "mstar": {"chunk_seconds": 0.5}}}))
+        ws.receive_text()
+        for n in (12000, 11964, 11964, 11964):
+            _append_bytes(ws, _tone(n).tobytes())
+        _commit(ws)
+    assert [len(h) for h in heard] == [7952, 16000, 24000, 31928]
+
+
+def test_24khz_coalesced_step_counts_every_chunk_it_heard(client_and_stub):
+    """One append of two chunks is one step that counts both, so the stable
+    prefix starts where it would with one step per chunk."""
+    client, stub = client_and_stub
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}}}))
+        ws.receive_text()
+        _append_bytes(ws, _tone(96000).tobytes())
+        events = _recv_until(ws, "mstar.transcription.partial")
+    assert events[-1]["chunk_id"] == 2 and events[-1]["audio_seconds"] == pytest.approx(4.0, abs=0.004)
+
+
+def test_24khz_item_cap_does_not_depend_on_how_the_audio_was_split(client_and_stub, monkeypatch):
+    """At 24 kHz the cap rounds the whole item once: one second fits however
+    the appends split it, and one sample more is refused."""
+    client, stub = client_and_stub
+    monkeypatch.setattr(serving_realtime, "MAX_ITEM_SECONDS", 1.0)
+    heard = _step_samples(stub)
+    tone = (np.sin(2 * np.pi * 440 * np.arange(24001) / 24000) * 8000).astype("<i2")
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}, "mstar": {"chunk_seconds": 0.5}}}))
+        assert json.loads(ws.receive_text())["session"]["mstar"]["sample_rate"] == 24000
+        for piece in (tone[:1], tone[1:23999], tone[23999:24000], tone[24000:]):
+            _append_bytes(ws, piece.tobytes())
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1 and "would pass 1 s" in errors[0]["error"]["message"]
+    assert len(heard[-1]) == 16000
+
+
+def test_24khz_resampling_runs_off_the_event_loop(client_and_stub, monkeypatch):
+    """A long 24 kHz append is resampled in a worker thread, so it does not
+    stall the event loop every session shares; a short one, or one with no
+    whole sample, costs less than the hop and stays on the loop."""
+    import threading
+
+    from mstar.api_server import media_io
+
+    client, _ = client_and_stub
+    threads = {}
+    push, send = media_io.StreamResampler.push, serving_realtime.RealtimeTranscription.send
+
+    def recording_push(self, x):
+        threads.setdefault("resample", []).append((len(x), threading.get_ident()))
+        return push(self, x)
+
+    async def recording_send(self, event):
+        threads["loop"] = threading.get_ident()
+        await send(self, event)
+
+    monkeypatch.setattr(media_io.StreamResampler, "push", recording_push)
+    monkeypatch.setattr(serving_realtime.RealtimeTranscription, "send", recording_send)
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}}}))
+        ws.receive_text()
+        _append_bytes(ws, b"\x01")
+        _append_bytes(ws, b"\x02" + np.zeros(95, dtype="<i2").tobytes() + b"\x03")
+        _append_bytes(ws, np.zeros(24000, dtype="<i2").tobytes())
+        _commit(ws)
+    loop = threads["loop"]
+    assert [(n, t == loop) for n, t in threads["resample"]] == [(96, True), (24000, False)]
+
+
+def test_unsupported_rate_and_a_rate_change_mid_item_are_refused(client_and_stub):
+    client, stub = client_and_stub
+    with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
+        ws.receive_text()
+        for fmt, needle in (({"type": "audio/pcm", "rate": 44100}, "rate must be 16000 or 24000"),
+                            ("g711_ulaw", "input_audio_format must be"),
+                            ({"type": "audio/pcm", "rate": 24000, "channels": 2}, "takes only type and rate")):
+            ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"input_audio_format": fmt}}))
+            assert needle in json.loads(ws.receive_text())["error"]["message"]
+        _append_bytes(ws, _tone(800).tobytes())
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}}}))
+        assert "before changing the input sample rate" in json.loads(ws.receive_text())["error"]["message"]
+        _commit(ws)
+        # half a sample survives the commit, and only clear drops it
+        _append_bytes(ws, b"\x01")
+        _commit(ws)
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}}}))
+        assert "clear the input audio buffer" in json.loads(ws.receive_text())["error"]["message"]
+        ws.send_text(json.dumps({"type": "input_audio_buffer.clear"}))
+        assert json.loads(ws.receive_text())["type"] == "input_audio_buffer.cleared"
+        ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
+            "input_audio_format": {"type": "audio/pcm", "rate": 24000}}}))
+        assert json.loads(ws.receive_text())["session"]["mstar"]["sample_rate"] == 24000
+
+
+def test_stream_resampler_is_split_invariant_and_keeps_time():
+    from mstar.api_server.media_io import StreamResampler
+
+    rng = np.random.default_rng(0)
+    n = 24000 * 2 + 7
+    x = (np.sin(2 * np.pi * 1000 * np.arange(n) / 24000) * 0.5).astype(np.float32)
+    r = StreamResampler(24000, 16000)
+    whole = np.concatenate([r.push(x), r.flush()])
+    pieces, i = [], 0
+    while i < n:
+        step = int(rng.integers(1, 700))
+        pieces.append(r.push(x[i:i + step]))
+        i += step
+    pieces.append(r.flush())
+    assert whole.size == -(-n * 2 // 3)
+    assert np.array_equal(np.concatenate(pieces), whole)
+    exact = np.sin(2 * np.pi * 1000 * np.arange(whole.size) / 16000) * 0.5
+    assert np.abs(whole[50:-50] - exact[50:-50]).max() < 1e-4
+    # above the 8 kHz Nyquist of the output: filtered, not folded back
+    for hz in (8250, 10000):  # just past the Nyquist folds to just under it
+        alias = np.sin(2 * np.pi * hz * np.arange(n) / 24000).astype(np.float32)
+        out = np.concatenate([r.push(alias), r.flush()])
+        assert np.sqrt((out[100:-100] ** 2).mean()) < 1e-3, hz

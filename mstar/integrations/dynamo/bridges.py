@@ -774,22 +774,37 @@ class RealtimeBridge:
                         # audio/pcma) — closes the socket upstream as a
                         # malformed frame. What arrives here is a complete GA
                         # audio object or nothing.
-                        session = event.get("session")
-                        fmt = {}
+                        served_in = {}
                         if isinstance(session, dict):
-                            fmt = ((session.get("audio") or {}).get("input") or {}).get("format") or {}
+                            served_in = (session.get("audio") or {}).get("input") or {}
+                        session = event.get("session")
+                        audio_in = {}
+                        if isinstance(session, dict):
+                            audio_in = (session.get("audio") or {}).get("input") or {}
+                        fmt = (audio_in.get("format") or {}) if isinstance(audio_in, dict) else {}
+                        refused = None
                         if isinstance(fmt, dict) and fmt.get("type") not in (None, "audio/pcm"):
-                            out_stream.put_nowait(self._error(
-                                f"unsupported input audio format {fmt.get('type')!r}; "
-                                "only audio/pcm is supported",
-                                etype="invalid_request_error",
-                                code="unsupported_audio_format"))
+                            refused = (f"unsupported input audio format {fmt.get('type')!r}; "
+                                       "only audio/pcm is supported")
                         elif isinstance(fmt, dict) and fmt.get("rate") not in (None, 24000):
+                            refused = f"unsupported input audio rate {fmt.get('rate')!r}; only 24000 is supported"
+                        if refused:
+                            # keep reading the audio as before, and echo that
                             out_stream.put_nowait(self._error(
-                                f"unsupported input audio rate {fmt.get('rate')!r}; "
-                                "only 24000 is supported",
+                                refused, etype="invalid_request_error", code="unsupported_audio_format"))
+                            kept = served_in.get("format") if isinstance(served_in, dict) else None
+                            audio_in = {**audio_in, "format": kept or {"type": "audio/pcm", "rate": 24000}}
+                            session = {**session, "audio": {**session["audio"], "input": audio_in}}
+                        if isinstance(audio_in, dict) and audio_in.get("turn_detection") is not None:
+                            # no server turn detection: say so, and echo the
+                            # session as served rather than as asked
+                            out_stream.put_nowait(self._error(
+                                "server turn detection is not supported; set audio.input.turn_detection "
+                                "to null and end each turn with input_audio_buffer.commit",
                                 etype="invalid_request_error",
-                                code="unsupported_audio_format"))
+                                code="unsupported_turn_detection"))
+                            session = {**session, "audio": {**session["audio"],
+                                                            "input": {**audio_in, "turn_detection": None}}}
                         out_stream.put_nowait(self._session_updated(session))
                     elif etype == "input_audio_buffer.append":
                         raw = _decode_pcm16_b64(event.get("audio", ""))
