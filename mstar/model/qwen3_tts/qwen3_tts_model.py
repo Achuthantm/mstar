@@ -650,13 +650,20 @@ class Qwen3TTSModel(Model):
         import torchaudio.functional as audio_functional
 
         from mstar.api_server.media_io import check_resample_rate
+        from mstar.model.media_limits import read_sound_file, sound_file_seconds
 
         # Bound the clip before decoding it: a small compressed file can hold hours of audio.
         info = soundfile.info(filepath)
         target_rate = self.config.codec.input_sample_rate
         check_resample_rate(info.samplerate, target_rate)
-        self._check_reference_duration(info.frames / info.samplerate)
-        waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
+        seconds = sound_file_seconds(info.frames, info.samplerate)
+        if seconds is not None:
+            self._check_reference_duration(seconds)
+            waveform, sample_rate = soundfile.read(filepath, dtype="float32", always_2d=True)
+        else:
+            # no sample count in the header (a FLAC written to a pipe): count it as it decodes
+            waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
+            self._check_reference_duration(len(waveform) / sample_rate)
         audio = torch.from_numpy(waveform).mean(dim=1)
         if sample_rate != target_rate:
             audio = audio_functional.resample(audio, sample_rate, target_rate)

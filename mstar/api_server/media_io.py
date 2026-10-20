@@ -243,9 +243,16 @@ def check_ref_audio(path: str, decoder: str) -> None:
         else:
             import soundfile
 
+            from mstar.model.media_limits import count_sound_file_seconds, sound_file_seconds
+
             info = soundfile.info(path)
             _require_ref_audio_rate(info.samplerate)
-            _require_ref_audio_seconds(info.frames / info.samplerate)
+            seconds = sound_file_seconds(info.frames, info.samplerate)
+            if seconds is None:
+                # no sample count in the header (a FLAC written to a pipe)
+                with _ref_audio_decodes:
+                    seconds = count_sound_file_seconds(path, MAX_REF_AUDIO_SECONDS)
+            _require_ref_audio_seconds(seconds)
     except RefAudioTooLongError:
         Path(path).unlink(missing_ok=True)
         raise
