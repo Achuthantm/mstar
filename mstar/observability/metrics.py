@@ -56,7 +56,7 @@ from mstar.observability.recorders import MetricSnapshot
 
 if TYPE_CHECKING:
     from mstar.api_server.entrypoint import PendingRequest
-    from mstar.api_server.request_types import ConductorStatus
+    from mstar.api_server.request_types import ConductorStatus, DataWorkerProfile
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,14 @@ STAGE_BUCKETS = (
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
     1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
 )
+# Input files: a few KiB for a small image to MSTAR_MAX_BODY_MB (128 MiB by
+# default) and the transcription route's larger cap.
+_MiB = 1 << 20
+UPLOAD_SIZE_BUCKETS = (
+    1 << 10, 4 << 10, 16 << 10, 32 << 10, 64 << 10, 128 << 10, 256 << 10, 512 << 10,
+    _MiB, 2 * _MiB, 4 * _MiB, 8 * _MiB, 16 * _MiB, 32 * _MiB, 64 * _MiB, 128 * _MiB,
+    256 * _MiB, 1024 * _MiB,
+)
 # 16-bit PCM: the data worker emits audio as headerless s16le.
 _AUDIO_BYTES_PER_SAMPLE = 2
 
@@ -94,25 +102,22 @@ def require_prometheus_client() -> None:
 
 
 def modalities_label(modalities: list[str]) -> str:
-    """One label value per set of output modalities, e.g. ``audio,text``."""
+    """One label value per set of input or output modalities, e.g. ``audio,text``."""
     return ",".join(sorted(set(modalities)))
 
 
-class _InFlight:
-    """``mstar_requests_in_flight``, read when scraped rather than counted up
-    and down, so a request that ends on an unusual path cannot leave it off."""
+class _ScrapedGauge:
+    """A gauge read when scraped rather than counted up and down, so a request
+    that ends on an unusual path cannot leave it off."""
 
-    def __init__(self, model_name: str, count: Callable[[], int]):
+    def __init__(self, name: str, documentation: str, model_name: str, count: Callable[[], int]):
+        self.name = name
+        self.documentation = documentation
         self.model_name = model_name
         self.count = count
 
     def collect(self):
-        family = GaugeMetricFamily(
-            "mstar_requests_in_flight",
-            "Requests the API server holds: submitted and not yet returned, "
-            "failed or aborted.",
-            labels=["model_name"],
-        )
+        family = GaugeMetricFamily(self.name, self.documentation, labels=["model_name"])
         family.add_metric([self.model_name], self.count())
         yield family
 
@@ -338,10 +343,19 @@ class RefusalMiddleware:
                 metrics.refusals.inc(route_template(scope, self.routes()), status)
 
 
+class _DataWorkerSeries(NamedTuple):
+    """One input-modality set's data worker series."""
+    seconds: Any
+    failures: Any
+
+
 class ServingMetrics:
     """The API server's registry and its request metrics."""
 
-    def __init__(self, model_name: str, in_flight: Callable[[], int]):
+    def __init__(
+        self, model_name: str, in_flight: Callable[[], int],
+        data_worker_queue_depth: Callable[[], int],
+    ):
         require_prometheus_client()
         self.model_name = model_name
         self.content_type = CONTENT_TYPE_LATEST
@@ -372,7 +386,12 @@ class ServingMetrics:
             queue.name, queue.help, ["model_name", *queue.labels],
             buckets=queue.buckets, registry=self.registry,
         )
-        self.registry.register(_InFlight(model_name, in_flight))
+        self.registry.register(_ScrapedGauge(
+            "mstar_requests_in_flight",
+            "Requests the API server holds: submitted and not yet returned, "
+            "failed or aborted.",
+            model_name, in_flight,
+        ))
         self.refusals = _Refusals(model_name)
         self.registry.register(self.refusals)
         self._conductor = _ConductorStatus(model_name)
@@ -422,12 +441,41 @@ class ServingMetrics:
             "output modality reaching the API server.",
             ["model_name", "modality"], buckets=FIRST_OUTPUT_BUCKETS, registry=self.registry,
         )
+        # The data worker's own work, from the profile it reports per request
+        # it took off its queue; perf_counter is shared, it is a thread here.
+        data_worker = ["model_name", "input_modalities"]
+        self.data_worker_seconds = Histogram(
+            "mstar_data_worker_preprocess_seconds",
+            "Requests the data worker preprocessed: from taking the request off "
+            "its queue to handing it to the conductor.",
+            data_worker, buckets=STAGE_BUCKETS, registry=self.registry,
+        )
+        self.data_worker_failures = Counter(
+            "mstar_data_worker_preprocess_failures",
+            "Requests whose preprocessing failed in the data worker (media "
+            "limits, undecodable media, the model's prompt processing, any other error).",
+            data_worker, registry=self.registry,
+        )
+        self.upload_size = Histogram(
+            "mstar_upload_size_bytes",
+            "Size of each image, audio or video file a request carried to the "
+            "data worker, uploaded or inline.",
+            ["model_name", "modality"], buckets=UPLOAD_SIZE_BUCKETS, registry=self.registry,
+        )
+        self.registry.register(_ScrapedGauge(
+            "mstar_data_worker_queue_depth",
+            "Requests submitted and waiting for the data worker to take them up.",
+            model_name, data_worker_queue_depth,
+        ))
+
         # Label lookups resolved once per modality set or modality. Two
         # threads may resolve the same key at once; labels() returns the same
         # series to both, so the race is harmless.
         self._request_series: dict[str, _RequestSeries] = {}
         self._first_chunk_series: dict[str, Any] = {}
         self._chunk_series: dict[str, tuple] = {}
+        self._data_worker_series: dict[str, _DataWorkerSeries] = {}
+        self._upload_series: dict[str, Any] = {}
 
     def _series(self, modalities: str) -> _RequestSeries:
         series = self._request_series.get(modalities)
@@ -497,6 +545,33 @@ class ServingMetrics:
                 channels = metadata.get("num_channels") or 1
                 self.output_audio_seconds.inc(
                     len(data) / (_AUDIO_BYTES_PER_SAMPLE * channels * rate))
+
+    def record_preprocess(self, profile: DataWorkerProfile) -> None:
+        """Record the data worker's numbers for one request it took off its
+        queue: its time if preprocessing finished, else a failure, and the size
+        of each input file either way."""
+        modalities = modalities_label(profile.input_modalities)
+        series = self._data_worker_series.get(modalities)
+        if series is None:
+            labels = (self.model_name, modalities)
+            # Both from the first request of a modality set, so the first
+            # failure is not lost to rate().
+            series = _DataWorkerSeries(
+                self.data_worker_seconds.labels(*labels),
+                self.data_worker_failures.labels(*labels),
+            )
+            self._data_worker_series[modalities] = series
+        if profile.failed:
+            series.failures.inc()
+        else:
+            series.seconds.observe(profile.preprocess_finish_time - profile.dequeue_time)
+        for modality, sizes in profile.upload_sizes.items():
+            upload = self._upload_series.get(modality)
+            if upload is None:
+                upload = self.upload_size.labels(self.model_name, modality)
+                self._upload_series[modality] = upload
+            for size in sizes:
+                upload.observe(size)
 
     def render(self) -> bytes:
         return generate_latest(self.registry)

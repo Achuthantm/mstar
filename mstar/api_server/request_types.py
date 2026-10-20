@@ -97,13 +97,21 @@ class APIServerMessage:
 
 @dataclass
 class DataWorkerProfile:
-    """Profiling reported by the API-server data worker at preprocess finish:
-    the timestamp at which the request was handed to the conductor and the
-    per-modality sizes of the raw inputs. (The data worker's tx/rx are read
-    directly from its tensor manager at request completion, not via this.)"""
+    """Profiling reported by the API-server data worker at preprocess finish
+    (or failure): the timestamp at which the request was handed to the
+    conductor and the per-modality sizes of the raw inputs. (The data worker's
+    tx/rx are read directly from its tensor manager at request completion,
+    not via this.)"""
     request_id: str
     preprocess_finish_time: float | None = None  # time.perf_counter
     inputs: list[InputInfo] = field(default_factory=list)
+    # Set only with metrics on: the data worker's own numbers for the request.
+    dequeue_time: float | None = None  # perf_counter, taken off the data worker's queue
+    input_modalities: list[str] = field(default_factory=list)
+    # modality -> size in bytes of each input file, read when it was dequeued
+    upload_sizes: dict[str, list[int]] = field(default_factory=dict)
+    # preprocessing raised: the client gets an error chunk instead
+    failed: bool = False
 
 
 @dataclass

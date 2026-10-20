@@ -1,8 +1,9 @@
 """Prometheus metrics at ``/metrics`` (``--enable-metrics``).
 
 Requests go through the FastAPI app and the API server's real message thread;
-only the data worker and the conductor are stand-ins, fed the messages the
-real ones send. Each test scrapes ``/metrics`` and reads the samples back.
+the conductor is a stand-in fed the messages the real one sends, and so is the
+data worker except in the data worker's own tests, which run its real thread.
+Each test scrapes ``/metrics`` and reads the samples back.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib
+import os
 import queue
 import sys
 import threading
@@ -53,6 +55,9 @@ class _DataWorker:
 
     def report_preprocess_finish(self):
         self.reporting = True
+
+    def queue_depth(self):
+        return 0
 
     def new_request(self, inp):
         self.inputs.append(inp)
@@ -659,6 +664,26 @@ def test_with_metrics_off_no_chunk_is_timed(tmp_path):
         thread.join(timeout=5)
 
 
+class _StubTensorManager:
+    """The data worker's transport, holding nothing: these tests stop at the
+    handoff to the conductor."""
+
+    def store_and_return_tensor_info(self, request_id, tensors):
+        return {}
+
+    def register_for_send(self, request_id, tensor_infos):
+        pass
+
+    def get_ready_tensors(self):
+        return {}
+
+    def has_inflight_reads(self, request_id):
+        return False
+
+    def force_cleanup_request(self, request_id):
+        pass
+
+
 def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     """The real data worker thread stamps the handoff without ``--log-stats``
     once ``report_preprocess_finish`` is called, and skips the input summary."""
@@ -668,22 +693,6 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
     class _Model:
         def process_prompt(self, *args, **kwargs):
             return None
-
-    class _TensorManager:
-        def store_and_return_tensor_info(self, request_id, tensors):
-            return {}
-
-        def register_for_send(self, request_id, tensor_infos):
-            pass
-
-        def get_ready_tensors(self):
-            return {}
-
-        def has_inflight_reads(self, request_id):
-            return False
-
-        def force_cleanup_request(self, request_id):
-            pass
 
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
@@ -697,7 +706,7 @@ def test_the_data_worker_reports_preprocess_finish_once_asked(tmp_path):
         discard_tensor_queue=queue.Queue(), stop_event=stop,
         communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
                                            send=lambda entity, msg: sent.append(msg)),
-        tensor_manager=_TensorManager(), model=_Model(),
+        tensor_manager=_StubTensorManager(), model=_Model(),
         timing_requested=facade.timing_requested,
     )
     thread = threading.Thread(target=worker.run, daemon=True)
@@ -880,6 +889,281 @@ def test_the_rust_bridge_serves_the_conductor_families(served):
     assert _without_age(bridged) == _without_age(python_route)
 
 
+SLOW_PROMPT_S = 0.03
+
+
+class _MediaModel:
+    """Decodes images with the base model's real loader and WAVs with the
+    stdlib (CI has neither soundfile nor torchcodec); takes one image per
+    request. The prompt text can slow, hold or fail its prompt processing."""
+
+    def __init__(self):
+        self.holding = threading.Event()
+        self.release = threading.Event()
+
+    def max_input_files(self):
+        return {"image": 1}
+
+    def load_image(self, filepath, device):
+        from mstar.model.base import Model
+
+        return Model.load_image(self, filepath, device)
+
+    def load_audio(self, filepath, device):
+        import wave
+
+        import torch
+
+        from mstar.model.base import TensorAndMetadata
+
+        with wave.open(filepath) as f:
+            rate, pcm = f.getframerate(), f.readframes(f.getnframes())
+        audio = torch.frombuffer(bytearray(pcm), dtype=torch.int16).float() / 32768
+        return TensorAndMetadata(audio, metadata={"sample_rate": rate, "num_channels": 1})
+
+    def process_prompt(self, text, *args, **kwargs):
+        if text == "slow":
+            time.sleep(SLOW_PROMPT_S)
+        elif text == "hold":
+            self.holding.set()
+            assert self.release.wait(5)
+        elif text == "raise":
+            raise ValueError("the prompt is too long")
+
+
+class _RealDataWorker:
+    """The API server on the real data worker: its facade and its thread, a
+    stand-in transport and conductor, and the API server's message thread."""
+
+    def __init__(self, tmp_path, *, metrics, enable_prof=False):
+        from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+
+        self.model, self.sent, self.tmp_path = _MediaModel(), [], tmp_path
+        facade = self.facade = PreprocessWorker.__new__(PreprocessWorker)
+        for name in ("request_input_queue", "result_tensor_input_queue", "cleanup_request_queue",
+                     "abort_request_queue", "reads_done_queue", "discard_tensor_queue",
+                     "output_queue", "profile_queue"):
+            setattr(facade, name, queue.Queue())
+        facade.timing_requested, facade.stop_event = threading.Event(), threading.Event()
+        facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}
+        worker = PreprocessWorkerThread(
+            in_queue=facade.request_input_queue, result_tensor_queue=facade.result_tensor_input_queue,
+            out_queue=facade.output_queue, profile_queue=facade.profile_queue,
+            cleanup_request_queue=facade.cleanup_request_queue,
+            abort_request_queue=facade.abort_request_queue,
+            reads_done_queue=facade.reads_done_queue,
+            discard_tensor_queue=facade.discard_tensor_queue, stop_event=facade.stop_event,
+            communicator=types.SimpleNamespace(get_all_new_messages=lambda: [],
+                                               send=lambda entity, msg: self.sent.append(msg)),
+            tensor_manager=_StubTensorManager(), model=self.model, enable_prof=enable_prof,
+            timing_requested=facade.timing_requested,
+        )
+        facade.thread = threading.Thread(target=worker.run, daemon=True)
+        facade.thread.start()
+        self.server = make_test_api_server(
+            preprocess_worker=facade, communicator=_Conductor(), upload_dir=tmp_path,
+        )
+        if metrics:
+            self.server.enable_metrics()
+        self.message_thread = threading.Thread(target=self.server._process_messages, daemon=True)
+        self.message_thread.start()
+
+    def submit(self, text, files=(), modalities=("text",)):
+        file_paths = {}
+        for modality, path in files:
+            file_paths.setdefault(modality, []).append(path)
+        return self.server.submit_request(
+            text=text, file_paths=file_paths or None, input_modalities=list(modalities),
+            output_modalities=["text"], streaming=False,
+        )
+
+    def scrape(self):
+        return _parse(self.server.metrics.render().decode())
+
+    def stop(self):
+        self.model.release.set()
+        self.server.running = False
+        self.facade.shutdown()
+        self.message_thread.join(timeout=5)
+
+
+@pytest.fixture
+def real_data_worker(monkeypatch, tmp_path):
+    pytest.importorskip("prometheus_client")
+    started = []
+
+    def start(**kwargs):
+        served = _RealDataWorker(tmp_path, **kwargs)
+        started.append(served)
+        monkeypatch.setattr(entrypoint, "api_server", served.server)
+        return served
+
+    yield start
+    for served in started:
+        served.stop()
+
+
+def _png(path, side=48):
+    import numpy as np
+    from PIL import Image
+
+    pixels = np.random.default_rng(0).integers(0, 256, (side, side, 3), dtype=np.uint8)
+    Image.fromarray(pixels).save(path)
+    return str(path)
+
+
+def _wav(path, seconds, rate=16_000):
+    import wave
+
+    with wave.open(str(path), "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(b"\x01\x00" * int(seconds * rate))
+    return str(path)
+
+
+def _data_worker_hist(samples, modalities):
+    return _hist(samples, "mstar_data_worker_preprocess_seconds", input_modalities=modalities)
+
+
+def _failures(samples, modalities):
+    return samples.get(("mstar_data_worker_preprocess_failures_total",
+                        _labels(input_modalities=modalities)), 0)
+
+
+def _upload_buckets(samples, modality):
+    return {
+        float(dict(k[1])["le"]): v for k, v in samples.items()
+        if k[0] == "mstar_upload_size_bytes_bucket" and dict(k[1])["modality"] == modality
+    }
+
+
+def _preprocessed(samples):
+    """Requests the data worker finished or failed, by its metrics."""
+    return sum(v for (name, _), v in samples.items()
+               if name in ("mstar_data_worker_preprocess_seconds_count",
+                           "mstar_data_worker_preprocess_failures_total"))
+
+
+def test_the_data_worker_times_preprocessing_and_counts_failures_by_input_modalities(
+        real_data_worker, monkeypatch, tmp_path):
+    """Each request the real data worker takes up is timed if it reaches the
+    conductor, or counted once as a failure (a corrupt upload through
+    ``/generate``, too many images, audio over the length limit, the prompt
+    processing raising); every image and audio file is sized either way."""
+    monkeypatch.setenv("MSTAR_MAX_AUDIO_SECONDS", "2")
+    served = real_data_worker(metrics=True)
+    png, png2 = _png(tmp_path / "a.png"), _png(tmp_path / "b.png")
+    short, long = _wav(tmp_path / "short.wav", 1.0), _wav(tmp_path / "long.wav", 3.0)
+    corrupt = b"\x89PNG\r\n\x1a\n" + b"\x00" * 3000
+    start = time.perf_counter()
+
+    served.submit("slow")
+    served.submit("describe", [("image", png)], ("image", "text"))
+    served.submit("transcribe", [("audio", short)], ("audio", "text"))
+    r = TestClient(entrypoint.app).post(
+        "/generate", data={"text": "describe", "streaming": "false"},
+        files={"files": ("upload.png", corrupt, "image/png")},
+    )
+    assert r.status_code == 400 and "image is not in a format" in r.text, r.text
+    served.submit("compare", [("image", png), ("image", png2)], ("image", "text"))
+    served.submit("transcribe", [("audio", long)], ("audio", "text"))
+    served.submit("raise")
+    _wait(lambda: _preprocessed(served.scrape()) == 7)
+    elapsed = time.perf_counter() - start
+    s = served.scrape()
+
+    assert len(served.sent) == 3  # the three that reached the conductor
+    text_n, text_s = _data_worker_hist(s, "text")
+    assert text_n == 1 and SLOW_PROMPT_S <= text_s < elapsed
+    for modalities in ("image,text", "audio,text"):
+        n, seconds = _data_worker_hist(s, modalities)
+        assert n == 1 and 0 < seconds < elapsed, modalities
+    assert {m: _failures(s, m) for m in ("text", "image,text", "audio,text")} == {
+        "text": 1, "image,text": 2, "audio,text": 1}
+
+    sizes = {
+        "image": [os.path.getsize(png)] * 2 + [os.path.getsize(png2), len(corrupt)],
+        "audio": [os.path.getsize(short), os.path.getsize(long)],
+    }
+    for modality, observed in sizes.items():
+        assert _hist(s, "mstar_upload_size_bytes", modality=modality) == (
+            len(observed), sum(observed)), modality
+        buckets = _upload_buckets(s, modality)
+        assert len(buckets) > 2
+        assert buckets == {le: sum(size <= le for size in observed) for le in buckets}, modality
+    assert not _upload_buckets(s, "text")
+
+
+def test_queue_depth_counts_requests_waiting_for_the_data_worker(real_data_worker, tmp_path):
+    """Read at scrape time: requests queued behind the one the data worker is
+    working on. Its preprocess time leaves their wait in the queue out."""
+    served = real_data_worker(metrics=True)
+    clip = _wav(tmp_path / "clip.wav", 0.5)
+    assert served.scrape()[("mstar_data_worker_queue_depth", _labels())] == 0
+
+    served.submit("hold")
+    assert served.model.holding.wait(5)
+    queued_at = time.perf_counter()
+    served.submit("transcribe", [("audio", clip)], ("audio", "text"))
+    served.submit("transcribe", [("audio", clip)], ("audio", "text"))
+    assert served.scrape()[("mstar_data_worker_queue_depth", _labels())] == 2
+    time.sleep(0.2)
+    waited = time.perf_counter() - queued_at
+    served.model.release.set()
+    _wait(lambda: _preprocessed(served.scrape()) == 3)
+
+    s = served.scrape()
+    assert s[("mstar_data_worker_queue_depth", _labels())] == 0
+    held_n, held_s = _data_worker_hist(s, "text")
+    assert held_n == 1 and held_s >= waited
+    queued_n, queued_s = _data_worker_hist(s, "audio,text")
+    assert queued_n == 2 and 0 < queued_s < waited
+
+
+@pytest.mark.parametrize("enable_prof", [False, True], ids=["plain", "log_stats"])
+def test_with_metrics_off_the_data_worker_reports_nothing_new(real_data_worker, tmp_path, enable_prof):
+    """No profile for a failed preprocess and no metrics fields on a
+    successful one; ``--log-stats`` still gets its input summary."""
+    served = real_data_worker(metrics=False, enable_prof=enable_prof)
+    png = _png(tmp_path / "a.png")
+    served.facade.get_profile_updates = lambda: []  # keep the updates for the test to read
+    key_ok = served.server._live[served.submit("describe", [("image", png)], ("image", "text"))]
+    failing = served.server.pending_requests[served.server._live[served.submit("raise")]]
+    # the failure's error chunk; the data worker finished the first request before
+    _wait(lambda: failing.error is not None)
+    assert len(served.sent) == 1
+
+    updates = []
+    while not served.facade.profile_queue.empty():
+        updates.append(served.facade.profile_queue.get())
+    assert served.server.metrics is None
+    if not enable_prof:
+        assert updates == []
+        return
+    [update] = updates
+    assert update.request_id == key_ok and update.preprocess_finish_time is not None
+    assert [(i.modality, i.count, i.total_bytes) for i in update.inputs] == [
+        ("text", 1, len("describe")), ("image", 1, os.path.getsize(png))]
+    assert (update.dequeue_time, update.input_modalities, update.upload_sizes, update.failed) == (
+        None, [], {}, False)
+
+
+def test_log_stats_and_metrics_together_keep_the_input_summary(real_data_worker, tmp_path):
+    served = real_data_worker(metrics=True, enable_prof=True)
+    png = _png(tmp_path / "a.png")
+    key = served.server._live[served.submit("describe", [("image", png)], ("image", "text"))]
+    _wait(lambda: served.server.pending_requests[key].profile.inputs)
+
+    inputs = served.server.pending_requests[key].profile.inputs
+    assert [(i.modality, i.total_bytes) for i in inputs] == [
+        ("text", len("describe")), ("image", os.path.getsize(png))]
+    s = served.scrape()
+    assert _data_worker_hist(s, "image,text")[0] == 1
+    assert _hist(s, "mstar_upload_size_bytes", modality="image") == (1, os.path.getsize(png))
+
+
 class _StopError(Exception):
     pass
 
@@ -1059,7 +1343,7 @@ def test_a_missing_package_is_reported_and_a_broken_one_raises(monkeypatch):
             importlib.reload(metrics_module)
             assert metrics_module.MISSING_DEPENDENCY is not None
             with pytest.raises(RuntimeError, match=r"mstar\[metrics\]"):
-                metrics_module.ServingMetrics("dummy", in_flight=int)
+                metrics_module.ServingMetrics("dummy", in_flight=int, data_worker_queue_depth=int)
         with monkeypatch.context() as m:
             m.setitem(sys.modules, "prometheus_client.core", None)
             with pytest.raises(ModuleNotFoundError) as e:

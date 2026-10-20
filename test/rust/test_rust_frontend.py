@@ -253,7 +253,9 @@ def test_metrics_relay_the_api_server_registry_open_like_health():
     from mstar.profile.format import RequestTiming
 
     with _running_stack(api_key="s3cret") as (port, stub, _bridge, _proc):
-        stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 3)
+        stub.metrics = ServingMetrics(
+            "qwen3_omni", in_flight=lambda: 3, data_worker_queue_depth=lambda: 0,
+        )
         now = time.perf_counter()
         timing = RequestTiming(recv_time=now - 0.4, first_chunk_time=now - 0.3)
         stub.metrics.record(types.SimpleNamespace(
@@ -926,7 +928,7 @@ def test_refusals_reach_the_api_server_registry():
     key = {"Authorization": "Bearer s3cret"}
     gate = threading.Event()
     stub = _GatedKeyedStub(gate)
-    stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 0)
+    stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 0, data_worker_queue_depth=lambda: 0)
     env = {"MSTAR_API_KEY": "s3cret", "MSTAR_MAX_CONCURRENT_REQUESTS": "2", "MSTAR_MAX_BODY_MB": "1"}
     chat = json.dumps({"model": "qwen3_omni", "messages": [{"role": "user", "content": "hi"}]}).encode()
 

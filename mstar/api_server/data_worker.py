@@ -216,8 +216,14 @@ class PreprocessWorker:
 
     def report_preprocess_finish(self) -> None:
         """Put each request's preprocess-finish time on the profile queue
-        without ``--log-stats`` too (``mstar_request_preprocess_seconds``)."""
+        without ``--log-stats`` too (``mstar_request_preprocess_seconds``),
+        with the data worker's own time, a failed preprocess, and the input
+        files' sizes."""
         self.timing_requested.set()
+
+    def queue_depth(self) -> int:
+        """Requests submitted and not yet taken up by the data worker thread."""
+        return self.request_input_queue.qsize()
 
     def _signal(self):
         """End the thread's idle wait: new work is queued. getattr: tests
@@ -475,7 +481,8 @@ class PreprocessWorkerThread:
         self.device = device
         self.model = model
         self.enable_prof = enable_prof
-        # Preprocess-finish times are reported when enable_prof or this is set.
+        # Preprocess-finish times are reported when enable_prof or this is set,
+        # the data worker's own metrics only when this is set.
         self.timing_requested = timing_requested if timing_requested is not None else threading.Event()
         # This thread turns each output tensor into client-ready bytes. At 720p
         # that is an 11 MiB SHM read plus a postprocess copy per engine step,
@@ -529,7 +536,7 @@ class PreprocessWorkerThread:
                 state.pop(request_id, None)
 
     def _process_input(
-        self, input: PreprocessInput
+        self, input: PreprocessInput, profile: DataWorkerProfile | None = None,
     ):
         tensors: NameToTensorList = {}
         input_metadata = {}
@@ -655,12 +662,38 @@ class PreprocessWorkerThread:
         # the *raw* inputs. ``perf_counter`` is consistent here because the worker
         # runs as a thread inside the API server process. (tx/rx are snapshotted
         # directly by the main thread at request completion — see APIServer.)
-        if self.enable_prof or self.timing_requested.is_set():
-            self.profile_queue.put(DataWorkerProfile(
-                request_id=input.request_id,
-                preprocess_finish_time=time.perf_counter(),
-                inputs=self._summarize_inputs(input) if self.enable_prof else [],
-            ))
+        # ``profile`` was started at dequeue when metrics are on.
+        if profile is None and self.enable_prof:
+            profile = DataWorkerProfile(request_id=input.request_id)
+        if profile is not None:
+            profile.preprocess_finish_time = time.perf_counter()
+            if self.enable_prof:
+                profile.inputs = self._summarize_inputs(input)
+            self.profile_queue.put(profile)
+
+    @staticmethod
+    def _start_profile(input: PreprocessInput) -> DataWorkerProfile:
+        """The metrics side of a request's profile, taken as it leaves the
+        queue: the HTTP layer deletes uploads on a timer, so their sizes are
+        read before the work, not after."""
+        dequeue_time = time.perf_counter()
+        sizes: dict[str, list[int]] = {}
+        for modality, paths in (input.file_paths or {}).items():
+            # The modalities _process_input loads; it skips any other key.
+            if modality not in ("image", "audio", "video"):
+                continue
+            found = sizes[modality] = []
+            for path in paths:
+                try:
+                    found.append(os.stat(path).st_size)
+                except (OSError, ValueError):
+                    pass  # gone or not a valid path: its load fails, and the failure is counted
+        return DataWorkerProfile(
+            request_id=input.request_id,
+            dequeue_time=dequeue_time,
+            input_modalities=input.input_modalities,
+            upload_sizes=sizes,
+        )
 
     def _prefix_keys(
         self, tensors: dict, layouts: dict, file_paths: dict | None,
@@ -1272,9 +1305,15 @@ class PreprocessWorkerThread:
                     # Releases queued before this request was submitted belong
                     # to an earlier request under its id: apply them first.
                     self._process_releases()
+                    profile = None
                     try:
-                        self._process_input(pre_input)
+                        if self.timing_requested.is_set():
+                            profile = self._start_profile(pre_input)
+                        self._process_input(pre_input, profile)
                     except Exception as exc:  # noqa: BLE001 — any failure must reach the client
+                        if profile is not None:
+                            profile.failed = True
+                            self.profile_queue.put(profile)
                         # A request whose media load or prompt processing fails
                         # never reaches the conductor, so nothing downstream
                         # would ever complete it; surface the failure as an
