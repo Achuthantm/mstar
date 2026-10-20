@@ -32,6 +32,15 @@
 # model is skipped when both arms lack it): a module to import, `module:function` to call with no arguments (the
 # server's own loader, for a package it loads without importing it), or `rdma_nic` for an RDMA device on the host.
 #
+# Quality (`quality: [...]`, next to the check): each arm's saved c=1 outputs scored on their own after both servers
+# stop (e2e/quality.py). A case fails when head's mean score is below base's by more than 1.5x the row's A/A swing,
+# and never by less than the floor:
+#   mos          UTMOS22 predicted MOS of the speech (floor 0.1)
+#   speaker_sim  WavLM speaker similarity to the item's reference clip, voice-clone cases (floor 0.02)
+#   clip         CLIP score (openai/clip-vit-base-patch32) of the image or sampled video frames against the prompt
+#                (floor 0.5 points)
+# A psnr or text_match failure with every quality score holding reads "changed, quality same" and is not flagged.
+#
 # Perf: `latency` is the c=1 metric (lower is better), `throughput` the c=max metric (higher is better), `extra` are
 # shown in the details. A delta is a regression when it is worse than perf_pct, beyond noise_sigma combined standard
 # deviations of the passes, and beyond the row's A/A noise floor (calibration.yaml).
@@ -76,6 +85,7 @@ models:
         data: tts
         args: [--voice, af_heart, --seed, "0"]
         check: {kind: wer, max_increase: 1.5}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean, req_per_s]}
       - id: invariants
         modality: served invariants
@@ -96,6 +106,7 @@ models:
         data: tts
         args: [--seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
       - id: clone
         modality: tts (voice clone)
@@ -103,6 +114,7 @@ models:
         data: clone
         args: [--clone, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
 
   orpheus:
@@ -117,6 +129,7 @@ models:
         data: tts
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   omnivoice:
@@ -132,6 +145,7 @@ models:
         data: tts
         args: [--seed, "0"]
         check: {kind: wer, max_increase: 1.5}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50]}
       - id: clone_upload
         modality: tts (clone, /generate upload)
@@ -139,6 +153,7 @@ models:
         data: clone
         n: 24
         check: {kind: audio_len, pct: 10}
+        quality: [mos, speaker_sim]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   qwen3_tts:
@@ -157,6 +172,7 @@ models:
         data: tts
         args: [--voice, vivian, --language, English, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   # ---------------- speech in ----------------
@@ -242,6 +258,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
       - id: decode_fixed
         modality: text (fixed 256-token reply)
@@ -342,6 +359,7 @@ models:
         conc: [1]
         args: [--size, 512x512, --extra, num_timesteps=25]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   # ---------------- image and video generation ----------------
@@ -357,6 +375,7 @@ models:
         n: 8
         args: [--size, 1024x1024]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   wan22:
@@ -374,6 +393,7 @@ models:
         warmup: 1
         args: [--size, 832x480, --extra, num_frames=33, --extra, num_inference_steps=20, --extra, guidance_scale=5.0, --extra, fps=24]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
       - id: i2v
         modality: image to video
@@ -384,6 +404,7 @@ models:
         warmup: 1
         args: [--size, 832x480, --extra, num_frames=33, --extra, num_inference_steps=20, --extra, guidance_scale=5.0, --extra, fps=24]
         check: {kind: psnr, min_db: 30}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   cosmos3_edge:
@@ -398,6 +419,7 @@ models:
         n: 4
         args: [--size, 640x640]
         check: {kind: psnr, min_db: 25}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
       - id: chat_image
         modality: image in
@@ -459,6 +481,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   orpheus_mooncake:
@@ -476,6 +499,7 @@ models:
         data: tts
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   # ---------------- multi-GPU configs (optional) ----------------
@@ -540,6 +564,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   cosmos3_nano_sp2:      # DiT Ulysses SP 2 on ranks 0, 1; VAE and audio decoder on 0
@@ -559,6 +584,7 @@ models:
         conc: [1]
         args: [--size, 640x640]
         check: {kind: psnr, min_db: 25}
+        quality: [clip]
         perf: {latency: lat_p50_s, throughput: req_per_s}
 
   qwen3tts_1p7b_split:   # Talker on rank 0, codec on rank 1, both on GPU 0 (the config's rank_devices)
@@ -578,6 +604,7 @@ models:
         data: tts
         args: [--voice, vivian, --language, English, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   orpheus_pd_disaggregated:   # LLM prefill on rank 0, decode on rank 1; SNAC on 0
@@ -596,6 +623,7 @@ models:
         data: tts
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
 
   qwen3omni_pd_disaggregated:   # encoders, Code2Wav and Thinker prefill on rank 0; decode on 1; Talker on 2
@@ -622,6 +650,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   # ---------------- newer models (optional until their PRs are on main) ----------------
@@ -643,6 +672,7 @@ models:
         data: clone
         args: [--clone, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean, sim_mean]}
 
   voxcpm2:               # #496: tokenizer-free latent patches; 48 kHz streamed audio
@@ -659,6 +689,7 @@ models:
         data: tts
         args: [--seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
       - id: clone
         modality: tts (voice clone)
@@ -666,6 +697,7 @@ models:
         data: clone
         args: [--clone, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos, speaker_sim]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, sim_mean]}
       - id: design
         modality: tts (voice design)
@@ -673,6 +705,7 @@ models:
         data: tts
         args: [--instructions, "A calm, warm female voice speaking at a moderate pace", --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50]}
 
   omnilingual_asr_ctc_300m:   # #515: CTC (non-autoregressive) ASR, no decode loop
@@ -736,6 +769,7 @@ models:
         data: tts
         args: [--voice, vivian, --language, English, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
       - id: cancel
         modality: speech stream dropped mid-transfer
@@ -794,6 +828,7 @@ models:
         data: tts
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
+        quality: [mos]
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
       - id: cancel
         modality: speech stream dropped mid-transfer
@@ -860,6 +895,7 @@ models:
         n: 8
         args: [--max-tokens, "64", --audio-out]
         check: {kind: audio_len, pct: 25}
+        quality: [mos]
         perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
       - id: cancel
         modality: chat stream (text and speech) dropped mid-transfer

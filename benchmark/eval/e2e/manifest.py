@@ -26,6 +26,10 @@ CHECKS = {
     "audio_len": {"pct"},
 }
 STRESS_KEYS = {"model_kwargs", "max_tokens"}
+# Perceptual quality judges a case can list next to its check, each scored per arm on the saved c=1 outputs, with
+# the floor of how far head may score below base before it fails (A/A swings only widen it).
+QUALITY = {"mos": 0.1, "speaker_sim": 0.02, "clip": 0.5}
+CLIP_KINDS = ("image", "video", "video_i2v")
 
 
 class ManifestError(ValueError):
@@ -48,6 +52,7 @@ class Case:
     args: list[str] = field(default_factory=list)
     optional: bool = False
     server_timeout_s: float | None = None   # served by its own server with this per-request --timeout
+    quality: list[str] = field(default_factory=list)   # QUALITY judges
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -171,10 +176,22 @@ def _case(raw: dict, where: str, defaults: dict, model_conc: list[int], datasets
     to = raw.get("server_timeout_s")
     if to is not None and (not isinstance(to, (int, float)) or isinstance(to, bool) or to <= 0):
         raise ManifestError(f"{where}: server_timeout_s must be a positive number of seconds")
+    args = [str(a) for a in raw.get("args", [])]
+    quality = raw.get("quality") or []
+    if not isinstance(quality, list) or any(q not in QUALITY for q in quality):
+        raise ManifestError(f"{where}: quality must be a list of {', '.join(QUALITY)}")
+    speech = (driver, kind) in (("suite", "tts"), ("client", "gen_clone")) or (
+        driver == "client" and kind.startswith("chat_") and "--audio-out" in args)
+    if {"mos", "speaker_sim"} & set(quality) and not speech:
+        raise ManifestError(f"{where}: mos and speaker_sim need speech outputs (tts, gen_clone, --audio-out)")
+    if "speaker_sim" in quality and not data:
+        raise ManifestError(f"{where}: speaker_sim needs a dataset whose items carry reference clips")
+    if "clip" in quality and not (driver == "client" and kind in CLIP_KINDS):
+        raise ManifestError(f"{where}: clip needs generated images or video ({', '.join(CLIP_KINDS)})")
     return Case(id=cid, modality=str(raw.get("modality", cid)), driver=driver, kind=kind, check=check, perf=perf,
                 conc=sorted(conc), repeats=int(raw.get("repeats", defaults.get("repeats", 3))),
                 warmup=int(raw.get("warmup", defaults.get("warmup", 2))), n=raw.get("n"), data=data,
-                args=[str(a) for a in raw.get("args", [])], optional=bool(raw.get("optional", False)),
+                args=args, optional=bool(raw.get("optional", False)), quality=list(quality),
                 server_timeout_s=float(to) if to is not None else None)
 
 

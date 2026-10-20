@@ -195,11 +195,39 @@ def rp_facts(a: Path, b: Path) -> dict:
     return {"n": len(keys), "diffs": diffs}
 
 
+def _quality(d: Path) -> dict | None:
+    try:
+        js = json.loads((d / "quality.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return js if isinstance(js, dict) else None
+
+
+def quality_facts(a: Path, b: Path, kinds: list[str]) -> dict:
+    """Per quality judge: both arms' mean score over the outputs both have a score for (``quality.py``), or why
+    there is none."""
+    qa, qb = _quality(a), _quality(b)
+    out: dict = {}
+    for kind in kinds:
+        ea, eb = (qa or {}).get(kind) or {}, (qb or {}).get(kind) or {}
+        sa, sb = ea.get("scores") or {}, eb.get("scores") or {}
+        ids = sorted(i for i in set(sa) & set(sb) if sa[i] is not None and sb[i] is not None)
+        f: dict = {"n": len(ids), "judge": ea.get("judge") or eb.get("judge")}
+        if ids:
+            f["base"], f["head"] = statistics.mean(sa[i] for i in ids), statistics.mean(sb[i] for i in ids)
+        else:
+            f["error"] = (ea.get("error") or eb.get("error")
+                          or ("not scored" if qa is None or qb is None else "no output both arms scored"))
+        out[kind] = f
+    return out
+
+
 def compare_model(model_dir: Path, cases: list[dict], sessions: int) -> dict:
     """compare.json for one model's results directory (``<arm>/s<k>/<case>/``)."""
     res: dict = {}
     for case in cases:
         conc = min(case["conc"])
+        kinds = case.get("quality") or []
         per_session = []
         for s in range(sessions):
             a, b = (model_dir / arm / f"s{s}" / case["id"] for arm in ("base", "head"))
@@ -212,11 +240,16 @@ def compare_model(model_dir: Path, cases: list[dict], sessions: int) -> dict:
                     facts = rp_facts(a, b)
             except Exception as e:  # noqa: BLE001
                 facts = {"missing": ["base", "head"], "error": f"{type(e).__name__}: {str(e)[:200]}"}
+            if kinds:
+                facts["quality"] = quality_facts(a, b, kinds)
             per_session.append(facts)
-        if sessions > 1 and case["driver"] == "client":
-            # Base against itself across two server processes: the noise floor for the identity checks.
+        if sessions > 1 and (case["driver"] == "client" or kinds):
+            # Base against itself across two server processes: the noise floor for the identity and quality checks.
             s0, s1 = (model_dir / "base" / f"s{s}" / case["id"] for s in (0, 1))
-            per_session.append({"self_base": saved(saved_dir(s0, conc), saved_dir(s1, conc))})
+            selfb = saved(saved_dir(s0, conc), saved_dir(s1, conc)) if case["driver"] == "client" else {}
+            if kinds:
+                selfb["quality"] = quality_facts(s0, s1, kinds)
+            per_session.append({"self_base": selfb})
         res[case["id"]] = per_session
     tmp = model_dir / ".compare.json.tmp"   # whole or not at all
     tmp.write_text(json.dumps(res, indent=1, default=str))

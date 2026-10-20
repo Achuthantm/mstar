@@ -13,6 +13,8 @@ sessions alternate the arm order (ABBA with two sessions). Layout under ``job["o
   <arm>/s<k>/<case>/              mstar-eval/1 results per concurrency, saved outputs, client log, and
                                   stacks.txt when the case hung (ran past the model's case_timeout_s)
   <arm>/s<k>/stress/run<r>.json   ``--stress`` instead of the cases: one record per run (stress.run_session)
+  <arm>/s<k>/<case>/quality.json  perceptual scores of the saved outputs (quality.py), after every server stopped
+  quality.log
   compare.json                    checks.compare_model
   done.json                       written last: done | skipped | error | interrupted
 """
@@ -38,12 +40,14 @@ from benchmark.eval.e2e import checks, stress
 from benchmark.eval.server import ManagedServer, ServerError, is_healthy
 
 CASE_TIMEOUT_S = 3600
+QUALITY_TIMEOUT_S = 1800
 IDLE_MB = 2000
 # Each arm's first server start may compile from cold caches (whichever arm goes first pays the shared compiles,
 # and a head that changed kernels compiles those even second), so it gets this many times startup_timeout_s.
 COLD_START_FACTOR = 2.0
 
 job: dict = {}
+job_path = Path(".")
 out = Path(".")
 stop_reason = ""
 
@@ -538,6 +542,21 @@ def watch_lease(lease_s: float) -> None:
             return
 
 
+def score_quality() -> None:
+    """The judges in their own process on the job's GPU, with no server running: their load and GPU time stay out
+    of the timed passes, and their memory is freed before ``compare`` starts the next model on this GPU. A judge
+    that fails leaves its scores out (the report says not scored), not the job."""
+    status(phase="quality")
+    with open(out / "quality.log", "w") as f:
+        try:
+            r = subprocess.run([job["python"], "-m", "benchmark.eval.e2e.quality", str(job_path)], env=client_env(),
+                               cwd=job["evalfw"], stdout=f, stderr=subprocess.STDOUT, timeout=QUALITY_TIMEOUT_S,
+                               check=False)
+            log(f"quality judges rc={r.returncode}")
+        except subprocess.TimeoutExpired:
+            log(f"quality judges timed out after {QUALITY_TIMEOUT_S} s")
+
+
 def _broken(problems: dict[str, str | None]) -> dict:
     """``{"broken": arm}`` when exactly one arm failed to build: the report fails a head that cannot build."""
     bad = [a for a, p in problems.items() if p]
@@ -574,6 +593,8 @@ def run() -> None:
             info = run_arm(arm_name, s)
             if info.get("healthy") and not info.get("mstar_from_arm_src"):
                 return done("error", reason=f"the {arm_name} server did not import mstar from its own checkout")
+    if any(c.get("quality") for c in model["cases"]) and not job.get("stress"):   # stress runs no cases
+        score_quality()
     status(phase="compare")
     if not job.get("stress"):
         checks.compare_model(out, model["cases"], job["sessions"])
@@ -582,8 +603,9 @@ def run() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    global job, out
-    job = json.loads(Path((argv or sys.argv[1:])[0]).read_text())
+    global job, job_path, out
+    job_path = Path((argv or sys.argv[1:])[0]).resolve()
+    job = json.loads(job_path.read_text())
     out = Path(job["out"])
     out.mkdir(parents=True, exist_ok=True)
     (out / "done.json").unlink(missing_ok=True)
