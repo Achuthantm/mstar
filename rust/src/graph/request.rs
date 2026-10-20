@@ -106,15 +106,14 @@ pub struct PendingOutputs {
     pub persist: Vec<(Sym, Vec<u64>)>,
     /// partition -> signal -> count; each report carries its own partition's.
     pub new_tokens: Vec<(PartitionId, Vec<(String, i64)>)>,
-    /// Emitted signal names, in emission order.
+    /// One name per chunk emitted to the client, in emission order. The
+    /// conductor counts them to tell the API server how many chunks to wait
+    /// for.
     pub output_signals: Vec<Sym>,
-    /// signal -> the loop context it was emitted at.
-    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
 }
 
 impl PendingOutputs {
-    /// Everything but `output_loop_indices`, which the conductor keeps for the
-    /// life of the request -- Python re-sends it on every WGD.
+    /// Everything pending, with only `partition`'s token counts.
     pub fn take_for_send(
         &mut self, partition: Option<PartitionId>,
     ) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
@@ -147,8 +146,7 @@ impl PendingOutputs {
         }
     }
 
-    /// Accumulate, matching Python: a repeated signal's count adds up, and a
-    /// repeated loop index overwrites.
+    /// Accumulate, matching Python: a repeated signal's count adds up.
     pub fn add_new_tokens(&mut self, partition: PartitionId, counts: &[(String, i64)]) {
         let i = match self.new_tokens.iter().position(|(p, _)| *p == partition) {
             Some(i) => i,
@@ -163,15 +161,6 @@ impl PendingOutputs {
                 Some((_, v)) => *v += n,
                 None => pending.push((name.clone(), *n)),
             }
-        }
-    }
-
-    pub fn set_loop_indices(
-        &mut self, signal: Sym, idx: (Vec<Sym>, Vec<(Sym, u32)>, u32),
-    ) {
-        match self.output_loop_indices.iter_mut().find(|(s, _)| *s == signal) {
-            Some(slot) => slot.1 = idx,
-            None => self.output_loop_indices.push((signal, idx)),
         }
     }
 }
