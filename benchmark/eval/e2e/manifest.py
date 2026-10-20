@@ -65,6 +65,8 @@ class Model:
     serve_args: list[str] = field(default_factory=list)
     thresholds: dict[str, float] = field(default_factory=dict)
     optional: bool = False             # a variant (Mooncake transport): only when named or picked by its own tag
+    gpus: int = 1                      # GPUs of one host both arms are served on (TP, SP, split, disaggregated)
+    case_timeout_s: float | None = None   # wall cap per case: a case still running then has hung (arm.CASE_TIMEOUT_S)
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -185,6 +187,12 @@ def parse(raw: dict) -> Manifest:
         ids = [c.id for c in cases]
         if len(set(ids)) != len(ids):
             raise ManifestError(f"{where}: duplicate case ids")
+        gpus = m.get("gpus", 1)
+        if not isinstance(gpus, int) or isinstance(gpus, bool) or gpus < 1:
+            raise ManifestError(f"{where}: gpus must be a positive int")
+        cap = m.get("case_timeout_s", defaults.get("case_timeout_s"))
+        if cap is not None and (not isinstance(cap, (int, float)) or isinstance(cap, bool) or cap <= 0):
+            raise ManifestError(f"{where}: case_timeout_s must be a positive number of seconds")
         models[name] = Model(
             name=name, serve=_req(m, "serve", where, str), family=str(m.get("family", "Other")),
             tags=[str(t) for t in m.get("tags", [])], cases=cases, config=m.get("config"),
@@ -195,7 +203,8 @@ def parse(raw: dict) -> Manifest:
                  **{k: str(v) for k, v in (m.get("env") or {}).items()}},
             serve_args=[str(a) for a in m.get("serve_args", [])],
             thresholds={**(defaults.get("thresholds") or {}), **(m.get("thresholds") or {})},
-            optional=bool(m.get("optional", False)))
+            optional=bool(m.get("optional", False)), gpus=gpus,
+            case_timeout_s=float(cap) if cap is not None else None)
     return Manifest(models=models, datasets=datasets, defaults=defaults)
 
 

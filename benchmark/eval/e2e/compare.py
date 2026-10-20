@@ -55,7 +55,11 @@ def add_args(sub) -> None:
     p.add_argument("--repeats", type=int, default=None, help="measured passes per point (default: cases.yaml)")
     p.add_argument("--no-rerun", action="store_true", help="report a flagged perf row without the 2-session rerun")
     p.add_argument("--gpus", default=None, help="local GPU indices to use (default: all)")
-    p.add_argument("--hosts", default=None, help="SSH targets instead of local GPUs: user@a,user@b:1 (host:gpu)")
+    p.add_argument("--stacks-sudo", action="store_true",
+                   help="retry a hung case's py-spy dump with sudo -n where ptrace is restricted (off by default: "
+                        "a refused sudo is logged, and often mailed, on shared clusters)")
+    p.add_argument("--hosts", default=None,
+                   help="SSH targets instead of local GPUs: user@a,user@b:1 (host:gpu), user@c:0-7 (GPUs 0 to 7)")
     p.add_argument("--host-provider", default=None, metavar="MODULE:FACTORY",
                    help="a launcher that supplies --hosts (see benchmark/eval/e2e/hosts.py)")
     p.add_argument("--python", default=sys.executable, help="Python of the M* environment on this machine")
@@ -284,12 +288,13 @@ class Runner:
         position = self.order.index(name.split(RERUN_TAG, maxsplit=1)[0]) + attempts
         arm = lambda ref: {"sha": ref.sha, "label": ref.label, "src": f"{p['src']}/{ref.sha}",  # noqa: E731
                            "rust_tree": ref.rust_tree}
-        return {"run_id": self.run_key, "model": m.to_dict(), "out": out, "gpu": slot.gpu,
+        gpus = slot.devices or ([slot.gpu] if slot.gpu is not None else [])
+        return {"run_id": self.run_key, "model": m.to_dict(), "out": out, "gpu": slot.gpu, "gpus": gpus,
                 "sessions": 2 if name in self.rerun_cases else self.args.sessions,
                 "order": ["base", "head"] if position % 2 == 0 else ["head", "base"],
                 "python": self.python(slot), "evalfw": p["evalfw"], "data": p["data"], "host_dir": slot.host_dir,
                 "datasets": self.man.datasets, "arms": {"base": arm(self.base), "head": arm(self.head)},
-                "lease_s": LEASE_S}
+                "lease_s": LEASE_S, "stacks_sudo": bool(getattr(self.args, "stacks_sudo", False))}
 
     def run_one(self, slot: hosts.Slot, name: str) -> str | None:
         self.prepare(slot)
@@ -318,7 +323,8 @@ class Runner:
             raise RuntimeError(f"{slot.name}: could not start the job: {r.stderr.strip()[-300:]}")
         t0 = time.time()
         self.set(name, status="running", slot=slot.name, started=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
-        self.log(f"{slot.name}: {name} started (order {' then '.join(job['order'])})")
+        on = f" on GPUs {','.join(map(str, job['gpus']))}" if len(job["gpus"]) > 1 else ""
+        self.log(f"{slot.name}: {name} started{on} (order {' then '.join(job['order'])})")
         # SIGTERM lets the job stop its server (up to 50 s); after two minutes, its session and the server's go.
         # A zombie (a container whose init does not reap) answers kill -0, so liveness reads the process state.
         is_alive = f'case "$(ps -o stat= -p {pid} 2>/dev/null)" in ""|Z*) false;; *) true;; esac'
@@ -361,7 +367,7 @@ class Runner:
         part.rename(dst)
         elapsed = time.time() - t0
         self.set(name, status=done.get("status"), reason=done.get("reason", ""),
-                 elapsed_s=round(elapsed, 1), gpu_s=round(elapsed, 1))
+                 elapsed_s=round(elapsed, 1), gpu_s=round(elapsed * max(1, len(job["gpus"])), 1))
         self.log(f"{slot.name}: {name} {done.get('status')} in {elapsed / 60:.1f} min"
                  + (f" ({done['reason']})" if done.get("reason") else ""))
         return self.maybe_rerun(name) if done.get("status") == "done" else None
@@ -407,7 +413,9 @@ def cmd_compare(args) -> int:
     if args.list:
         for m in man.models.values():
             cases = ", ".join(c.id + ("*" if c.optional else "") for c in m.cases)
-            print(f"{m.name + ('+' if m.optional else ''):22} {m.family:7} tags: {','.join(m.tags):50} cases: {cases}")
+            gpus = f" ({m.gpus} GPUs)" if m.gpus > 1 else ""
+            print(f"{m.name + ('+' if m.optional else ''):26} {m.family:7} tags: {','.join(m.tags):50} cases: {cases}"
+                  f"{gpus}")
         print("* request path or served invariants (--rp); + optional model: name it or use its own tag")
         return 0
     if args.render:
@@ -447,6 +455,10 @@ def _run(args, man, models, base, head, slots) -> int:
     if len(types) > 1:
         raise SystemExit(f"slots have different GPU types ({', '.join(sorted(types))}); one table never mixes them")
     if args.dry_run:
+        largest = hosts.GpuBook(usable).largest()
+        for m in (m for m in models if m.gpus > 1):
+            fit = "fits" if m.gpus <= largest else f"does not fit (largest host: {largest} GPUs)"
+            print(f"  {m.name}: {m.gpus} GPUs on one host, {fit}", file=sys.stderr)
         return 0
     stamp = time.strftime("%Y%m%d-%H%M%S")
     label = re.sub(r"[^A-Za-z0-9.-]+", "_", head.label)
@@ -469,10 +481,17 @@ def _run(args, man, models, base, head, slots) -> int:
            "sessions": args.sessions, "repeats": args.repeats or man.defaults.get("repeats", 3),
            "perf_pct": th.get("perf_pct", 5), "noise_sigma": th.get("noise_sigma", 2),
            "rerun_flagged": not args.no_rerun,
+           "gpus_per_model": {m.name: m.gpus for m in models if m.gpus > 1},
            "slots": [s.name for s in usable], "command": public_command(args),
            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     (run_dir / "run.json").write_text(json.dumps(run, indent=1))
-    queue = hosts.WorkQueue(runner.order, {m.name: m.est_min for m in models})
+    largest = hosts.GpuBook(usable).largest()
+    too_big = {m.name: m.gpus for m in models if m.gpus > largest}
+    for name, n in too_big.items():
+        runner.set(name, status="not run", reason=f"not run: needs {n} GPUs on one host, the largest has {largest}")
+        runner.log(f"{name}: needs {n} GPUs on one host; the largest host here has {largest}")
+    queue = hosts.WorkQueue([n for n in runner.order if n not in too_big],
+                            {m.name: m.est_min * m.gpus for m in models})
 
     def lost(slot, name, e):
         runner.log(f"{slot.name}: host lost during {name} ({e}); requeued for the other slots")
@@ -485,7 +504,8 @@ def _run(args, man, models, base, head, slots) -> int:
         runner.set(name, status="not run", reason="not run: no GPU slot left")
 
     try:
-        hosts.run_slots(usable, queue, runner.run_one, lost, error, given_up, stop=runner.stop)
+        hosts.run_slots(usable, queue, runner.run_one, lost, error, given_up, stop=runner.stop,
+                        need=lambda n: runner.models[n.split(RERUN_TAG, maxsplit=1)[0]].gpus)
     finally:
         st = runner.state["models"]
         run["gpu_hours"] = round(sum(s.get("gpu_s", 0) for s in st.values()) / 3600, 2)

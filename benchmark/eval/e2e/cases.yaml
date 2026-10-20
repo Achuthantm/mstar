@@ -33,7 +33,8 @@
 # shown in the details. A delta is a regression when it is worse than perf_pct, beyond noise_sigma combined standard
 # deviations of the passes, and beyond the row's A/A noise floor (calibration.yaml).
 #
-# `est_min` (GPU minutes per arm, H200) only orders the queue: longest model first.
+# `est_min` (GPU minutes per arm, H200) only orders the queue: longest model first. `gpus` (default 1) is how many
+# GPUs of one host serve the model; `case_timeout_s` caps each case's wall time (a case past it has hung).
 
 defaults:
   conc: [1, 8]
@@ -467,6 +468,152 @@ models:
         args: [--voice, tara, --seed, "0"]
         check: {kind: wer, max_increase: 2.0}
         perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  # ---------------- multi-GPU configs (optional) ----------------
+  # Tensor parallel, sequence parallel, split and disaggregated deployments: `gpus` GPUs of one host serve both arms
+  # (ranks 0..gpus-1 of the config are the job's GPUs in order). The TP configs run c=16, the load that hung TP 2 in
+  # #332. A case still running after `case_timeout_s` has hung: its server's Python stacks are saved, head hanging
+  # fails the row, base hanging reports it broken. Not in `all`: select with `tag:multi-gpu` or by name.
+  whisper_large_tp2:     # encoder on rank 0; decoder TP 2 on ranks 0, 1
+    serve: whisper_large
+    config: configs/whisper_large_tp2.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    family: ASR
+    tags: [multi-gpu, tp, asr, speech-in, multipart, sse]
+    est_min: 8
+    conc: [1, 16]
+    cases:
+      - id: upload
+        modality: asr (multipart upload, TP 2)
+        suite: asr
+        data: asr
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: e2e_s_p50, throughput: req_per_s, extra: [rtfx]}
+      - id: sse
+        modality: asr (SSE stream, TP 2)
+        suite: asr
+        data: asr
+        args: [--stream]
+        check: {kind: wer, max_increase: 0.5}
+        perf: {latency: first_text_s_p50, throughput: req_per_s, extra: [e2e_s_p50]}
+
+  qwen3omni_thinker_tp2:   # Thinker TP 2 on ranks 0, 1; encoders on 0; Talker and Code2Wav on 2
+    serve: qwen3_omni
+    config: configs/qwen3omni_thinker_tp2.yaml
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    family: Omni
+    tags: [multi-gpu, tp, omni, image-in, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread]
+    est_min: 16
+    conc: [1, 16]
+    cases:
+      - id: text
+        modality: text (Thinker TP 2)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: image_in
+        modality: image in (Thinker TP 2)
+        client: chat_image
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (Thinker TP 2)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+
+  cosmos3_nano_sp2:      # DiT Ulysses SP 2 on ranks 0, 1; VAE and audio decoder on 0
+    serve: cosmos3
+    config: configs/cosmos3_nano_sp2.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    family: World
+    tags: [multi-gpu, sp, world, image-gen]
+    est_min: 12
+    cases:
+      - id: t2i
+        modality: image gen 640px (DiT SP 2)
+        client: image
+        n: 4
+        conc: [1]
+        args: [--size, 640x640]
+        check: {kind: psnr, min_db: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+
+  qwen3tts_1p7b_split:   # Talker on rank 0, codec on rank 1, both on GPU 0 (the config's rank_devices)
+    serve: qwen3_tts_1p7b
+    config: configs/qwen3tts_1p7b_split.yaml
+    optional: true
+    gpus: 1
+    case_timeout_s: 900
+    family: TTS
+    tags: [multi-gpu, split, tts, speech-out, ar]
+    requires: [qwen_tts]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts (Talker and codec split)
+        suite: tts
+        data: tts
+        args: [--voice, vivian, --language, English, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  orpheus_pd_disaggregated:   # LLM prefill on rank 0, decode on rank 1; SNAC on 0
+    serve: orpheus
+    config: configs/orpheus_pd_disaggregated.yaml
+    optional: true
+    gpus: 2
+    case_timeout_s: 900
+    family: TTS
+    tags: [multi-gpu, disaggregated, tts, speech-out, ar]
+    est_min: 10
+    cases:
+      - id: tts
+        modality: tts (prefill and decode disaggregated)
+        suite: tts
+        data: tts
+        args: [--voice, tara, --seed, "0"]
+        check: {kind: wer, max_increase: 2.0}
+        perf: {latency: e2e_s_p50, throughput: audio_s_per_s, extra: [ttfa_ms_p50, rtf_mean]}
+
+  qwen3omni_pd_disaggregated:   # encoders, Code2Wav and Thinker prefill on rank 0; decode on 1; Talker on 2
+    serve: qwen3_omni
+    config: configs/qwen3omni_pd_disaggregated.yaml
+    optional: true
+    gpus: 3
+    case_timeout_s: 900
+    family: Omni
+    tags: [multi-gpu, disaggregated, omni, speech-out, big]
+    requires: [flash_attn, qwen_omni_utils, audioread]
+    est_min: 16
+    cases:
+      - id: text
+        modality: text (prefill and decode disaggregated)
+        client: chat_text
+        n: 16
+        args: [--max-tokens, "96"]
+        check: {kind: text_match, min_match: 0.5}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
+      - id: audio_out
+        modality: speech out (prefill and decode disaggregated)
+        client: chat_text
+        n: 8
+        args: [--max-tokens, "64", --audio-out]
+        check: {kind: audio_len, pct: 25}
+        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
 
   # ---------------- robotics ----------------
   pi05:

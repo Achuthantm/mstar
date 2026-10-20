@@ -464,6 +464,16 @@ class _Arms:
                 out.setdefault(p.parent.name, {"base": None, "head": None})[arm] = case.get("server_alive_after")
         return out
 
+    def hung(self, case_id: str) -> dict[str, float | None]:
+        """Per arm, the case's wall cap in seconds when that arm's case ran past it in any session, else None."""
+        out: dict[str, float | None] = {"base": None, "head": None}
+        for arm in ("base", "head"):
+            for p in sorted((self.md / arm).glob("s*/startup.json")):
+                case = _read(p, {}, {}).get("cases", {}).get(case_id) or {}
+                if case.get("hung"):
+                    out[arm] = float(case.get("cap_s") or 0)
+        return out
+
     def files(self, case_id: str) -> dict[str, list[Path]]:
         """Each arm's results files for a case; a file that is not a complete mstar-eval result (a client that died
         while writing it) does not count, so its point shows up as missing."""
@@ -564,6 +574,16 @@ def _row(a: _Arms, m: Model, c: Case, status: dict, gpu: str, calibration: dict)
             corr, detail = "base broken", f"{who} at {', '.join(silent['base'])}; {detail}"
         elif absent and corr == "pass":
             corr, detail = "incomplete", f"no results for {', '.join(absent)}; {detail}"
+        hung = a.hung(c.id)
+        if hung["base"] is not None:   # nothing to judge head against, timings included
+            corr, detail = "base broken", (f"base hung: still running after the {hung['base']:.0f} s case cap "
+                                           "(stacks saved)")
+            for p in (lat, thru, *extra):
+                if p:
+                    p.verdict = "n/a"
+        elif hung["head"] is not None:
+            corr, detail = "FAIL", (f"head hung: still running after the {hung['head']:.0f} s case cap; base finished "
+                                    "(stacks in head/s*/" + c.id + "/stacks.txt)")
     with_data = [p for p in (lat, thru) if p and p.base.mean is not None and p.head.mean is not None]
     rp = scrub((a.compare.get(c.id) or [None])[0]) if c.driver in ("rp", "invariants") else None
     note, detail = _public(note), _public(detail)   # reasons can quote server errors: no paths or addresses
@@ -733,7 +753,10 @@ def render_md(rows: list[Row], run: dict, chart_url: str | None = None) -> str:
     if bare:
         lines.append(f"No A/A noise baseline on {gpu} for {', '.join(bare)}: those rows are judged on the passes' "
                      "spread alone (`python -m benchmark.eval calibrate` on a main-vs-main run of them).")
-    lines += ["", f"Served through `mstar serve` on one {gpu} per model, base and head back to back on the same GPU "
+    multi = run.get("gpus_per_model") or {}
+    where = (f"on one {gpu} per model ({', '.join(f'{n}: {k}' for n, k in sorted(multi.items()))} {gpu}s of one host)"
+             if multi else f"on one {gpu} per model")
+    lines += ["", f"Served through `mstar serve` {where}, base and head back to back on the same GPUs "
               f"(order alternated per model), {run.get('repeats', 3)} measured passes per point, "
               f"{run.get('sessions', 1)} server session(s) per arm. Deltas are signed so that positive means head "
               "is better (lower latency, higher throughput).", ""]

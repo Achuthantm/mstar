@@ -9,7 +9,8 @@ sessions alternate the arm order (ABBA with two sessions). Layout under ``job["o
   status.json                     phase, arm, case (polled by compare)
   <arm>/s<k>/startup.json         healthy, startup_s, peak VRAM, which checkout the server imported
   <arm>/s<k>/server.log
-  <arm>/s<k>/<case>/              mstar-eval/1 results per concurrency, saved outputs, client log
+  <arm>/s<k>/<case>/              mstar-eval/1 results per concurrency, saved outputs, client log, and
+                                  stacks.txt when the case hung (ran past the model's case_timeout_s)
   compare.json                    checks.compare_model
   done.json                       written last: done | skipped | error | interrupted
 """
@@ -66,18 +67,26 @@ def done(state: str, **kw) -> None:
     _publish("done.json", {"status": state, "t": now(), **kw})
 
 
-def gpu_mem_mb() -> int:
+def job_gpus() -> list[int]:
+    """The job's GPUs: every one a multi-GPU model is served on, else the slot's own."""
+    return list(job.get("gpus") or ([job["gpu"]] if job.get("gpu") is not None else []))
+
+
+def gpu_mem_mb() -> list[int]:
+    """Used memory of each of the job's GPUs (all GPUs for a whole-machine slot); [-1] when unreadable."""
     cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
-    if job.get("gpu") is not None:
-        cmd += ["-i", str(job["gpu"])]
+    if job_gpus():
+        cmd += ["-i", ",".join(map(str, job_gpus()))]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        return max(int(x) for x in r.stdout.split())
+        return [int(x) for x in r.stdout.split()] or [-1]
     except (OSError, ValueError, subprocess.SubprocessError):
-        return -1
+        return [-1]
 
 
 class VramSampler(threading.Thread):
+    """Peak of the job's GPU memory, summed over its GPUs."""
+
     def __init__(self):
         super().__init__(daemon=True)
         self.peak = 0
@@ -85,23 +94,55 @@ class VramSampler(threading.Thread):
 
     def run(self):
         while not self.stop_ev.wait(2.0):
-            self.peak = max(self.peak, gpu_mem_mb())
+            self.peak = max(self.peak, sum(m for m in gpu_mem_mb() if m > 0))
 
 
 def wait_gpu_idle(limit_s: float = 180) -> int:
-    t0, mem = time.time(), gpu_mem_mb()
+    """Waits until every GPU of the job is under IDLE_MB (or ``limit_s``); returns the busiest one's MB."""
+    t0, mem = time.time(), max(gpu_mem_mb())
     while mem > IDLE_MB and time.time() - t0 < limit_s:
         time.sleep(5)
-        mem = gpu_mem_mb()
+        mem = max(gpu_mem_mb())
     return mem
 
 
 def base_env() -> dict[str, str]:
     # As if the environment were activated: JIT builds (FlashInfer's ninja, Triton) look for tools on PATH.
     env = {"PYTHONUNBUFFERED": "1", "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
-    if job.get("gpu") is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(job["gpu"])
+    if job_gpus():
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, job_gpus()))
     return env
+
+
+def dump_stacks(pgid: int, path: Path) -> None:
+    """Every Python thread's stack in the server's process group (``py-spy dump``), for a case that hung; without
+    py-spy, the process list and why there are no stacks. Threads only: a hang at an ``await`` shows an idle event
+    loop. Retries with ``sudo -n`` only when the job asks (``compare --stacks-sudo``): on a shared cluster a refused
+    ``sudo`` is logged, and often mailed to the admins."""
+    r = subprocess.run(["ps", "-o", "pid=,args=", "-g", str(pgid)], capture_output=True, text=True, check=False)
+    procs = [ln.strip().split(None, 1) for ln in r.stdout.splitlines() if ln.strip()]
+    spy = shutil.which("py-spy", path=base_env()["PATH"])
+    lines = [f"# process group {pgid}: {len(procs)} processes; py-spy: {spy or 'not installed (pip install py-spy)'}"]
+    if spy and not job.get("stacks_sudo"):
+        lines[0] += " (no sudo retry; compare --stacks-sudo adds one where ptrace is restricted)"
+    for pid, *args in procs:
+        lines.append(f"\n## pid {pid}: {(args or [''])[0][:300]}")
+        if not spy:
+            continue
+        out = ""
+        cmds = [[spy, "dump", "--pid", pid]] + ([["sudo", "-n", spy, "dump", "--pid", pid]]
+                                                 if job.get("stacks_sudo") else [])
+        for cmd in cmds:
+            try:
+                d = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=False)
+            except (OSError, subprocess.SubprocessError) as e:
+                out = f"{cmd[0]}: {e}"
+                continue
+            out = d.stdout if d.returncode == 0 else (d.stdout + d.stderr).strip()[-500:]
+            if d.returncode == 0:
+                break
+        lines.append(out)
+    path.write_text("\n".join(lines) + "\n")
 
 
 def server_env(arm: dict) -> dict[str, str]:
@@ -244,19 +285,31 @@ def run_arm(arm_name: str, session: int) -> dict:
             cd = d / case["id"]
             cd.mkdir(parents=True, exist_ok=True)
             status(phase="case", arm=arm_name, session=session, case=case["id"])
-            t0, rc = time.monotonic(), 0
+            t0, rc, hung = time.monotonic(), 0, False
+            cap = float(model.get("case_timeout_s") or CASE_TIMEOUT_S)
             with open(cd / "client.log", "w") as f:
                 for cmd in case_cmds(case, server.url, f"{model['name']}-{case['id']}-{arm_name}", cd):
+                    left = cap - (time.monotonic() - t0)
                     try:
+                        if left <= 0:
+                            raise subprocess.TimeoutExpired(cmd, cap)
                         r = subprocess.run(cmd, env=client_env(), cwd=job["evalfw"], stdout=f,
-                                           stderr=subprocess.STDOUT, timeout=CASE_TIMEOUT_S, check=False)
+                                           stderr=subprocess.STDOUT, timeout=left, check=False)
                         rc = r.returncode or rc
                     except subprocess.TimeoutExpired:
-                        rc = "timeout"
-            alive = is_healthy(server.url, timeout=10)
+                        rc, hung = "timeout", True
+                        log(f"{arm_name} s{session}: {case['id']} still running after {cap:.0f} s: saving stacks")
+                        dump_stacks(server.pid, cd / "stacks.txt")
+                        break
+            alive = not hung and is_healthy(server.url, timeout=10)
             cases[case["id"]] = {"rc": rc, "elapsed_s": round(time.monotonic() - t0, 1),
                                  "server_alive_after": alive}
+            if hung:
+                cases[case["id"]].update(hung=True, cap_s=cap)
             log(f"{arm_name} s{session}: {case['id']} rc={rc} {cases[case['id']]['elapsed_s']} s alive={alive}")
+            if hung:
+                log(f"{arm_name} s{session}: {case['id']} hung; skipping its remaining cases")
+                break
             if not alive:
                 log(f"{arm_name} s{session}: server died during {case['id']}; skipping its remaining cases")
                 break
