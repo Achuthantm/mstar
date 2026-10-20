@@ -144,14 +144,30 @@ def _make_graph_runtime(
 
 
 def _parse_tp_async_sched(raw: str) -> tuple[bool, frozenset[str] | None]:
-    """``MSTAR_TP_ASYNC_SCHED``: ``0``/empty off, ``1`` every parallel node,
-    or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
+    """``MSTAR_TP_ASYNC_SCHED``: ``0``/``false``/empty off, ``1``/``true`` every
+    parallel node, or a comma-separated node list. Returns ``(enabled, nodes_or_None)``."""
     raw = raw.strip()
-    if raw in ("", "0"):
+    # a quoted yaml boolean arrives as a string; it is the switch, not a node name
+    word = raw.lower()
+    if word in ("", "0", "false", "no", "off"):
         return False, None
-    if raw == "1":
+    if word in ("1", "true", "yes", "on"):
         return True, None
     return True, frozenset(n.strip() for n in raw.split(",") if n.strip())
+
+
+def _tp_async_sched_setting(
+    env: str | None, config: bool | str | list[str] | None,
+) -> tuple[bool, frozenset[str] | None]:
+    """The deployment config's ``tp_async_sched`` (true/false or a node list),
+    which a non-empty ``MSTAR_TP_ASYNC_SCHED`` overrides."""
+    if env:
+        return _parse_tp_async_sched(env)
+    if isinstance(config, (list, tuple)):
+        return _parse_tp_async_sched(",".join(config))
+    if isinstance(config, bool):
+        return config, None
+    return _parse_tp_async_sched(str(config or "0"))
 
 
 def _wait_ms(raw: str) -> float:
@@ -530,8 +546,8 @@ class Worker:
 
         # TP async scheduling: the leader speculates N+1 during forward N and
         # broadcasts it at once; followers rebuild it during their own N.
-        self.tp_async_sched, self.tp_async_nodes = _parse_tp_async_sched(
-            os.environ.get("MSTAR_TP_ASYNC_SCHED", "0")
+        self.tp_async_sched, self.tp_async_nodes = _tp_async_sched_setting(
+            os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
         )
         # Leader: monotonic seq stamped on every ScheduleTPNode it sends.
         self._tp_broadcast_seq = 0
@@ -548,9 +564,9 @@ class Worker:
             )
         elif self.tp_async_sched and self.parallel_nodes:
             logger.warning(
-                "Worker %s: MSTAR_TP_ASYNC_SCHED=%r names none of this worker's "
+                "Worker %s: TP async scheduling names %s, none of this worker's "
                 "parallel nodes %s; running the serial protocol",
-                worker_id, os.environ.get("MSTAR_TP_ASYNC_SCHED"),
+                worker_id, sorted(self.tp_async_nodes or ()),
                 sorted(self.parallel_nodes),
             )
 
@@ -4166,6 +4182,7 @@ class Worker:
         # engine's ``warmup``. The follower can't service the message
         # yet, but the leader will sit on the first NCCL collective.
         self.parallel_groups.barrier_all()
+        self.parallel_groups.restore_default_timeout()
 
         # Everything tracked right now — weights, capture buffers, wrapper
         # state — lives for the process, so gen2 gains nothing by walking it

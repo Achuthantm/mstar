@@ -644,7 +644,11 @@ class MicroScheduler:
                 return scheduled
         if ready is None:
             ready = self._scan_ready(request_state, scan_target, scan_exclude)
-        rr_key = self._select_node_rr(ready)
+        # A walk with no room (a cap of 0) takes nothing, so it stays the least
+        # recent; picked anyway, it would starve the walk that frees the room.
+        rr_key = self._select_node_rr({
+            key: rows for key, rows in ready.items() if self._walk_caps(key)[key[1]] != 0
+        })
         if rr_key is None or rr_key in keys:
             return None
         return schedule(rr_key, ready.get(rr_key, []))
