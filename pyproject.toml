@@ -80,13 +80,16 @@ audio = [
 # Optional: the eval framework (`python -m benchmark.eval`, docs/evaluation.rst).
 # The runner, metrics and reports need only aiohttp and numpy; the judges
 # (Whisper, WavLM speaker similarity, UTMOS via torch.hub), the dataset
-# builders and the charts import the rest lazily. Install it in a separate
-# client environment if the server's should stay lean.
+# builders, compare's media inputs and PSNR checks (PyAV, Pillow) and the
+# charts import the rest lazily. Install it in a separate client environment
+# if the server's should stay lean.
 eval = [
     "aiohttp",
+    "av",
     "datasets",
     "huggingface-hub",
     "matplotlib",
+    "Pillow",
     "soundfile",
     "transformers",
 ]
