@@ -341,22 +341,107 @@ def check_resample_rate(rate: int, target: int) -> None:
         raise ValueError(f"unsupported sample rate {rate} Hz; resample the audio to a standard rate")
 
 
-def decode_audio(path: str, sample_rate: int = 16000):
-    """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``.
+# Longest request audio any decoder here produces (transcription uploads, chat
+# and /generate audio, reference clips): the transcription route's limit.
+MAX_AUDIO_SECONDS = 30 * 60
+_SOUNDFILE_BLOCK_SECONDS = 10
+# libsndfile's MP3 decoder is seamless across reads only at whole 1152-sample
+# MPEG frames; a read that splits a frame glitches the samples after it
+_SOUNDFILE_BLOCK_ALIGN = 1152
+
+
+class AudioRefusedError(ValueError):
+    """Audio a decoder opened and refuses (too long, or an unsupported rate):
+    callers re-raise it rather than fall back to another decoder."""
+
+
+class AudioTooLongError(AudioRefusedError):
+    """Audio that decodes past the limit, whatever its header declares."""
+
+    status_code = 413
+
+    def __init__(self, max_seconds: float):
+        self.max_seconds = max_seconds
+        super().__init__(f"audio is longer than the {max_seconds:g} s limit")
+
+
+def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
+    """libsndfile decode of ``path``: float32 mono at the file's own rate.
+
+    Reads in blocks and counts the frames it decodes, so a header that hides
+    or understates the length cannot make the read unbounded; past
+    ``max_seconds`` it raises :class:`AudioTooLongError`. A rate outside
+    ``1..MAX_SAMPLE_RATE`` is refused (:class:`AudioRefusedError`) before
+    any read. A container libsndfile cannot read raises soundfile's own error.
+    """
+    import soundfile as sf
+
+    with sf.SoundFile(path) as f:
+        rate = f.samplerate
+        # the frame cap scales with the rate; the range alone here, the
+        # kernel to the caller's target is checked after the decode
+        try:
+            check_resample_rate(rate, rate)
+        except ValueError as exc:
+            raise AudioRefusedError(str(exc)) from None
+        limit = int(max_seconds * rate)
+        block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate // _SOUNDFILE_BLOCK_ALIGN) * _SOUNDFILE_BLOCK_ALIGN
+        parts, frames = [], 0
+        while True:
+            data = f.read(min(block, limit + 1 - frames), dtype="float32", always_2d=True)
+            if not len(data):
+                break
+            frames += len(data)
+            if frames > limit:
+                raise AudioTooLongError(max_seconds)
+            parts.append(data.mean(axis=1))
+    return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
+
+
+def decode_torchcodec_capped(path: str, sample_rate: int, max_seconds: float = MAX_AUDIO_SECONDS):
+    """FFmpeg (torchcodec) decode of ``path``: a float32 mono tensor at
+    ``sample_rate``, the same samples ``get_all_samples()`` returns.
+
+    The decode stops just past ``max_seconds`` of play time, and the audio is
+    refused with :class:`AudioTooLongError` when it plays longer or holds
+    more samples than that. The decoder resamples every frame to
+    ``sample_rate``, so what is counted is decoded output, not the rate or
+    duration the container declares.
+    """
+    return torchcodec_samples_capped(path, max_seconds, sample_rate=sample_rate, num_channels=1).data[0]
+
+
+def torchcodec_samples_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS, **decoder_args):
+    """``AudioDecoder(path, **decoder_args)``'s samples from the stream's first
+    frame, as ``get_all_samples()`` returns them, decoding just past
+    ``max_seconds`` of play time; refused with :class:`AudioTooLongError` when
+    the audio plays longer or holds more samples than that."""
+    from torchcodec.decoders import AudioDecoder
+
+    decoder = AudioDecoder(path, **decoder_args)
+    # play time counts from the stream's first timestamp, which need not be 0
+    start = max(0.0, getattr(decoder.metadata, "begin_stream_seconds_from_header", None) or 0.0)
+    samples = decoder.get_samples_played_in_range(start, start + max_seconds + 1.0)
+    rate = decoder_args.get("sample_rate") or samples.sample_rate
+    played = samples.pts_seconds - start + samples.duration_seconds
+    if played > max_seconds or samples.data.shape[-1] > max_seconds * rate:
+        raise AudioTooLongError(max_seconds)
+    return samples
+
+
+def decode_audio(path: str, sample_rate: int = 16000, max_seconds: float = MAX_AUDIO_SECONDS):
+    """Decode an audio file to a float32 mono numpy waveform at ``sample_rate``,
+    refused with :class:`AudioTooLongError` past ``max_seconds``.
 
     libsndfile (``soundfile``) first — no FFmpeg needed for wav/flac/ogg/mp3 —
     then torchcodec for the rest (m4a, webm, ...).
     """
     try:
-        import soundfile as sf
-
-        audio, sr = sf.read(path, dtype="float32", always_2d=True)
-        audio = audio.mean(axis=1)
+        audio, sr = read_soundfile_capped(path, max_seconds)
+    except AudioRefusedError:
+        raise
     except Exception:  # noqa: BLE001 — not a libsndfile container
-        from torchcodec.decoders import AudioDecoder
-
-        frames = AudioDecoder(path, sample_rate=sample_rate, num_channels=1).get_all_samples()
-        return frames.data[0].numpy().astype(np.float32)
+        return decode_torchcodec_capped(path, sample_rate, max_seconds).numpy().astype(np.float32)
     check_resample_rate(sr, sample_rate)
     if sr != sample_rate:
         try:
