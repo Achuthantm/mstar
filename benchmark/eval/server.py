@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -139,11 +140,16 @@ class ManagedServer:
     def environment(self) -> dict[str, str]:
         env = {**os.environ, **self.env}
         if self._own_python and self._command is None:
-            # Tools the server finds on PATH (FlashInfer's JIT needs ninja) come from its own
-            # venv, as when that venv is activated; the abspath keeps a venv's bin/python
-            # symlink unresolved.
-            bin_dir = os.path.dirname(os.path.abspath(self.python))
-            env["PATH"] = os.pathsep.join([bin_dir, env["PATH"]]) if env.get("PATH") else bin_dir
+            python = self.python
+            if not os.path.dirname(python):
+                # a bare name (`python3.12`) runs from PATH, where Popen finds it, not from the cwd
+                python = shutil.which(python, path=env.get("PATH"))
+            if python:
+                # Tools the server finds on PATH (FlashInfer's JIT needs ninja) come from its own
+                # venv, as when that venv is activated; the abspath keeps a venv's bin/python
+                # symlink unresolved.
+                bin_dir = os.path.dirname(os.path.abspath(python))
+                env["PATH"] = os.pathsep.join([bin_dir, env["PATH"]]) if env.get("PATH") else bin_dir
         return env
 
     def __enter__(self) -> ManagedServer:

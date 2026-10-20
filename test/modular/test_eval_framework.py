@@ -734,6 +734,23 @@ def test_serve_python_puts_its_own_bin_dir_first_on_the_server_path(tmp_path):
     assert custom.environment()["PATH"] == "/usr/bin"
 
 
+def test_a_bare_serve_python_name_is_found_on_path_not_in_the_cwd(tmp_path, monkeypatch):
+    from benchmark.eval.server import ManagedServer
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "eval-test-python").symlink_to(sys.executable)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    path = os.pathsep.join([str(tmp_path / "missing"), str(venv_bin)])
+    srv = ManagedServer("m", python="eval-test-python", env={"PATH": path})
+    assert srv.environment()["PATH"] == os.pathsep.join([str(venv_bin), path])
+    # not on PATH either: Popen will not find it, and the cwd stays off PATH
+    absent = ManagedServer("m", python="no-such-eval-python", env={"PATH": "/usr/bin"})
+    assert absent.environment()["PATH"] == "/usr/bin"
+
+
 def test_server_info_names_the_tree_the_server_python_imports(tmp_path, monkeypatch):
     from benchmark.eval.schema import collect_metadata
     from benchmark.eval.server import ManagedServer
