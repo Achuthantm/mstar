@@ -4,11 +4,11 @@ import logging
 import os
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 import torch
 
@@ -17,9 +17,11 @@ from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_i
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
+    CapturePlan,
     PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    plan_captures,
 )
 from mstar.engine.resources import (
     AdmitFailedReason,
@@ -116,6 +118,9 @@ class SubmoduleManagement:
     joint_comm_group: JointGroups
     resources: dict[str, Resource]
     accelerator_graph_runner: AcceleratorGraphRunner | None = None
+    # the runner capture ran with, graphs or none: a bucket it didn't capture
+    # runs eager, and the floor covers eager steps only up to its largest
+    capture_runner: AcceleratorGraphRunner | None = None
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -436,11 +441,18 @@ class Engine:
         autocast_dtype=torch.bfloat16,
         enable_nvtx: bool = False,
         enable_profile: bool=False,
+        gpu_memory_fraction: float | None = None,
         device_capability: DeviceCapability | None = None,
     ):
+        assert gpu_memory_fraction is None or 0 < gpu_memory_fraction <= 1, (
+            f"gpu_memory_fraction is a fraction of the device, got {gpu_memory_fraction}"
+        )
         self._device = None
         self._device_capability = device_capability
         self._autocast_dtype = autocast_dtype
+        # the share of the device this worker's allocations may hold once
+        # capture is done, None for whatever is free
+        self._gpu_memory_fraction = gpu_memory_fraction
         self._resources: dict[str, Resource] = {}
         self._submodules: dict[str, SubmoduleManagement] = {}
         self._runner: StepRunner = None
@@ -645,18 +657,36 @@ class Engine:
             for runner in piecewise[node_name].values():
                 runner.prepare_for_capture()
 
+        # every bucket sized before any is captured, so one plan weighs them all
+        # against the largest eager step on the device
+        plan = self._plan_captures(ag_runners, piecewise)
+
         for node_name, submodule_mgmt in self._submodules.items():
             runner = ag_runners[node_name]
-            runner.warmup_and_capture()
+            with self._capture_into(plan, node_name) as planned:
+                runner.warmup_and_capture(planned)
+            if plan is not None or runner.any_graphs:
+                submodule_mgmt.capture_runner = runner
             if runner.any_graphs:
                 submodule_mgmt.accelerator_graph_runner = runner
 
             captured: dict[str, PiecewiseAcceleratorGraphRunner] = {}
-            for label, pw_runner in piecewise[node_name].items():
-                pw_runner.warmup_and_capture()
-                if pw_runner.any_graphs:
-                    captured[label] = pw_runner
+            with self._capture_into(plan, f"{node_name} piecewise") as planned:
+                for label, pw_runner in piecewise[node_name].items():
+                    pw_runner.warmup_and_capture(
+                        None if planned is None else {bucket for region, bucket in planned if region == label}
+                    )
+                    if pw_runner.any_graphs:
+                        captured[label] = pw_runner
             submodule_mgmt.piecewise_runners = captured
+        if plan is not None:
+            torch.cuda.empty_cache()
+            free = torch.cuda.mem_get_info(self._device)[0]
+            logger.log(
+                logging.WARNING if free < plan.floor else logging.INFO,
+                "CapturePlan[%s]: %.0f MiB free after capture, %.0f for the largest eager step",
+                self._device, free / 2**20, plan.floor / 2**20,
+            )
 
         fail_if_graphs_required([
             f"{node_name} {key}"
@@ -675,6 +705,86 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+
+    def _plan_captures(
+        self, ag_runners: dict[str, AcceleratorGraphRunner],
+        piecewise: dict[str, dict[str, PiecewiseAcceleratorGraphRunner]],
+    ) -> CapturePlan | None:
+        """Size every bucket on the device, then plan which to capture.
+
+        None off CUDA: sizing reads CUDA's allocator, and asking the driver for
+        memory would fail a CPU worker at start. With no plan, an XPU worker
+        captures every bucket.
+        """
+        if self._device is None or self._device.type != "cuda":
+            return None
+        def planned(size: Callable[[Any], dict]) -> tuple[dict[str, dict], int, CapturePlan]:
+            """A plan over what ``size`` says each runner's buckets cost."""
+            pools: dict[str, dict] = {}
+            for node_name in self._submodules:
+                pools[node_name] = size(ag_runners[node_name])
+                # one pool for all of a node's regions (see `_build_piecewise_runners`)
+                pools[f"{node_name} piecewise"] = {
+                    (label, bucket): cost
+                    for label, runner in piecewise[node_name].items()
+                    for bucket, cost in size(runner).items()
+                }
+            torch.cuda.empty_cache()
+            free, total = torch.cuda.mem_get_info(self._device)
+            reusable = None
+            if self._gpu_memory_fraction is not None:
+                # shortcut: counts this worker's PyTorch allocations, not its CUDA
+                # context or NCCL buffers; add those if a capped worker still crowds another
+                capped = int(self._gpu_memory_fraction * total) - torch.cuda.memory_reserved(self._device)
+                # Free memory already excludes what sizing holds outside the allocator, and `capped`
+                # doesn't, so the plan counts graphs as reusing that memory only up to the gap between them.
+                reusable = max(capped - free, 0)
+                free = min(free, capped)
+            return pools, free, plan_captures(pools, free, reusable)
+
+        pools, free, plan = planned(lambda runner: runner.size_captures())
+        # a walk's smaller buckets were sized by its largest, which is enough
+        # while every graph fits. If one doesn't, here or on another rank of a
+        # runner's group, each is sized by its own capture, and the plan made again
+        short = any(
+            cost.graph is not None and bucket not in plan.buckets[pool]
+            for pool, costs in pools.items() for bucket, cost in costs.items()
+        )
+        pools, free, plan = planned(lambda runner: runner.size_lent_captures(short))
+        logger.info(
+            "CapturePlan[%s]: %.0f MiB free, %.0f for the largest eager step",
+            self._device, free / 2**20, plan.floor / 2**20,
+        )
+        if free < plan.floor:
+            logger.warning(
+                "CapturePlan[%s]: no room for graphs beside the largest eager step "
+                "(gpu_memory_fraction %s)", self._device, self._gpu_memory_fraction,
+            )
+        for pool, costs in pools.items():
+            if costs:
+                logger.info(
+                    "CapturePlan[%s] %s: %d of %d buckets, %.0f MiB predicted, %.0f outside the allocator",
+                    self._device, pool, len(plan.buckets[pool]), len(costs), plan.predicted[pool] / 2**20,
+                    plan.outside[pool] / 2**20,
+                )
+        return plan
+
+    @contextmanager
+    def _capture_into(self, plan: CapturePlan | None, pool: str) -> Iterator[set | None]:
+        """Yield what ``plan`` captures into ``pool``, then log what capturing it took."""
+        if plan is None:
+            yield None
+            return
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved(self._device)
+        yield plan.buckets[pool]
+        torch.cuda.empty_cache()
+        took = torch.cuda.memory_reserved(self._device) - before
+        logger.log(
+            logging.WARNING if took > plan.predicted[pool] else logging.INFO,
+            "CapturePlan[%s] %s: capture took %.0f MiB, %.0f predicted", self._device, pool,
+            took / 2**20, plan.predicted[pool] / 2**20,
+        )
 
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement,
@@ -1959,16 +2069,17 @@ class Engine:
         """Most requests this node will take in one step, or None for no cap.
 
         Two sources: what the submodule says it can batch, and the largest
-        batch this walk captured a graph for — going past that would drop the
-        step to eager, so the scheduler splits instead. Splitting is the
-        scheduler's job, not the engine's: the pieces then pipeline like any
-        other batch instead of running back to back.
+        bucket this walk has a capture config for, captured or not — past it a
+        step runs eager at a size the capture budget never measured, so the
+        scheduler splits instead. Splitting is the scheduler's job, not the
+        engine's: the pieces then pipeline like any other batch instead of
+        running back to back.
         """
         submodule_mgmt = self._submodules[node_name]
         caps = [submodule_mgmt.submodule.max_batch_size(graph_walk)]
-        if submodule_mgmt.accelerator_graph_runner is not None:
+        if submodule_mgmt.capture_runner is not None:
             caps.append(
-                submodule_mgmt.accelerator_graph_runner.max_batch_size_for(graph_walk)
+                submodule_mgmt.capture_runner.max_batch_size_for(graph_walk)
             )
         capped = [cap for cap in caps if cap is not None]
         return min(capped) if capped else None
