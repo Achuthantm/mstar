@@ -16,8 +16,9 @@
 //!   POST /v1/images/edits          (multipart)
 //!   POST /generate                 (native multipart -> NDJSON)
 //!   GET  /health
+//!   GET  /metrics                  (the API server's Prometheus text, via the bridge)
 //!
-//! With `MSTAR_API_KEY` set, every route but `/health` needs
+//! With `MSTAR_API_KEY` set, every route but `/health` and `/metrics` needs
 //! `Authorization: Bearer <key>` (`auth.rs`).
 //!
 //! Two result sources, selected at startup by whether a conductor socket dir is
@@ -130,7 +131,8 @@ async fn main() {
 
     // Admission control: bound concurrent generation requests; past the cap
     // clients get an immediate 503 instead of queueing into the timeout.
-    // /health and /v1/models bypass it (a saturated server is still alive).
+    // /health, /metrics and /v1/models bypass it (a saturated server is
+    // still alive, and still scrapeable).
     let max_concurrent: usize = std::env::var("MSTAR_MAX_CONCURRENT_REQUESTS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -156,6 +158,7 @@ async fn main() {
     // outside admission, so an unauthenticated request never takes a permit.
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
@@ -401,7 +404,10 @@ fn sse_error_event(status: u16, msg: &str) -> Event {
     )
 }
 
-// ---- GET /health, /v1/models ---------------------------------------------
+// ---- GET /health, /metrics, /v1/models ------------------------------------
+
+/// How long `/health` and `/metrics` wait for the bridge loop to answer.
+const BRIDGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Deep health: liveness of the whole serving path, not just this process.
 /// With a bridge configured, a ping must round-trip to the Python backend —
@@ -409,7 +415,7 @@ fn sse_error_event(status: u16, msg: &str) -> Event {
 /// letting requests queue into the timeout. Mock mode stays shallow.
 async fn health(State(st): State<AppState>) -> Response {
     if let Some(bridge) = &st.bridge {
-        if !bridge.ping(std::time::Duration::from_secs(2)).await {
+        if !bridge.ping(BRIDGE_PROBE_TIMEOUT).await {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"status": "unhealthy", "reason": "backend bridge unreachable"})),
@@ -418,6 +424,25 @@ async fn health(State(st): State<AppState>) -> Response {
         }
     }
     Json(json!({"status": "healthy"})).into_response()
+}
+
+/// Prometheus metrics: the text the API server renders from its one
+/// registry, asked over the bridge, so both frontends serve the same names.
+/// 404 when the server runs without `--enable-metrics` (and in mock mode,
+/// which has no registry), with the Python route's body; 503 when the bridge
+/// does not answer.
+async fn metrics(State(st): State<AppState>) -> Response {
+    let off = || detail_error(404, "metrics are off; start the server with --enable-metrics");
+    let Some(bridge) = &st.bridge else {
+        return off();
+    };
+    let Some(reply) = bridge.metrics(BRIDGE_PROBE_TIMEOUT).await else {
+        return detail_error(503, "backend bridge unreachable");
+    };
+    match reply.metadata.get("content_type").and_then(Value::as_str) {
+        Some(content_type) => ([(CONTENT_TYPE, content_type.to_string())], reply.data).into_response(),
+        None => off(),
+    }
 }
 
 async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
@@ -1162,6 +1187,132 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mstar_rust::communicator::RawZmqCommunicator;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn state(bridge: Option<Arc<Bridge>>) -> AppState {
+        AppState {
+            model_name: "m".into(),
+            upload_dir: std::env::temp_dir(),
+            allow_remote: false,
+            sample_rate: 24000,
+            request_timeout: std::time::Duration::from_secs(5),
+            max_images_per_request: 10,
+            tok: None,
+            bridge,
+        }
+    }
+
+    /// The Python bridge loop's side of the socket: answers every `metrics`
+    /// message with `metadata`, as `RustFrontendBridge` does.
+    struct FakeBackend {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeBackend {
+        fn start(dir: &std::path::Path, text: &'static [u8], metadata: Value) -> Self {
+            #[derive(serde::Serialize)]
+            struct Reply<'a> {
+                t: &'static str,
+                rid: &'a str,
+                sub: u64,
+                #[serde(with = "serde_bytes")]
+                data: &'a [u8],
+                metadata: &'a Value,
+            }
+            let peer = RawZmqCommunicator::bind("bridge", dir).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !stopping.load(Ordering::Relaxed) {
+                    let Some(frame) = peer.recv_timeout(std::time::Duration::from_millis(20)) else {
+                        continue;
+                    };
+                    let msg: Value = rmp_serde::from_slice(&frame).unwrap();
+                    if msg["t"] != "metrics" {
+                        continue;
+                    }
+                    let reply = Reply {
+                        t: "metrics",
+                        rid: msg["rid"].as_str().unwrap(),
+                        sub: msg["sub"].as_u64().unwrap(),
+                        data: text,
+                        metadata: &metadata,
+                    };
+                    peer.send("frontend", &rmp_serde::to_vec_named(&reply).unwrap()).unwrap();
+                }
+            });
+            Self { stop, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    fn socket_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mstar-metrics-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn body(resp: Response) -> (StatusCode, Option<String>, Vec<u8>) {
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (status, content_type, bytes.to_vec())
+    }
+
+    #[tokio::test]
+    async fn metrics_serve_the_backend_s_text_with_its_content_type() {
+        let dir = socket_dir();
+        let text: &[u8] = b"# TYPE mstar_requests_total counter\nmstar_requests_total{model_name=\"m\"} 3.0\n";
+        let content_type = "text/plain; version=1.0.0; charset=utf-8";
+        let _backend = FakeBackend::start(&dir, text, json!({"content_type": content_type}));
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+
+        let (status, ct, data) = body(metrics(State(state(Some(bridge)))).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct.as_deref(), Some(content_type));
+        assert_eq!(data, text);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_404_when_the_backend_runs_without_them_and_in_mock_mode() {
+        let dir = socket_dir();
+        let _backend = FakeBackend::start(&dir, b"", json!({}));
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+
+        let (status, _, data) = body(metrics(State(state(Some(bridge)))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&data).contains("--enable-metrics"));
+
+        let (status, _, _) = body(metrics(State(state(None))).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_503_when_the_bridge_does_not_answer() {
+        let dir = socket_dir();
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+
+        let (status, _, _) = body(metrics(State(state(Some(bridge)))).await).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn image_count_refuses_n_outside_one_to_limit() {

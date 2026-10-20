@@ -10,6 +10,7 @@ import socket
 import tempfile
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -45,6 +46,8 @@ class _StubAPIServer:
     def __init__(self):
         self.submitted = []
         self.aborted = []
+        # APIServer.metrics: None until --enable-metrics turns them on.
+        self.metrics = None
 
     def submit_request(self, *, text=None, file_paths=None,
                        input_modalities, output_modalities,
@@ -227,6 +230,57 @@ def test_health_goes_red_when_the_bridge_dies(stack):
     assert e.value.code == 503
 
 
+def _get(port, path, headers=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+
+
+def test_metrics_relay_the_api_server_registry_open_like_health():
+    """``/metrics`` on ``mstar-server`` is the text the API server's registry
+    renders, with its content type, and needs no key while the request
+    routes keep it."""
+    pytest.importorskip("prometheus_client")
+    from mstar.observability.metrics import ServingMetrics
+
+    with _running_stack(api_key="s3cret") as (port, stub, _bridge, _proc):
+        stub.metrics = ServingMetrics("qwen3_omni", in_flight=lambda: 3)
+        now = time.perf_counter()
+        timing = types.SimpleNamespace(recv_time=now - 0.4, first_chunk_time=now - 0.3)
+        stub.metrics.record(types.SimpleNamespace(
+            output_modalities=["text"], profile=types.SimpleNamespace(timing=timing),
+        ), "success")
+        for headers in ({}, {"Authorization": "Bearer wrong"}):
+            status, resp_headers, body = _get(port, "/metrics", headers)
+            assert status == 200, body
+            assert resp_headers["Content-Type"] == stub.metrics.content_type
+            assert body == stub.metrics.render()
+        from prometheus_client.parser import text_string_to_metric_families
+
+        samples = {(s.name, tuple(sorted(s.labels.items()))): s.value
+                   for f in text_string_to_metric_families(body.decode()) for s in f.samples}
+        model = ("model_name", "qwen3_omni")
+        assert samples[("mstar_requests_in_flight", (model,))] == 3
+        assert samples[("mstar_requests_total", (model, ("outcome", "success"),
+                                                 ("output_modalities", "text")))] == 1
+        assert samples[("mstar_e2e_request_latency_seconds_count",
+                        (model, ("output_modalities", "text")))] == 1
+        assert _get(port, "/v1/models")[0] == 401
+
+
+def test_metrics_are_404_when_off_and_503_when_the_bridge_dies(stack):
+    port, _stub, bridge, _proc = stack
+    status, _, body = _get(port, "/metrics")
+    assert status == 404
+    assert "--enable-metrics" in json.loads(body)["detail"]
+    bridge.stop()
+    time.sleep(0.1)  # let the loop exit
+    assert _get(port, "/metrics")[0] == 503
+
+
 def test_sigterm_drains_and_exits(stack):
     import signal
 
@@ -270,6 +324,9 @@ def test_admission_permit_is_held_through_streaming_body():
     proc = subprocess.Popen(
         [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
     stub = _GatedStub(gate)
+    # What the bridge reads of APIServer.metrics.
+    stub.metrics = types.SimpleNamespace(
+        render=lambda: b"mstar_up 1\n", content_type="text/plain; version=0.0.4")
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
@@ -290,6 +347,8 @@ def test_admission_permit_is_held_through_streaming_body():
         with pytest.raises(urllib.error.HTTPError) as e:
             _chat(port, "second", timeout=5)
         assert e.value.code == 503
+        # A saturated server is still scrapeable: /metrics bypasses the cap.
+        assert _get(port, "/metrics")[:3:2] == (200, b"mstar_up 1\n")
         # Release A; its permit frees and a subsequent request succeeds.
         gate.set()
         assert b"world" in resp_a.read()

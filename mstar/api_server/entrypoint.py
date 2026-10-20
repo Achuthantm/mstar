@@ -1909,9 +1909,6 @@ def main(argv: list[str] | None = None):
     args = parser.parse_args(argv)
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
         parser.error(INSTALL_HINT)
-    if args.enable_metrics and args.rust_frontend:
-        parser.error("--enable-metrics is not served by the Rust frontend yet; "
-                     "drop --rust-frontend or --enable-metrics")
     if args.socket_path_prefix is None:
         args.socket_path_prefix = per_port_socket_prefix(args.port)
 

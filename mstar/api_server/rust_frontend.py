@@ -10,8 +10,15 @@ protocol are untouched):
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
                           prompt_parts, streaming} | {t:"abort", rid, sub}
+                       | {t:"ping", rid, sub} | {t:"metrics", rid, sub}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
+                       | {t:"pong", rid, sub}
+                       | {t:"metrics", rid, sub, data(bin), metadata}
+
+A ``metrics`` reply is what ``GET /metrics`` serves on the Python frontend:
+the text rendered from ``APIServer.metrics`` with its ``content_type`` in
+``metadata``, or empty ``metadata`` when metrics are off (a 404).
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -195,6 +202,30 @@ class RustFrontendBridge:
         else:
             self.server.abort_submission(self._keys.pop(sub, None))
 
+    def _metrics(self, msg: dict) -> None:
+        metrics = self.server.metrics
+        reply = {"t": "metrics", "rid": msg["rid"], "sub": msg.get("sub"),
+                 "data": b"", "metadata": {}}
+        if metrics is not None:
+            reply["data"] = metrics.render()
+            reply["metadata"] = {"content_type": metrics.content_type}
+        self._send(reply)
+
+    def _handle(self, msg: dict) -> None:
+        t = msg.get("t")
+        if t == "submit":
+            self._submit(msg)
+        elif t == "abort":
+            self._abort(msg)
+        elif t == "ping":
+            # Deep-health liveness: the frontend's /health goes red
+            # unless this loop answers.
+            self._send({"t": "pong", "rid": msg["rid"], "sub": msg.get("sub")})
+        elif t == "metrics":
+            self._metrics(msg)
+        else:
+            logger.warning("bridge: unknown message type %r", t)
+
     # -- loop ----------------------------------------------------------------
 
     async def _serve(self) -> None:
@@ -219,17 +250,7 @@ class RustFrontendBridge:
                 # and takes the whole server down. `_submit` is already wrapped;
                 # this guards every other branch.
                 try:
-                    t = msg.get("t")
-                    if t == "submit":
-                        self._submit(msg)
-                    elif t == "abort":
-                        self._abort(msg)
-                    elif t == "ping":
-                        # Deep-health liveness: the frontend's /health goes red
-                        # unless this loop answers.
-                        self._send({"t": "pong", "rid": msg["rid"], "sub": msg.get("sub")})
-                    else:
-                        logger.warning("bridge: unknown message type %r", t)
+                    self._handle(msg)
                 except Exception:  # noqa: BLE001 — one bad message must not kill the loop
                     logger.exception("bridge: dropping a message that raised (%r)",
                                      msg.get("t"))

@@ -104,16 +104,20 @@ class _Served:
         )))
 
     def scrape(self) -> dict:
-        from prometheus_client.parser import text_string_to_metric_families
-
         r = TestClient(entrypoint.app).get("/metrics")
         assert r.status_code == 200, r.text
         assert r.headers["content-type"].startswith("text/plain")
-        samples = {}
-        for family in text_string_to_metric_families(r.text):
-            for s in family.samples:
-                samples[(s.name, tuple(sorted(s.labels.items())))] = s.value
-        return samples
+        return _parse(r.text)
+
+
+def _parse(text: str) -> dict:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    samples = {}
+    for family in text_string_to_metric_families(text):
+        for s in family.samples:
+            samples[(s.name, tuple(sorted(s.labels.items())))] = s.value
+    return samples
 
 
 @pytest.fixture
@@ -207,6 +211,75 @@ def test_metrics_need_no_api_key_while_generate_still_does(served):
         assert "mstar_requests_in_flight" in r.text
     finally:
         entrypoint.api_key_guard.set(auth.resolve_api_key())
+
+
+class _BridgeSocket:
+    """The Rust-frontend bridge's transport: each receive hands the serve loop
+    the next scripted batch (a callable runs first and returns it), then
+    stops the loop."""
+
+    def __init__(self, bridge, script):
+        self.bridge, self.script = bridge, list(script)
+
+    def get_all_new_messages(self, blocking=True, timeout_s=None):
+        if not self.script:
+            self.bridge.running = False
+            return []
+        step = self.script.pop(0)
+        return step() if callable(step) else step
+
+
+def _serve_bridge(server, script, sent: list) -> None:
+    """Run the real ``RustFrontendBridge`` serve loop over ``script``,
+    appending what it sends the frontend to ``sent``."""
+    from mstar.api_server.rust_frontend import RustFrontendBridge
+
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.server, bridge._keys, bridge.running = server, {}, True
+    bridge._send = sent.append
+    bridge.comm = _BridgeSocket(bridge, script)
+    asyncio.run(bridge._serve())
+
+
+def test_the_rust_bridge_answers_metrics_with_what_the_python_route_serves(served):
+    """``mstar-server``'s ``/metrics`` relays this reply, so both frontends
+    show the same registry, and requests that came in through the bridge
+    move it."""
+    sent = []
+
+    def scrape_while_in_flight():
+        _wait(lambda: served.data_worker.inputs)
+        return [{"t": "metrics", "rid": "metrics-a", "sub": 2}]
+
+    def answer_then_scrape():
+        served.answer(served.key())
+        _wait(lambda: any(m["t"] == "done" and m["sub"] == 1 for m in sent))
+        return [{"t": "metrics", "rid": "metrics-b", "sub": 3}]
+
+    _serve_bridge(served.server, [
+        [{"t": "submit", "rid": "X", "sub": 1, "text": "hi", "streaming": True, **TEXT}],
+        scrape_while_in_flight,
+        answer_then_scrape,
+    ], sent)
+
+    replies = {m["sub"]: m for m in sent if m["t"] == "metrics"}
+    assert sorted(replies) == [2, 3]
+    for reply, rid in ((replies[2], "metrics-a"), (replies[3], "metrics-b")):
+        assert reply["rid"] == rid
+        assert reply["metadata"] == {"content_type": served.server.metrics.content_type}
+    assert _parse(replies[2]["data"].decode())[("mstar_requests_in_flight", _labels())] == 1
+    after = _parse(replies[3]["data"].decode())
+    assert after[("mstar_requests_in_flight", _labels())] == 0
+    assert _count(after, "success") == 1
+    assert replies[3]["data"] == TestClient(entrypoint.app).get("/metrics").content
+
+
+def test_the_rust_bridge_answers_metrics_off_when_they_are_off(tmp_path):
+    """Empty metadata is how ``mstar-server`` knows to answer 404."""
+    sent = []
+    _serve_bridge(make_test_api_server(upload_dir=tmp_path),
+                  [[{"t": "metrics", "rid": "metrics-a", "sub": 5}]], sent)
+    assert sent == [{"t": "metrics", "rid": "metrics-a", "sub": 5, "data": b"", "metadata": {}}]
 
 
 def _engine_fails(served):
@@ -384,10 +457,9 @@ def test_enable_metrics_without_the_package_stops_before_anything_starts(monkeyp
     assert _main_until_api_server(monkeypatch, tmp_path)
 
 
-def test_enable_metrics_with_the_rust_frontend_is_refused(monkeypatch, tmp_path, capsys):
+def test_enable_metrics_with_the_rust_frontend_starts(monkeypatch, tmp_path):
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
-    assert not _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics", "--rust-frontend")
-    assert "Rust frontend" in capsys.readouterr().err
+    assert _main_until_api_server(monkeypatch, tmp_path, "--enable-metrics", "--rust-frontend")
 
 
 def test_mstar_serve_forwards_enable_metrics(monkeypatch):
