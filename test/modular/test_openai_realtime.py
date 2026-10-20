@@ -800,20 +800,21 @@ def test_request_error_from_the_engine_keeps_only_base_names_of_server_paths(cli
                        "(see codec.json); docs at https://example.com/a/b, lang en/US")
 
 
-def test_turn_detection_is_refused_and_echoed_as_null(client_and_stub):
-    """The server has no turn detection, so a client asking for one hears so
-    instead of waiting for commits that never come; the session says null."""
+def test_unsupported_turn_detection_is_refused_and_echoed_as_null(client_and_stub):
+    """A turn detection the server does not have is refused, instead of the
+    client waiting for commits that never come; the session says null."""
     client, _ = client_and_stub
     with client.websocket_connect("/v1/realtime?intent=transcription") as ws:
         assert json.loads(ws.receive_text())["session"]["turn_detection"] is None
         ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
-            "turn_detection": {"type": "server_vad", "silence_duration_ms": 500},
+            "turn_detection": {"type": "push_to_talk"},
             "input_audio_transcription": {"language": "en"},
         }}))
         err = json.loads(ws.receive_text())
-        assert err["type"] == "error" and "turn_detection 'server_vad' is not supported" in err["error"]["message"]
+        assert err["type"] == "error"
+        assert "turn_detection type 'push_to_talk' is not supported" in err["error"]["message"]
         for td, shown in (({}, "turn_detection {} is"), ({"type": None}, "turn_detection {'type': None} is"),
-                          (False, "turn_detection False is")):
+                          (False, "turn_detection must be an object")):
             ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"turn_detection": td}}))
             assert json.loads(ws.receive_text())["error"]["message"].startswith(shown)
         ws.send_text(json.dumps({"type": "transcription_session.update", "session": {"turn_detection": None}}))
