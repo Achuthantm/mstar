@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-from benchmark.eval.e2e import calibrate, hosts, media, report, trees
+from benchmark.eval.e2e import calibrate, hosts, media, report, stress, trees
 from benchmark.eval.e2e import manifest as mf
 from benchmark.eval.e2e.report import RERUN_TAG
 
@@ -77,6 +77,18 @@ def add_args(sub) -> None:
     p.add_argument("--render", default=None, metavar="RUN_DIR", help="only re-render RUN_DIR's report")
     p.add_argument("--list", action="store_true", help="list models, tags and cases")
     p.add_argument("--dry-run", action="store_true", help="resolve refs and slots, print the plan, run nothing")
+    s = p.add_argument_group("stress", "--stress replaces the cases with a pinned-id workload of cancels, drops, "
+                             "retries, reuse and overlaps, judged on failed runs (benchmark/eval/e2e/stress.py)")
+    s.add_argument("--stress", action="store_true", help="run the stress workload on the models that define one")
+    s.add_argument("--stress-runs", type=int, default=stress.DEFAULTS["runs"], help="runs per arm (default 20)")
+    s.add_argument("--stress-seconds", type=float, default=stress.DEFAULTS["seconds"],
+                   help="seconds per run (default 60)")
+    s.add_argument("--stress-clients", type=int, default=stress.DEFAULTS["clients"],
+                   help="concurrent clients, one pinned request_id each (default 32)")
+    s.add_argument("--stress-patterns", default=",".join(stress.PATTERNS),
+                   help=f"comma-separated subset of {','.join(stress.PATTERNS)}")
+    s.add_argument("--stress-hang-s", type=float, default=stress.DEFAULTS["hang_s"],
+                   help="no progress this long is a hang (default 30)")
     c = sub.add_parser("calibrate", allow_abbrev=False, help="fold A/A compare runs into the noise floors")
     c.add_argument("runs", nargs="+", help="run directories of compare --base X --head X")
     c.add_argument("--cases", default=str(mf.DEFAULT))
@@ -97,6 +109,9 @@ def run_models(man: mf.Manifest, run: dict) -> list[mf.Model]:
 
 def render(run_dir: Path, man: mf.Manifest, calibration: str, chart_url: str | None = None) -> tuple[Path, int]:
     run = json.loads((run_dir / "run.json").read_text())
+    if run.get("stress"):
+        md, verdicts = stress.write(run_dir, run["models"], chart_url)
+        return md, 1 if any(v.flagged for v in verdicts) else 2 if any(v.unfinished for v in verdicts) else 0
     md, rows = report.write(run_dir, run_models(man, run), chart_url, calibrate.load(calibration))
     bare = sorted({r.model for r in rows if r.no_baseline})
     if bare:
@@ -130,9 +145,31 @@ def public_command(args) -> str:
         parts.append(f"--sessions {args.sessions}")
     if args.repeats:
         parts.append(f"--repeats {args.repeats}")
+    if getattr(args, "stress", False):
+        parts += ["--stress", f"--stress-runs {args.stress_runs}", f"--stress-seconds {args.stress_seconds:g}",
+                  f"--stress-clients {args.stress_clients}"]
+        if args.stress_patterns != ",".join(stress.PATTERNS):
+            parts.append(f"--stress-patterns {shlex.quote(args.stress_patterns)}")
+        if args.stress_hang_s != stress.DEFAULTS["hang_s"]:
+            parts.append(f"--stress-hang-s {args.stress_hang_s:g}")
     if args.hosts or args.host_provider:
         parts.append("--hosts <ssh hosts>")
     return " ".join(parts)
+
+
+def stress_config(args) -> dict | None:
+    """The job's ``stress`` block (model kwargs are added per model), or None without ``--stress``."""
+    if not getattr(args, "stress", False):
+        return None
+    patterns = [p.strip() for p in args.stress_patterns.split(",") if p.strip()]
+    bad = sorted(set(patterns) - set(stress.PATTERNS))
+    if bad or not patterns:
+        raise SystemExit(f"--stress-patterns: unknown {', '.join(bad) or 'empty list'} "
+                         f"(known: {', '.join(stress.PATTERNS)})")
+    if args.stress_runs < 1 or args.stress_clients < 1 or args.stress_seconds <= 0 or args.stress_hang_s <= 0:
+        raise SystemExit("--stress-runs and --stress-clients must be at least 1, the seconds positive")
+    return {**stress.DEFAULTS, "runs": args.stress_runs, "seconds": args.stress_seconds,
+            "clients": args.stress_clients, "hang_s": args.stress_hang_s, "patterns": patterns}
 
 
 def tree_id(root: Path) -> str:
@@ -289,8 +326,14 @@ class Runner:
         arm = lambda ref: {"sha": ref.sha, "label": ref.label, "src": f"{p['src']}/{ref.sha}",  # noqa: E731
                            "rust_tree": ref.rust_tree}
         gpus = slot.devices or ([slot.gpu] if slot.gpu is not None else [])
+        st = stress_config(self.args)
+        if st is not None:
+            st = {**st, **{k: v for k, v in m.stress.items() if k != "model_kwargs"},
+                  "model_kwargs": m.stress.get("model_kwargs", {})}
+        sessions = (2 if name in self.rerun_cases else self.args.sessions) if st is None \
+            else -(-st["runs"] // stress.PER_SERVER)
         return {"run_id": self.run_key, "model": m.to_dict(), "out": out, "gpu": slot.gpu, "gpus": gpus,
-                "sessions": 2 if name in self.rerun_cases else self.args.sessions,
+                "stress": st, "sessions": sessions,
                 "order": ["base", "head"] if position % 2 == 0 else ["head", "base"],
                 "python": self.python(slot), "evalfw": p["evalfw"], "data": p["data"], "host_dir": slot.host_dir,
                 "datasets": self.man.datasets, "arms": {"base": arm(self.base), "head": arm(self.head)},
@@ -375,7 +418,8 @@ class Runner:
     def maybe_rerun(self, name: str) -> str | None:
         """A perf regression with one server session per arm may be the process's speed level (some servers settle
         at one of two speeds per process): queue those cases with two sessions, ABBA, before reporting them."""
-        if RERUN_TAG in name or self.args.sessions > 1 or self.args.no_rerun or self.stop.is_set():
+        if (RERUN_TAG in name or self.args.sessions > 1 or self.args.no_rerun or self.stop.is_set()
+                or getattr(self.args, "stress", False)):
             return None
         rows = report.build_rows(self.run_dir, [self.model_for(name)], calibrate.load(self.args.calibration))
         flagged = report.flagged_perf_cases(rows)
@@ -427,6 +471,14 @@ def cmd_compare(args) -> int:
     if args.out and (Path(args.out) / "run.json").exists():
         raise SystemExit(f"{args.out} already holds a run; pass a new --out (reruns and results would mix)")
     models = man.select(args.models, include_optional=args.rp)
+    st = stress_config(args)
+    if st is not None:
+        named = {t.strip() for t in args.models.split(",")} & set(man.models)
+        without = sorted(m.name for m in models if not m.stress and m.name in named)
+        if without:
+            raise SystemExit(f"no stress workload for {', '.join(without)} (models with one: "
+                             f"{', '.join(n for n, m in man.models.items() if m.stress)})")
+        models = [m for m in models if m.stress]
     if not models:
         raise SystemExit("no models selected")
     base = trees.resolve(TOOL_ROOT, args.base, args.remote)
@@ -459,6 +511,8 @@ def _run(args, man, models, base, head, slots) -> int:
         for m in (m for m in models if m.gpus > 1):
             fit = "fits" if m.gpus <= largest else f"does not fit (largest host: {largest} GPUs)"
             print(f"  {m.name}: {m.gpus} GPUs on one host, {fit}", file=sys.stderr)
+        if getattr(args, "stress", False):
+            print(stress.plan_text(stress_config(args)), file=sys.stderr)
         return 0
     stamp = time.strftime("%Y%m%d-%H%M%S")
     label = re.sub(r"[^A-Za-z0-9.-]+", "_", head.label)
@@ -480,7 +534,7 @@ def _run(args, man, models, base, head, slots) -> int:
            "gpu_name": usable[0].gpu_name, "models": [m.name for m in models], "include_optional": args.rp,
            "sessions": args.sessions, "repeats": args.repeats or man.defaults.get("repeats", 3),
            "perf_pct": th.get("perf_pct", 5), "noise_sigma": th.get("noise_sigma", 2),
-           "rerun_flagged": not args.no_rerun,
+           "rerun_flagged": not args.no_rerun, "stress": stress_config(args),
            "gpus_per_model": {m.name: m.gpus for m in models if m.gpus > 1},
            "slots": [s.name for s in usable], "command": public_command(args),
            "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}

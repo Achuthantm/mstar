@@ -11,6 +11,7 @@ sessions alternate the arm order (ABBA with two sessions). Layout under ``job["o
   <arm>/s<k>/server.log
   <arm>/s<k>/<case>/              mstar-eval/1 results per concurrency, saved outputs, client log, and
                                   stacks.txt when the case hung (ran past the model's case_timeout_s)
+  <arm>/s<k>/stress/run<r>.json   ``--stress`` instead of the cases: one record per run (stress.run_session)
   compare.json                    checks.compare_model
   done.json                       written last: done | skipped | error | interrupted
 """
@@ -29,7 +30,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from benchmark.eval.e2e import checks
+from benchmark.eval.e2e import checks, stress
 from benchmark.eval.server import ManagedServer, ServerError, is_healthy
 
 CASE_TIMEOUT_S = 3600
@@ -281,7 +282,11 @@ def run_arm(arm_name: str, session: int) -> dict:
         imported = os.path.realpath(prov.stdout.strip() or "/nonexistent")
         info["mstar_from_arm_src"] = imported.startswith(os.path.realpath(arm["src"]) + os.sep)
         log(f"{arm_name} s{session}: healthy after {info['startup_s']} s")
-        for case in model["cases"] if info["mstar_from_arm_src"] else []:
+        if job.get("stress") and info["mstar_from_arm_src"]:
+            status(phase="stress", arm=arm_name, session=session)
+            stress.run_session(server.url, server.pid, arm_name, session, d, job["stress"], status, log, _publish,
+                               stress.server_namespaces(server))
+        for case in model["cases"] if info["mstar_from_arm_src"] and not job.get("stress") else []:
             cd = d / case["id"]
             cd.mkdir(parents=True, exist_ok=True)
             status(phase="case", arm=arm_name, session=session, case=case["id"])
@@ -316,6 +321,9 @@ def run_arm(arm_name: str, session: int) -> dict:
     except ServerError as e:
         info.update(healthy=False, error=str(e)[-500:])
         log(f"{arm_name} s{session}: did not start: {e}")
+        if job.get("stress"):
+            stress.lost_runs(stress.session_runs(job["stress"], session), arm_name, session, d, ["error"],
+                             "not run: the server did not start", _publish, no_server=True)
     finally:   # also when interrupted; a signal must not cut the process-group sweep short
         with signals_deferred():
             server.stop()
@@ -402,7 +410,8 @@ def run() -> None:
             if info.get("healthy") and not info.get("mstar_from_arm_src"):
                 return done("error", reason=f"the {arm_name} server did not import mstar from its own checkout")
     status(phase="compare")
-    checks.compare_model(out, model["cases"], job["sessions"])
+    if not job.get("stress"):
+        checks.compare_model(out, model["cases"], job["sessions"])
     done("done", rust={a: p for a, p in problems.items() if p})
     status(phase="done")
 

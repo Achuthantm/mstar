@@ -36,6 +36,9 @@
 #
 # `est_min` (GPU minutes per arm, H200) only orders the queue: longest model first. `gpus` (default 1) is how many
 # GPUs of one host serve the model; `case_timeout_s` caps each case's wall time (a case past it has hung).
+#
+# `stress` (optional): the model takes `compare --stress`, a pinned-id text workload on streamed `/generate`
+# (benchmark/eval/e2e/stress.py); `model_kwargs` are added to every request, `max_tokens` caps replies (64).
 
 defaults:
   conc: [1, 8]
@@ -260,6 +263,7 @@ models:
     family: LLM
     tags: [llm, text, image-in, small]
     est_min: 6
+    stress: {model_kwargs: {enable_thinking: false}}
     cases:
       - id: text
         modality: text

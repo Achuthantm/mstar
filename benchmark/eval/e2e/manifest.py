@@ -24,6 +24,7 @@ CHECKS = {
     "duplex": {"tol"},
     "audio_len": {"pct"},
 }
+STRESS_KEYS = {"model_kwargs", "max_tokens"}
 
 
 class ManifestError(ValueError):
@@ -67,6 +68,7 @@ class Model:
     optional: bool = False             # a variant (Mooncake transport): only when named or picked by its own tag
     gpus: int = 1                      # GPUs of one host both arms are served on (TP, SP, split, disaggregated)
     case_timeout_s: float | None = None   # wall cap per case: a case still running then has hung (arm.CASE_TIMEOUT_S)
+    stress: dict[str, Any] = field(default_factory=dict)   # the `compare --stress` workload; empty: none
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -193,6 +195,10 @@ def parse(raw: dict) -> Manifest:
         cap = m.get("case_timeout_s", defaults.get("case_timeout_s"))
         if cap is not None and (not isinstance(cap, (int, float)) or isinstance(cap, bool) or cap <= 0):
             raise ManifestError(f"{where}: case_timeout_s must be a positive number of seconds")
+        stress = m.get("stress") or {}
+        if not isinstance(stress, dict) or set(stress) - STRESS_KEYS \
+                or not isinstance(stress.get("model_kwargs", {}), dict):
+            raise ManifestError(f"{where}: stress takes {', '.join(sorted(STRESS_KEYS))} (model_kwargs a mapping)")
         models[name] = Model(
             name=name, serve=_req(m, "serve", where, str), family=str(m.get("family", "Other")),
             tags=[str(t) for t in m.get("tags", [])], cases=cases, config=m.get("config"),
@@ -204,7 +210,7 @@ def parse(raw: dict) -> Manifest:
             serve_args=[str(a) for a in m.get("serve_args", [])],
             thresholds={**(defaults.get("thresholds") or {}), **(m.get("thresholds") or {})},
             optional=bool(m.get("optional", False)), gpus=gpus,
-            case_timeout_s=float(cap) if cap is not None else None)
+            case_timeout_s=float(cap) if cap is not None else None, stress=stress)
     return Manifest(models=models, datasets=datasets, defaults=defaults)
 
 
