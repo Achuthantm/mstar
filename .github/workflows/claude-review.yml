@@ -387,7 +387,7 @@ jobs:
             ${{ steps.prev.outputs.session_id && format('--resume {0}', steps.prev.outputs.session_id) || '' }}
             --allowedTools "mcp__github_inline_comment__create_inline_comment"
             --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch
-            --json-schema '{"type":"object","properties":{"summary":{"type":"string","description":"The summary comment, in the format review-prompt.md gives."}},"required":["summary"]}'
+            --json-schema '{"type":"object","properties":{"summary":{"type":"string","description":"The summary comment, in the format review-prompt.md gives."},"types":{"type":"array","minItems":1,"maxItems":3,"uniqueItems":true,"items":{"type":"string","enum":["new-model","bug","perf","feature","refactor","test","docs","ci"]},"description":"The kinds of change the PR is, main one first, as review-prompt.md defines them."}},"required":["summary","types"]}'
 
       # The action fails a run that went past --max-turns even when Claude
       # finished and returned its summary, and on a real failure it still
@@ -398,17 +398,33 @@ jobs:
         if: steps.review.outcome == 'failure'
         id: salvage
         continue-on-error: true
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           f="$RUNNER_TEMP/claude-execution-output.json"
           if [ ! -s "$f" ]; then
             echo "why=it stopped before Claude Code returned (a timeout or a setup error)" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Out of API credit: an automatic review skips with a warning in the
+          # log, rather than leave a "didn't complete" comment on every PR until
+          # it's topped up. A /review someone asked for gets a one-line answer.
+          if jq -e 'any(.[]; .type == "assistant" and (.error == "billing_error" or
+                ([.message.content[]? | select(.type == "text") | .text] | join("") | startswith("Credit balance is too low"))))' \
+              "$f" > /dev/null; then
+            echo "::warning::The Anthropic API account is out of credit; skipping the review."
+            echo "billing=true" >> "$GITHUB_OUTPUT"
+            if [ "$EVENT" = "issue_comment" ]; then
+              gh pr comment "$PR" --repo "$REPO" \
+                --body "The review didn't run: the API account for the review bot is out of credit." > /dev/null
+            fi
+            exit 0
+          fi
           res=$(jq -c '[.[] | select(.type == "result")] | last // {}' "$f")
           turns=$(jq -r '.num_turns // "?"' <<< "$res")
           subtype=$(jq -r '.subtype // empty' <<< "$res")
           summary=$(jq -c 'select(.subtype == "success" and (.is_error | not) and ((.structured_output.summary // "") != ""))
-            | {summary: .structured_output.summary}' <<< "$res")
+            | {summary: .structured_output.summary, types: .structured_output.types}' <<< "$res")
           if [ -z "$summary" ]; then
             jq -r '[.[] | select(.type == "assistant") | .message.content[]?
                 | select(.type == "tool_use" and (.name | endswith("create_inline_comment"))) | .input]
@@ -468,6 +484,35 @@ jobs:
             gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@resolved.md > /dev/null || true
           done
 
+      # The PR's type/* labels, from the review's structured output. Model
+      # output, so each is checked against the fixed list before it reaches
+      # the API; type/* labels the review no longer returns are removed. Area
+      # and size labels come from pr-labels.yml.
+      - name: Set the type labels
+        if: steps.post.outcome == 'success'
+        continue-on-error: true
+        env:
+          OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
+        run: |
+          types=()
+          while IFS= read -r t; do
+            case "$t" in
+              new-model|bug|perf|feature|refactor|test|docs|ci) types+=("type/$t") ;;
+            esac
+          done < <(printf '%s' "$OUTPUT" | jq -r '.types // [] | .[] | strings')
+          if [ ${#types[@]} -eq 0 ]; then
+            echo "::warning::The review returned no valid type; leaving the type labels alone."
+            exit 0
+          fi
+          for old in $(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name | select(startswith("type/"))'); do
+            [[ " ${types[*]} " == *" $old "* ]] || gh api -X DELETE "repos/$REPO/issues/$PR/labels/${old//\//%2F}" > /dev/null
+          done
+          for label in "${types[@]}"; do
+            gh api "repos/$REPO/labels/${label//\//%2F}" > /dev/null 2>&1 ||
+              gh api -X POST "repos/$REPO/labels" -f name="$label" -f color=fbca04 > /dev/null
+            gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$label" > /dev/null
+          done
+
       # A review that stopped before it finished: keep its Claude Code session
       # (the transcript Claude Code writes as it goes, so this works after a
       # timeout too) for `/review continue`. The transcript holds the PR's own
@@ -476,7 +521,7 @@ jobs:
       - name: Save the session for /review continue
         if: >-
           always() && steps.review.outcome == 'failure' &&
-          steps.salvage.outputs.structured_output == ''
+          steps.salvage.outputs.structured_output == '' && steps.salvage.outputs.billing != 'true'
         id: save
         continue-on-error: true
         env:
@@ -524,7 +569,7 @@ jobs:
       # still be resumed by someone else).
       - name: Report a review that didn't complete
         if: >-
-          always() && steps.pre.outputs.run == 'true' &&
+          always() && steps.pre.outputs.run == 'true' && steps.salvage.outputs.billing != 'true' &&
           (steps.pr.outcome == 'failure' || steps.prev.outcome == 'failure' ||
            steps.base.outcome == 'failure' || steps.head.outcome == 'failure' ||
            steps.diff.outcome == 'failure' || steps.post.outcome == 'failure' ||

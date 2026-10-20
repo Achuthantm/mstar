@@ -96,4 +96,17 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 <sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>
 ```
 
+**Types.** Return the `types` field too: the kinds of change the PR is, main one first, one to three of them, which the workflow applies as `type/*` labels. Judge from the code, not the title.
+
+- `new-model`: adds a model users can serve: a new folder under `mstar/model/`, or a new checkpoint registered on existing model code. Engine pieces split out ahead of a model are `feature`.
+- `bug`: fixes wrong behavior, including a latent one no shipped config hits yet, in mstar or in its eval and benchmark harnesses and launch scripts: a crash, hang, wrong output, a security hole or unsafe default, a memory leak, or a pathological slowdown such as thrashing or a silent fallback to a slow path. A dependency or packaging change that fixes a model or install failing for users is `bug` too.
+- `perf`: makes a path that already works as designed faster or leaner, with outputs unchanged.
+- `feature`: adds or extends a capability other than a new model: an API field, a resource, a mode, a benchmark or eval harness.
+- `refactor`: restructures code without changing behavior.
+- `test`: adds test coverage, or fixes or restructures tests.
+- `docs`: documentation: `docs/`, examples, Markdown including `AGENTS.md` and `.claude/skills/`, comments or docstrings.
+- `ci`: CI, build, packaging, dependencies or repository tooling: workflows, which tests CI runs (turning existing tests on in CI is `ci`), scripts, the review bot and its prompt. A fix to CI or the review bot is just `ci`.
+
+List a kind only when it's a change in its own right, not support for another one: a bug fix with its regression test is just `bug`, a feature with its docs just `feature`. A PR that fixes a crash and also adds a backend is `bug` and `feature`; one that only adds tests is `test`.
+
 Never approve or request changes, and never push commits or edit files.
