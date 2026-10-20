@@ -502,7 +502,8 @@ class APIServer:
             callback()
 
     def enable_metrics(self) -> None:
-        """Count requests from now on and serve them at ``/metrics``.
+        """Count requests from now on and serve them at ``/metrics``, and
+        have the engine workers start their histograms and counters.
 
         ``main()`` calls this after the warmup requests, so their first-shape
         compile times stay out of the latency histograms."""
@@ -516,6 +517,7 @@ class APIServer:
             local_status=(lambda: transfers.latest) if transfers is not None else None,
         )
         self.preprocess_worker.report_preprocess_finish()
+        self.preprocess_worker.enable_worker_metrics()
 
     # ----------------------------------------------------------
     # Submitting a request

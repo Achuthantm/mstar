@@ -40,6 +40,7 @@ class WorkerMessageType(Enum):
     SCHEDULE_TP = "schedule_tp"
     STOP_LOOPS = "stop_loops"
     TP_NO_SPEC = "tp_no_spec"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -218,6 +219,7 @@ class ConductorMessageType(Enum):
     FAIL_REQUESTS = "fail_requests"
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
+    ENABLE_METRICS = "enable_metrics"
 
 
 @dataclass
@@ -291,6 +293,13 @@ class WorkerStatus(MessageBody):
     edge, never per-request data."""
     worker_id: str
     metrics: list[MetricSnapshot]
+
+
+@dataclass
+class EnableMetrics(MessageBody):
+    """Start the workers' histograms and counters. The API server sends it to
+    the conductor after its warmup requests; the conductor forwards it to
+    every worker (``WorkerMetrics.start_counting``)."""
 
 
 @dataclass

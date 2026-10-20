@@ -1822,6 +1822,13 @@ class Conductor:
             self._handle_reads_done(message.body)
         elif message.message_type == ConductorMessageType.WORKER_STATUS:
             self._worker_metrics[message.body.worker_id] = message.body.metrics
+        elif message.message_type == ConductorMessageType.ENABLE_METRICS:
+            # Every rank: each counts the tensors it reads. Sent before any
+            # message of a request the API server submits after its warmups.
+            for worker_id in self.worker_ids:
+                self.communicator.send(worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.ENABLE_METRICS, body=message.body,
+                ))
         elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
             rid = message.body.request_id
             # Draining requests linger in self.requests (concurrency

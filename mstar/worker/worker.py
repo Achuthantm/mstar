@@ -670,16 +670,16 @@ class Worker:
             self._metrics = self._start_metrics(status_interval_s)
 
     def _start_metrics(self, interval_s: float) -> WorkerMetrics:
-        """Metrics on: record the steps of the nodes this rank leads and the
-        tensors every rank reads, and send the conductor a WorkerStatus every
-        ``interval_s``."""
+        """Metrics on: send the conductor a WorkerStatus every ``interval_s``,
+        and from ``ENABLE_METRICS`` on record the steps of the nodes this rank
+        leads and the tensors every rank reads."""
         return WorkerMetrics(
             self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
             self.engine_manager.engine, self.scheduler,
             send=lambda status: self.communicator.send("conductor", ConductorMessage(
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),
-            transfers=self.tensor_manager.enable_transfer_metrics(),
+            enable_transfers=self.tensor_manager.enable_transfer_metrics,
         )
 
     @staticmethod
@@ -1185,6 +1185,9 @@ class Worker:
                 self._register_tp_follow(message.body)
             elif message.message_type == WorkerMessageType.TP_NO_SPEC:
                 self._register_tp_nospec(message.body)
+            elif message.message_type == WorkerMessageType.ENABLE_METRICS:
+                # sent only with metrics on, so _metrics is set
+                self._metrics.start_counting()
 
     def _process_messages(self) -> None:
         self._process_message_list(self.communicator.get_all_new_messages())

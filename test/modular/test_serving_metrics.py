@@ -53,9 +53,13 @@ class _DataWorker:
         self.profiles = queue.Queue()
         self.reporting = False
         self.transfers = None
+        self.worker_metrics = False
 
     def report_preprocess_finish(self):
         self.reporting = True
+
+    def enable_worker_metrics(self):
+        self.worker_metrics = True
 
     def enable_transfer_metrics(self):
         self.transfers = EdgeTransfers("SHM")
@@ -1041,6 +1045,7 @@ class _RealDataWorker:
                      "output_queue", "profile_queue"):
             setattr(facade, name, queue.Queue())
         facade.timing_requested, facade.stop_event = threading.Event(), threading.Event()
+        facade.worker_metrics_requested = threading.Event()
         facade.per_request_reading_tensors, facade.received_chunk_counts = {}, {}
         facade.tensor_manager = _StubTensorManager()
         worker = PreprocessWorkerThread(
@@ -1054,6 +1059,7 @@ class _RealDataWorker:
                                                send=lambda entity, msg: self.sent.append(msg)),
             tensor_manager=facade.tensor_manager, model=self.model, enable_prof=enable_prof,
             timing_requested=facade.timing_requested,
+            worker_metrics_requested=facade.worker_metrics_requested,
         )
         facade.thread = threading.Thread(target=worker.run, daemon=True)
         facade.thread.start()
@@ -1171,7 +1177,8 @@ def test_the_data_worker_times_preprocessing_and_counts_failures_by_input_modali
     elapsed = time.perf_counter() - start
     s = served.scrape()
 
-    assert len(served.sent) == 3  # the three that reached the conductor
+    # the three that reached the conductor, after the workers' ENABLE_METRICS
+    assert [m.message_type.value for m in served.sent] == ["enable_metrics"] + ["new_request"] * 3
     text_n, text_s = _data_worker_hist(s, "text")
     assert text_n == 1 and SLOW_PROMPT_S <= text_s < elapsed
     for modalities in ("image,text", "audio,text"):

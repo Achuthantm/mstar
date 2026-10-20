@@ -9,6 +9,8 @@ API server's message thread (``test_serving_metrics``).
 """
 from __future__ import annotations
 
+import queue
+import threading
 from types import SimpleNamespace
 
 import msgpack
@@ -16,7 +18,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from test_conductor_status import _conductor, _to_api_server  # noqa: E402
+from test_conductor_status import _conductor, _request, _to_api_server  # noqa: E402
 from test_ingest_unpersist import _run  # noqa: E402
 from test_kv_prefix_lease import ROOT, _grow, _keys, _layout, _seed, _StubTransfer  # noqa: E402
 from test_micro_scheduler import _Engine, _Manager, _next_batch, _scheduler  # noqa: E402
@@ -35,7 +37,14 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
-from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, WorkerStatus  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    ConductorMessage,
+    ConductorMessageType,
+    EnableMetrics,
+    WorkerMessage,
+    WorkerMessageType,
+    WorkerStatus,
+)
 from mstar.worker import worker_metrics  # noqa: E402
 from mstar.worker.worker import Worker  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
@@ -117,13 +126,17 @@ def _prepare(eng: Engine, walk: str, **lengths) -> ExecutingBatch:
     return batch
 
 
-def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None) -> WorkerMetrics:
+def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=True) -> WorkerMetrics:
+    """``counting``: as after the API server's warmup requests."""
     if scheduler is None:
         scheduler = SimpleNamespace(pending_rows=lambda: {})
-    return WorkerMetrics(
+    m = WorkerMetrics(
         "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler,
-        send=(sent if sent is not None else []).append, transfers=EdgeTransfers("SHM"),
+        send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"),
     )
+    if counting:
+        m.start_counting()
+    return m
 
 
 def _by_name(snapshots: list[MetricSnapshot]) -> dict[str, MetricSnapshot]:
@@ -339,7 +352,8 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     w._handle_main_loop_error = fail_loudly
     w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
                                SimpleNamespace(pending_rows=dict), send=sent.append,
-                               transfers=EdgeTransfers("SHM"))
+                               enable_transfers=lambda: EdgeTransfers("SHM"))
+    w._metrics.start_counting()
     return w, sent, postprocessed, iteration
 
 
@@ -411,6 +425,152 @@ def test_an_unkeyed_request_is_not_a_lookup():
     kv.ingest_request("plain", KVReqConfig())
     _prepare(eng, PREFILL, plain=50)
     assert _prefix(_metrics(eng)) == ({}, {})
+
+
+# ── warmup requests ──────────────────────────────────────────────────────────
+
+def test_before_start_counting_gauges_are_live_and_steps_are_not_counted(clock):
+    """The warmup requests run first; a step whose time starts before
+    ``start_counting`` is not counted even when it finishes after it."""
+    kv = _kv()
+    eng = _engine([kv])
+    sent = []
+    m = _metrics(eng, sent=sent, counting=False)
+    _hold(kv, "warmup-0", 20)
+    clock.now = 1.0
+    m.step_done(NODE, PREFILL, _prepare(eng, PREFILL, w=20).inputs, submitted_at=0.5)
+    m.maybe_report()
+    (status,) = sent
+    assert [s.name for s in status.metrics] == list(catalog.WORKER_FAMILIES)
+    assert _values(status.metrics, "mstar_kv_pages_used") == {(NODE, "kv"): 2}
+    assert _hist(status.metrics, "mstar_step_seconds") == {}
+
+    clock.now = 2.0
+    m.start_counting()
+    clock.now = 2.5
+    m.step_done(NODE, DECODE, _prepare(eng, DECODE, w=1).inputs, submitted_at=1.5)
+    assert _hist(m.snapshot(), "mstar_step_seconds") == {}
+    clock.now = 2.75
+    m.step_done(NODE, DECODE, _prepare(eng, DECODE, r1=1, r2=1).inputs, submitted_at=2.6)
+    step = _hist(m.snapshot(), "mstar_step_seconds")
+    assert list(step) == [(NODE, DECODE)]
+    assert step[(NODE, DECODE)][0][-1] == 1 and step[(NODE, DECODE)][1] == pytest.approx(0.15)
+    assert _hist(m.snapshot(), "mstar_batch_size")[(NODE, DECODE)][1] == 2
+    # a speculated step carries no hand-off time: it counts from the step before
+    clock.now = 2.85
+    m.step_done(NODE, DECODE, _prepare(eng, DECODE, r1=1, r2=1).inputs, submitted_at=0.0)
+    assert _hist(m.snapshot(), "mstar_step_seconds")[(NODE, DECODE)][1] == pytest.approx(0.25)
+
+
+def test_prefix_lookups_before_start_counting_are_not_counted():
+    kv = _kv(prefix=True)
+    eng = _engine([kv], keyed=True)
+    m = _metrics(eng, counting=False)
+    keys = _seed(kv, list(range(100)))
+    kv.ingest_request("warmup-0", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    _prepare(eng, PREFILL, **{"warmup-0": 100})
+    assert _prefix(m) == ({}, {})
+
+    m.start_counting()
+    assert _prefix(m) == ({(NODE,): 0}, {(NODE,): 0})
+    other = _keys(list(range(1000, 1100)))
+    kv.ingest_request("miss", KVReqConfig(prefix_keys={"main": other}, prefix_layout=_layout(100)))
+    kv.ingest_request("hit", KVReqConfig(prefix_keys={"main": keys}, prefix_layout=_layout(100)))
+    _prepare(eng, PREFILL, miss=100, hit=100)
+    assert _prefix(m) == ({(NODE,): 200}, {(NODE,): 96})
+
+
+def test_the_worker_starts_counting_on_enable_metrics(clock):
+    w = Worker.__new__(Worker)
+    w._metrics = _metrics(counting=False)
+    clock.now = 1.0
+    w._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
+    clock.now = 1.25
+    w._metrics.step_done(NODE, DECODE, _prepare(_engine(), DECODE, r1=1).inputs, submitted_at=1.0)
+    assert _hist(w._metrics.snapshot(), "mstar_step_seconds")[(NODE, DECODE)][1] == pytest.approx(0.25)
+
+
+def test_the_conductor_forwards_enable_metrics_to_every_worker_before_the_next_request(
+        tmp_path, monkeypatch):
+    c = _conductor(tmp_path, monkeypatch, status_interval_s=0.0)
+    enable = ConductorMessage(ConductorMessageType.ENABLE_METRICS, EnableMetrics())
+    _run(c, [[wire.decode(wire.encode(enable)), _request("r1")]])
+    for worker_id in c.worker_ids:
+        kinds = [m.message_type for e, m in c.comm.sent if e == worker_id]
+        assert kinds.count(WorkerMessageType.ENABLE_METRICS) == 1, worker_id
+    first = [m.message_type for e, m in c.comm.sent if e == "worker_0"][:2]
+    assert first == [WorkerMessageType.ENABLE_METRICS, WorkerMessageType.NEW_REQUEST]
+
+
+def test_enable_metrics_crosses_the_wire_both_ways():
+    for message in (ConductorMessage(ConductorMessageType.ENABLE_METRICS, EnableMetrics()),
+                    WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())):
+        frame = wire.encode(message)
+        _, payload = msgpack.unpackb(frame, raw=False, strict_map_key=False)
+        assert payload["body"] == ["enable_metrics", {}]
+        assert wire.decode(frame) == message
+
+
+def test_the_api_server_starts_the_workers_counting_when_it_enables_metrics(monkeypatch, tmp_path):
+    """``main()`` calls ``enable_metrics`` after the warmup requests."""
+    pytest.importorskip("prometheus_client")
+    with _serve(monkeypatch, tmp_path, metrics=False) as served:
+        assert not served.data_worker.worker_metrics
+        served.server.enable_metrics()
+        assert served.data_worker.worker_metrics
+
+
+def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path):
+    """The API server's warmups are done when it asks; the thread sends the
+    message on the socket that carries every submission, ahead of the next."""
+    from test_serving_metrics import TEXT, _StubTensorManager
+
+    from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread
+    from mstar.api_server.request_types import PreprocessInput
+
+    class _Model:
+        def process_prompt(self, *args, **kwargs):
+            return None
+
+    sent = []
+    facade = PreprocessWorker.__new__(PreprocessWorker)
+    facade.worker_metrics_requested = threading.Event()
+    facade.wakeup = None
+    stop = threading.Event()
+    worker = PreprocessWorkerThread(
+        in_queue=queue.Queue(), result_tensor_queue=queue.Queue(), out_queue=queue.Queue(),
+        profile_queue=queue.Queue(), cleanup_request_queue=queue.Queue(),
+        abort_request_queue=queue.Queue(), reads_done_queue=queue.Queue(),
+        discard_tensor_queue=queue.Queue(), stop_event=stop,
+        communicator=SimpleNamespace(get_all_new_messages=lambda: [],
+                                     send=lambda entity, msg: sent.append((entity, msg))),
+        tensor_manager=_StubTensorManager(), model=_Model(),
+        worker_metrics_requested=facade.worker_metrics_requested,
+    )
+
+    def submit(key):
+        worker.in_queue.put(PreprocessInput(
+            request_id=key, client_request_id=key, text="hi", file_paths=None,
+            model_kwargs={}, **TEXT))
+
+    thread = threading.Thread(target=worker.run, daemon=True)
+    thread.start()
+    try:
+        submit("warmup-0")
+        _wait(lambda: len(sent) == 1)
+        facade.enable_worker_metrics()
+        submit("k1")
+        _wait(lambda: len(sent) == 3)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+
+    assert {entity for entity, _ in sent} == {"conductor"}
+    assert [(m.message_type, getattr(m.body, "request_id", None)) for _, m in sent] == [
+        (ConductorMessageType.NEW_REQUEST, "warmup-0"),
+        (ConductorMessageType.ENABLE_METRICS, None),
+        (ConductorMessageType.NEW_REQUEST, "k1"),
+    ]
 
 
 # ── pending rows ─────────────────────────────────────────────────────────────
@@ -538,8 +698,11 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
         SimpleNamespace(pending_rows=lambda: {NODE: pending}), send=None,
-        transfers=EdgeTransfers("SHM"),
+        enable_transfers=lambda: EdgeTransfers("SHM"),
     )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(worker_metrics, "time", clock)
+        m.start_counting()
     for submitted, done in steps:
         clock.now = done
         with pytest.MonkeyPatch.context() as mp:

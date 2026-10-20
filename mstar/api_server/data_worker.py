@@ -48,6 +48,7 @@ from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
     DrainRequest,
+    EnableMetrics,
     NewRequestConductor,
     ReadsDone,
     RemoveRequest,
@@ -164,6 +165,8 @@ class PreprocessWorker:
         self.profile_queue = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
+        # Set by enable_worker_metrics(); the worker thread tells the conductor.
+        self.worker_metrics_requested = threading.Event()
         self.stop_event = threading.Event()
         # Wakes the thread's idle wait: every producer below signals it.
         self.wakeup = EventWakeup()
@@ -210,6 +213,7 @@ class PreprocessWorker:
                 model=model,
                 enable_prof=enable_prof,
                 timing_requested=self.timing_requested,
+                worker_metrics_requested=self.worker_metrics_requested,
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
             )
@@ -222,6 +226,14 @@ class PreprocessWorker:
         with the data worker's own time, a failed preprocess, and the input
         files' sizes."""
         self.timing_requested.set()
+
+    def enable_worker_metrics(self) -> None:
+        """Have the conductor start the engine workers' histograms and
+        counters. The thread sends it on the socket that carries every
+        submission, so it reaches the conductor before any request submitted
+        after this call."""
+        self.worker_metrics_requested.set()
+        self._signal()
 
     def queue_depth(self) -> int:
         """Requests submitted and not yet taken up by the data worker thread."""
@@ -437,6 +449,8 @@ class PreprocessWorkerThread:
     # next time the thread publishes its transfer counts; class-level so a
     # thread built without __init__ has one
     _next_transfer_publish = 0.0
+    # class-level so a thread built without __init__ never sends ENABLE_METRICS
+    worker_metrics_requested: threading.Event | None = None
 
     def __init__(
         self,
@@ -458,6 +472,7 @@ class PreprocessWorkerThread:
         enable_nvtx: bool=False,
         wakeup: EventWakeup | None = None,
         timing_requested: threading.Event | None = None,
+        worker_metrics_requested: threading.Event | None = None,
     ):
         # keying a stream needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no stream
@@ -495,6 +510,9 @@ class PreprocessWorkerThread:
         # Preprocess-finish times are reported when enable_prof or this is set,
         # the data worker's own metrics only when this is set.
         self.timing_requested = timing_requested if timing_requested is not None else threading.Event()
+        self.worker_metrics_requested = (
+            worker_metrics_requested if worker_metrics_requested is not None else threading.Event()
+        )
         # This thread turns each output tensor into client-ready bytes. At 720p
         # that is an 11 MiB SHM read plus a postprocess copy per engine step,
         # downstream of the last worker-side NVTX range.
@@ -1173,6 +1191,14 @@ class PreprocessWorkerThread:
                 self._hard_cleanup(body.request_id)
         return did_work
 
+    def _send_enable_metrics_if_requested(self) -> None:
+        requested = self.worker_metrics_requested
+        if requested is not None and requested.is_set():
+            requested.clear()
+            self.communicator.send("conductor", ConductorMessage(
+                message_type=ConductorMessageType.ENABLE_METRICS, body=EnableMetrics(),
+            ))
+
     def _finish_reading(self, request_id: str, drained: bool) -> None:
         """The API server is done with this rid's outputs. ``drained`` (every
         chunk delivered) means no read can still be in flight, so ACK straight
@@ -1277,6 +1303,7 @@ class PreprocessWorkerThread:
             did_work = False
             try:
                 did_work = self._process_messages()
+                self._send_enable_metrics_if_requested()
                 # Output delivery is latency-sensitive: the API server holds a
                 # finished request open for its final chunks only briefly, so
                 # queued read-starts / acks / cleanups must never wait behind a
@@ -1322,6 +1349,9 @@ class PreprocessWorkerThread:
                 if not self.in_queue.empty():
                     did_work = True
                     pre_input = self.in_queue.get()
+                    # again here: a request submitted after the event was set
+                    # sees it set, so the conductor gets ENABLE_METRICS first
+                    self._send_enable_metrics_if_requested()
                     # Releases queued before this request was submitted belong
                     # to an earlier request under its id: apply them first.
                     self._process_releases()
