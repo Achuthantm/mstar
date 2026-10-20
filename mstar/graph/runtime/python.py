@@ -109,6 +109,8 @@ class GraphRuntimeRequestInfo:
     pending_persist_signals: list[GraphEdge] = field(default_factory=list)
     pending_new_token_counts: dict[str, dict[str, int]] = field(default_factory=dict)  # by partition
     # one name per chunk emitted to the client; the conductor counts them
+    # stream edge -> destination worker -> items sent, local ones included
+    pending_stream_items: dict[str, dict[str, int]] = field(default_factory=dict)
     current_output_chunks: list[str] = field(default_factory=list)
 
 
@@ -1524,6 +1526,16 @@ class PythonGraphRuntime(GraphRuntime):
             for worker_id, edges in routing.streaming_to_workers.items():
                 self._send_input_signals(rid, worker_id, edges, fwd_info, partition)
 
+            if info is not None:
+                for worker_id, edges in [
+                    (self._my_worker_id, routing.streaming_local),
+                    *routing.streaming_to_workers.items(),
+                ]:
+                    for edge in edges:
+                        if edge.tensor_info:
+                            sent = info.pending_stream_items.setdefault(edge.name, {})
+                            sent[worker_id] = sent.get(worker_id, 0) + len(edge.tensor_info)
+
             if routing.completed_worker_graph_ids and info is not None:
                 part = info.partition_info.get(partition)
                 node = self._queues[
@@ -1595,6 +1607,8 @@ class PythonGraphRuntime(GraphRuntime):
                     infos.append(i)
         info.pending_persist_signals = []
         new_token_counts = info.pending_new_token_counts.pop(partition, {})
+        stream_items_sent = info.pending_stream_items
+        info.pending_stream_items = {}
         output_signal_names = list(info.current_output_chunks)
         info.current_output_chunks.clear()
 
@@ -1615,6 +1629,7 @@ class PythonGraphRuntime(GraphRuntime):
                 partition_name=partition,
                 partition_done=partition_done,
                 stream_tokens_consumed=stream_tokens_consumed,
+                stream_items_sent=stream_items_sent,
                 graph_timings=graph_timings,
                 rx_info=rx_info,
                 tx_info=tx_info,

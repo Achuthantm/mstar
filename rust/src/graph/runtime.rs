@@ -343,10 +343,10 @@ pub struct GraphRuntime {
                 .unwrap_or(false);
 
         let partition = self.interner.get(partition_name);
-        let (persist, new_tokens, output_signals) =
+        let (persist, new_tokens, output_signals, stream_items) =
             match self.requests[rid as usize].as_mut() {
                 Some(info) => info.pending.take_for_send(partition),
-                None => (vec![], vec![], vec![]),
+                None => (vec![], vec![], vec![], vec![]),
             };
         let persist_signals: Vec<(Sym, Vec<crate::tensors::TensorPointerInfo>)> =
             persist.into_iter().map(|(sig, uuids)| (sig, self.infos(&uuids))).collect();
@@ -361,6 +361,7 @@ pub struct GraphRuntime {
             partition_name,
             partition_done,
             stream_tokens_consumed,
+            stream_items_sent: stream_items,
             resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
         };
@@ -2985,6 +2986,14 @@ impl GraphRuntime {
         }
         out.rids_needing_request_info = sends_a_frame.into_iter().collect();
 
+        let me = self.shard.me;
+        for (name, rids_for_edge, _) in &streaming_by_signal {
+            for &rid in rids_for_edge {
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.add_stream_items(*name, me, 1);
+                }
+            }
+        }
         // One string per stream, resolved now that `&mut self` is released.
         for (name, rids_for_edge, uuids_for_edge) in streaming_by_signal {
             out.local_streaming_signals
@@ -3240,6 +3249,9 @@ impl GraphRuntime {
             // with the batch; the Vec stays only to keep frame order stable.
             let mut grouped: Vec<((u32, Sym), Vec<frames::OutEdge>)> = Vec::new();
             let mut at: FxHashMap<(u32, Sym), usize> = FxHashMap::default();
+            // (rid, edge, worker, items): what each consumer will register, so
+            // counted from the descriptors that go out, not the refs.
+            let mut stream_items: Vec<(u32, String, Sym, i64)> = Vec::new();
             {
                 // One acquisition for every descriptor lookup in the batch, not
                 // one per edge. Released before the sends -- holding it across
@@ -3247,6 +3259,11 @@ impl GraphRuntime {
                 let bk = self.bookkeeping.lock().unwrap();
                 for w in plan.to_workers {
                     let infos = Self::sliced_infos_locked(&bk, &w.tensors);
+                    if w.streaming && !infos.is_empty() {
+                        stream_items.push((
+                            w.rid, w.signal.clone(), w.worker, infos.len() as i64,
+                        ));
+                    }
                     let key = (w.rid, w.worker);
                     let edge = frames::OutEdge {
                         name: w.signal, next_node: w.next_node,
@@ -3260,6 +3277,12 @@ impl GraphRuntime {
                             grouped.push((key, vec![edge]));
                         }
                     }
+                }
+            }
+            for (rid, signal, worker, n) in stream_items {
+                let sig = self.interner.intern(&signal);
+                if let Some(info) = self.requests[rid as usize].as_mut() {
+                    info.pending.add_stream_items(sig, worker, n);
                 }
             }
             // Encoding is pure CPU, so it all happens under one more acquisition;
