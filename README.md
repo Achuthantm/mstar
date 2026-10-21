@@ -121,6 +121,7 @@ _Note_: The **first request(s) on a fresh environment can be slow** — often te
 | [BAGEL](https://huggingface.co/ByteDance-Seed/BAGEL-7B-MoT) | Unified multimodal | text, image → text, image | `/v1/chat/completions`, `/v1/images/generations` |
 | [Qwen3-Omni](https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct) | Omni | text, image, audio, video → text, speech | `/v1/chat/completions` |
 | [Orpheus](https://huggingface.co/canopylabs/orpheus-3b-0.1-ft) | Speech LM | text → speech | `/v1/audio/speech` |
+| [Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) | Speech LM | text, reference audio → speech (streamed; weights under the Fish Audio Research License, non-commercial use only) | `/v1/audio/speech` |
 | [Cosmos3 Nano / Super](https://huggingface.co/nvidia/Cosmos3-Nano) | World model | text, image, video → image, video (+ sound), robot actions | `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3 Policy DROID](https://huggingface.co/nvidia/Cosmos3-Nano-Policy-DROID) | Robot policy | text, image, video → robot actions, video | `/generate`, `/v1/images/generations`, `/v1/videos/generations` |
 | [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) | 480p world model + VLM | text, image, video → image, video (streamed windows), robot actions, text | `/v1/chat/completions`, `/v1/images/generations`, `/v1/videos/generations`, `/generate`, `/generate/ws` |

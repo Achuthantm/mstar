@@ -1,0 +1,27 @@
+# Fish Audio S2-Pro (fishaudio/s2-pro): dual-AR TTS with reference-audio voice cloning.
+# Weights: Fish Audio Research License, non-commercial use only.
+# The AR node holds the 4B Slow AR (paged KV) and the 4-layer Fast AR; the
+# RefEncoder DAC-encodes a voice clone's reference clip ahead of its prefill;
+# the Codec node streams 44.1 kHz audio whose chunks stitch into one decode.
+model: "fish_s2_pro"
+max_seq_len: 32768
+# The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
+# kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+resources:
+  slow_ar_attn:
+    flashinfer_backend: fa2
+node_groups:
+  - node_names: [RefEncoder, AR]
+    ranks: [0]
+    graph_walks: [ar_prefill, ar_prefill_clone, ar_decode]
+  - node_names: [Codec]
+    ranks: [0]
+    graph_walks: [codec_chunk]
+# The first plain request after startup otherwise pays the AR and codec
+# first-call costs (about 4 s TTFA on an H200 against 0.16 s after). A short
+# one before the server binds takes them; a voice clone's RefEncoder still
+# pays its own on the first clone.
+warmup_requests:
+  - text: Hello, this is a short warmup.
+    output_modalities: [audio]
+    model_kwargs: {max_new_tokens: 32}

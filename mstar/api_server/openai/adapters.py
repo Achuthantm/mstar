@@ -679,6 +679,46 @@ class ChatterboxAdapter(OpenAIAdapter):
         )
 
 
+class FishS2ProAdapter(OpenAIAdapter):
+    """Fish Audio S2-Pro: text-to-speech with optional reference-audio voice cloning.
+
+    The voice comes from a reference clip: ``ref_audio`` in ``extra_body`` (a
+    data URL, bare base64, or, when the server allows remote fetch, an http(s)
+    URL; paths on the server are refused) with its transcript in ``ref_text``. Without
+    one the model picks a voice. ``voice`` and ``speed`` are not S2-Pro
+    controls and are dropped; inline ``[tag]`` prosody control is part of
+    the input text. ``temperature`` / ``top_p`` / ``seed`` are the standard
+    fields; ``top_k``, ``repetition_penalty``, ``do_sample`` and
+    ``max_new_tokens`` pass through ``extra_body``. Long inputs are
+    synthesized as ordered sentence chunks, as for Qwen3-TTS.
+    """
+
+    supports_speech = True
+    speech_chunk_min_chars = 600
+    speech_chunk_max_chars = 400
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
+            return SubmitArgs(
+                text=req.input,
+                file_paths={"audio": [path]},
+                input_modalities=["text", "audio"],
+                output_modalities=["audio"],
+                model_kwargs=mk,
+            )
+        mk.pop("ref_text", None)
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class Cosmos3Adapter(OpenAIAdapter):
     """NVIDIA Cosmos3: text-to-image and text/image-to-video generation.
 
@@ -1130,6 +1170,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "chatterbox": ChatterboxAdapter(),
     "chatterbox_multilingual": ChatterboxAdapter(),
     "chatterbox_turbo": ChatterboxAdapter(),
+    "fish_s2_pro": FishS2ProAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
