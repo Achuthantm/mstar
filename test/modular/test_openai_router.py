@@ -645,6 +645,22 @@ def test_image_routes_report_validation_errors_as_400(client_and_stub):
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
+def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
+    """A model with image generation but no editing refuses the edit as the
+    Rust frontend does, and the saved image goes with the refusal."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"] == "image editing is not supported by this model"
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
 def _refuse(**kw):
     raise ValueError("size must be 'WxH'")
 

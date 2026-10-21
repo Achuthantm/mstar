@@ -1519,17 +1519,21 @@ def _ws_modalities(value, key: str) -> list[str] | None:
     raise ValueError(f"{key} must be a comma-separated string or a list of strings")
 
 
+def _remove_uploads(file_paths: dict[str, list[str]]) -> None:
+    for ps in file_paths.values():
+        for p in ps:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _schedule_upload_cleanup(file_paths: dict[str, list[str]], delay_s: float = 60.0) -> None:
     """Delete a request's uploaded files once the preprocess worker has had
     time to read them. Shared by the HTTP and WebSocket routes."""
     def _cleanup(paths: dict[str, list[str]]) -> None:
         time.sleep(delay_s)
-        for ps in paths.values():
-            for p in ps:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except OSError:
-                    pass
+        _remove_uploads(paths)
     threading.Thread(target=_cleanup, args=(file_paths,), daemon=True).start()
 
 
@@ -1747,6 +1751,9 @@ async def generate(
         for f in files:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
+                # a refused request is never submitted, so the deferred cleanup
+                # below never sees what it saved
+                _remove_uploads(file_paths)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
@@ -1783,6 +1790,7 @@ async def generate(
         in_mods = [p.modality for p in parts]
 
     if "video_frame" in in_mods:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="'video_frame' is an output-only modality",
@@ -1791,12 +1799,14 @@ async def generate(
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
     except json.JSONDecodeError as e:
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be valid JSON",
         ) from e
 
     if parsed_kwargs is not None and not isinstance(parsed_kwargs, dict):
+        _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
             detail="model_kwargs must be a JSON object",
