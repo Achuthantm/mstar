@@ -1555,6 +1555,11 @@ def _ws_input_layout(
     return [p.modality for p in parts], parts
 
 
+def _pass_turn(turn: asyncio.Future) -> None:
+    if not turn.done():
+        turn.set_result(None)
+
+
 @app.websocket("/generate/ws")
 async def generate_ws(websocket: WebSocket):
     """``/generate`` over one persistent WebSocket, for control loops.
@@ -1571,7 +1576,8 @@ async def generate_ws(websocket: WebSocket):
     for a ``request_id`` still in flight, as on ``/generate``); no finish
     follows an error. Messages may be pipelined: a client can
     send the next observation before the previous action chunk has returned,
-    and the ``request_id`` tells the replies apart. Closing the socket aborts
+    and the ``request_id`` tells the replies apart. They are submitted in the
+    order they were sent; their replies may interleave. Closing the socket aborts
     whatever is still in flight.
     """
     if api_server is None:
@@ -1591,7 +1597,11 @@ async def generate_ws(websocket: WebSocket):
                     payload = {**payload, "data": base64.b64encode(payload["data"]).decode("ascii")}
                 await websocket.send_text(json.dumps(payload))
 
-    async def serve_one(message: dict, binary: bool) -> None:
+    async def serve_one(
+        message: dict, binary: bool, after: asyncio.Future | None, turn: asyncio.Future,
+    ) -> None:
+        """``after`` is done once the message before this one was submitted or
+        refused; ``turn`` is this message's, for the one after it."""
         request_id = message.get("request_id")
         file_paths: dict[str, list[str]] | None = None
         try:
@@ -1614,6 +1624,10 @@ async def generate_ws(websocket: WebSocket):
                 model_kwargs = json.loads(model_kwargs)
             if model_kwargs is not None and not isinstance(model_kwargs, dict):
                 raise ValueError("model_kwargs must be a JSON object")
+            # Messages decode side by side but are submitted in the order they
+            # were sent; a message that decodes faster waits here.
+            if after is not None:
+                await asyncio.shield(after)
             await api_server.wait_for_request_id(request_id)
             request_id = api_server.submit_request(
                 text=text,
@@ -1625,6 +1639,7 @@ async def generate_ws(websocket: WebSocket):
                 streaming=True,
                 request_id=request_id,
             )
+            _pass_turn(turn)
             # Cancelling this task (socket closed mid-stream) tears the
             # iterator down, and its ``finally`` aborts the engine request.
             failed = False
@@ -1666,7 +1681,14 @@ async def generate_ws(websocket: WebSocket):
         finally:
             if file_paths:
                 _schedule_upload_cleanup(file_paths)
+            if not turn.done():
+                # refused: the next message still waits for the ones before this one
+                if after is None:
+                    _pass_turn(turn)
+                else:
+                    after.add_done_callback(lambda _: _pass_turn(turn))
 
+    previous_turn: asyncio.Future | None = None
     try:
         while True:
             frame = await websocket.receive()
@@ -1684,7 +1706,9 @@ async def generate_ws(websocket: WebSocket):
             if not isinstance(message, dict):
                 await send({"request_id": None, "error": "message must be an object"}, binary)
                 continue
-            task = asyncio.create_task(serve_one(message, binary))
+            turn = asyncio.get_running_loop().create_future()
+            task = asyncio.create_task(serve_one(message, binary, previous_turn, turn))
+            previous_turn = turn
             tasks.add(task)
             task.add_done_callback(tasks.discard)
     except WebSocketDisconnect:
