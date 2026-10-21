@@ -113,9 +113,18 @@ async fn main() {
         Arc::new(t)
     });
 
+    let python_adapter = std::env::var("MSTAR_OPENAI_ADAPTER").unwrap_or_default();
+    if !python_adapter.is_empty() && Adapter::from_python(&python_adapter).is_none() {
+        eprintln!(
+            "WARNING: {model_name}'s OpenAI adapter {python_adapter} has no port in this \
+             frontend: /v1/* answers 404 here, /generate is served"
+        );
+    }
+
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
         model_name: model_name.clone(),
+        python_adapter,
         upload_dir,
         allow_remote,
         sample_rate,
@@ -358,16 +367,17 @@ fn parse_form_bool(s: &str) -> Result<bool, String> {
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
 fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
-    let adapter = Adapter::from_model_name(&st.model_name).ok_or_else(|| {
-        error(
-            404,
-            &format!(
-                "Model {:?} has no OpenAI-compatible adapter; use POST /generate",
-                st.model_name
-            ),
-            "model_not_found",
+    let message = if st.python_adapter.is_empty() {
+        format!("Model '{}' has no OpenAI-compatible adapter; use POST /generate", st.model_name)
+    } else {
+        format!(
+            "Model '{}' has an OpenAI adapter ({}) the Rust frontend does not serve; \
+             use POST /generate, or serve without --rust-frontend",
+            st.model_name, st.python_adapter
         )
-    })?;
+    };
+    let adapter = Adapter::from_python(&st.python_adapter)
+        .ok_or_else(|| error(404, &message, "model_not_found"))?;
     let ok = match surface {
         Surface::Chat => adapter.supports_chat(),
         Surface::Speech => adapter.supports_speech(),
@@ -377,7 +387,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
     if !ok {
         return Err(error(
             404,
-            &format!("Model {:?} does not support this endpoint", st.model_name),
+            &format!("Model '{}' does not support this endpoint", st.model_name),
             "invalid_request_error",
         ));
     }
@@ -1232,6 +1242,7 @@ mod tests {
     fn state(bridge: Option<Arc<Bridge>>) -> AppState {
         AppState {
             model_name: "m".into(),
+            python_adapter: String::new(),
             upload_dir: std::env::temp_dir(),
             allow_remote: false,
             sample_rate: 24000,

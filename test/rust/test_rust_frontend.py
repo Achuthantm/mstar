@@ -19,9 +19,11 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from mstar.api_server.rust_frontend import (
+    OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
     find_server_binary,
     launch_rust_server,
+    openai_adapter_class,
 )
 
 try:
@@ -330,7 +332,8 @@ def test_admission_permit_is_held_through_streaming_body():
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_adm_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_admup_")
-    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1")
+    env = dict(os.environ, MSTAR_MAX_CONCURRENT_REQUESTS="1",
+               **{OPENAI_ADAPTER_ENV: openai_adapter_class("qwen3_omni")})
     proc = subprocess.Popen(
         [BINARY, "qwen3_omni", str(port), bridge_dir, upload_dir], env=env)
     stub = _GatedStub(gate)
@@ -535,8 +538,9 @@ def _model_stack(model, stub, env=None):
     port = _free_port()
     bridge_dir = tempfile.mkdtemp(prefix="mstar_rf_ms_")
     upload_dir = tempfile.mkdtemp(prefix="mstar_rf_msup_")
+    env = {OPENAI_ADAPTER_ENV: openai_adapter_class(model), **(env or {})}
     proc = subprocess.Popen(
-        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **(env or {})))
+        [BINARY, model, str(port), bridge_dir, upload_dir], env=dict(os.environ, **env))
     bridge = RustFrontendBridge(stub, bridge_dir)
     thread = threading.Thread(target=bridge.run, daemon=True)
     thread.start()
