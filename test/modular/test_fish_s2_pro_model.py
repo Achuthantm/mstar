@@ -27,6 +27,7 @@ from mstar.model.fish_s2_pro.components.fast_ar import FishFastAR
 from mstar.model.fish_s2_pro.components.slow_ar import FishSlowAR, remap_slow_ar_weights
 from mstar.model.fish_s2_pro.config import (
     AR_SAMPLER,
+    PROMPT_LAYOUT_KEY,
     FishDACConfig,
     FishFastARConfig,
     FishGenerationConfig,
@@ -131,9 +132,22 @@ def test_registry_and_deployment_config():
     assert deployment["model"] == "fish_s2_pro"
     walks = {walk for group in deployment["node_groups"] for walk in group["graph_walks"]}
     assert walks == set(tiny_model().get_graph_walk_graphs())
-    (warmup,) = [WarmupRequest.from_config(spec) for spec in deployment["warmup_requests"]]
-    assert warmup.output_modalities == ["audio"]
-    tiny_model().process_prompt(warmup.text, ["text"], ["audio"], **warmup.model_kwargs)
+    plain, greedy, clone = [WarmupRequest.from_config(spec) for spec in deployment["warmup_requests"]]
+    model = tiny_model()
+    for warmup in (plain, greedy, clone):
+        assert warmup.output_modalities == ["audio"]
+    assert not plain.files and not greedy.files
+    model.process_prompt(plain.text, ["text"], ["audio"], **plain.model_kwargs)
+    model.process_prompt(greedy.text, ["text"], ["audio"], **greedy.model_kwargs)
+    sampling = model.get_request_resource_configs({}, greedy.model_kwargs)
+    assert sampling[AR_SAMPLER].temperature == 0.0
+    ((media,),) = [clone.files]
+    assert media.modality == "audio" and media.path.startswith("hf://")
+    # the clip is 4.95 s at 24 kHz; load_audio hands process_prompt 44.1 kHz mono
+    clip = torch.zeros(int(4.95 * model.config.codec.sample_rate))
+    output = model.process_prompt(clone.text, ["audio", "text"], ["audio"], tensors={"audio_inputs": [clip]},
+                                  **clone.model_kwargs)
+    assert output.metadata[PROMPT_LAYOUT_KEY][1] > 0
 
 
 def test_load_logs_the_weights_license(monkeypatch, caplog, tmp_path):
