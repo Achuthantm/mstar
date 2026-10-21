@@ -469,6 +469,32 @@ def _generate(port, urlencoded: bool, timeout=30):
         return r.status, r.read()
 
 
+# The Python /generate's 400s (test_video_frame_protocol checks the same text there).
+_STREAMING_ONLY = ("Output modality video_frame requires streaming=true; raw frame "
+                   "chunks cannot be returned as an aggregated response.")
+_OUTPUT_ONLY = "'video_frame' is an output-only modality"
+
+
+@pytest.mark.parametrize("fields,detail", [
+    ({"output_modalities": "video_frame", "streaming": "false"}, _STREAMING_ONLY),
+    ({"input_modalities": "video_frame", "output_modalities": "text"}, _OUTPUT_ONLY),
+], ids=["output-not-streamed", "input"])
+def test_generate_refuses_video_frame_with_a_400_before_submitting(stack, fields, detail):
+    """The API server's own check would raise a ValueError, which reaches
+    the client as a 500."""
+    import urllib.parse
+
+    port, stub, _bridge, _proc = stack
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/generate",
+        data=urllib.parse.urlencode({"text": "hi", **fields}).encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=15)
+    assert (e.value.code, json.loads(e.value.read())) == (400, {"detail": detail})
+    assert stub.submitted == []
+
+
 def test_generate_accepts_both_content_types(stack):
     """The FastAPI /generate accepts multipart AND urlencoded form bodies
     (the latter is what `requests.post(data=...)` sends with no files); the

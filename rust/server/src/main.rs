@@ -1111,6 +1111,10 @@ async fn generate_finish(
             m
         }
     };
+    if let Some(message) = video_frame_refusal(&input_modalities, &output_modalities, streaming) {
+        remove_uploads(&st.upload_dir, &file_paths);
+        return detail_error(400, message);
+    }
     let model_kwargs: Map<String, Value> = match mk_raw {
         Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
@@ -1181,6 +1185,31 @@ async fn generate_finish(
             .push(json!({"data": media::b64(&c.data), "metadata": c.metadata}));
     }
     Json(json!({"request_id": request_id, "outputs": outputs})).into_response()
+}
+
+/// The Python `/generate`'s refusals for `video_frame`, worded the same: raw
+/// frames are an output only, and only a stream can carry them.
+fn video_frame_refusal(input: &[String], output: &[String], streaming: bool) -> Option<&'static str> {
+    if !streaming && output.iter().any(|m| m == "video_frame") {
+        return Some(
+            "Output modality video_frame requires streaming=true; raw frame \
+             chunks cannot be returned as an aggregated response.",
+        );
+    }
+    if input.iter().any(|m| m == "video_frame") {
+        return Some("'video_frame' is an output-only modality");
+    }
+    None
+}
+
+/// Delete a refused request's uploads now: it never reaches the deferred
+/// cleanup in `schedule_upload_cleanup`.
+fn remove_uploads(upload_dir: &std::path::Path, file_paths: &BTreeMap<String, Vec<String>>) {
+    for path in file_paths.values().flatten().map(PathBuf::from) {
+        if path.starts_with(upload_dir) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
@@ -1364,6 +1393,53 @@ mod tests {
             );
         }
         assert_eq!(image_count(Some(3), 2), Err("n must be between 1 and 2, got 3".to_string()));
+    }
+
+    async fn generate_with(
+        st: AppState, input: Option<&str>, output: &str, streaming: bool,
+        file_paths: BTreeMap<String, Vec<String>>,
+    ) -> (StatusCode, Vec<u8>) {
+        let resp = generate_finish(
+            st, Some("hi".into()), input.map(str::to_string), output.into(), streaming,
+            false, None, None, file_paths,
+        )
+        .await;
+        let (status, _, data) = body(resp).await;
+        (status, data)
+    }
+
+    #[tokio::test]
+    async fn generate_refuses_video_frame_as_the_python_frontend_does() {
+        let streaming_only = "Output modality video_frame requires streaming=true; raw frame \
+                              chunks cannot be returned as an aggregated response.";
+        for (input, output, streaming, detail) in [
+            (None, "video_frame", false, streaming_only),
+            (None, "text, video_frame", false, streaming_only),
+            (Some("video_frame"), "text", true, "'video_frame' is an output-only modality"),
+            (Some("text,video_frame"), "text", false, "'video_frame' is an output-only modality"),
+        ] {
+            let (status, data) = generate_with(state(None), input, output, streaming, BTreeMap::new()).await;
+            let body: Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!((status, body), (StatusCode::BAD_REQUEST, json!({"detail": detail})), "{input:?} {output:?}");
+        }
+        // a stream carries the frames
+        let (status, _) = generate_with(state(None), None, "video_frame", true, BTreeMap::new()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_refused_video_frame_request_leaves_no_upload_behind() {
+        let mut st = state(None);
+        st.upload_dir = socket_dir();
+        let upload = st.upload_dir.join("clip.wav");
+        std::fs::write(&upload, b"RIFF").unwrap();
+        let files = BTreeMap::from([("audio".to_string(), vec![upload.to_string_lossy().into_owned()])]);
+
+        let (status, _) = generate_with(st.clone(), None, "video_frame", false, files).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!upload.exists());
+        let _ = std::fs::remove_dir_all(&st.upload_dir);
     }
 
     #[test]
