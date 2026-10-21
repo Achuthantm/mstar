@@ -19,8 +19,7 @@ Streaming topology:
 
 Each codec window carries the decoder's whole receptive field as context, so
 the streamed audio is sample for sample the audio of one decode of the
-stream (the reference SGLang-Omni and vLLM-Omni stream with shorter
-overlaps).
+stream (other S2-Pro serving implementations stream with shorter overlaps).
 
 Request state machine:
     AR:    ar_prefill | ar_prefill_clone -> ar_decode loop -> done on <|im_end|> / token limit
@@ -324,7 +323,9 @@ class FishS2ProModel(Model):
         """Prompt token ids and ``prefix_len``, where a clone's reference frames go.
 
         The chat layout and the segment-by-segment tokenization are those of
-        SGLang-Omni's ``S2ProTokenizerAdapter.build_prompt``: a clone puts the
+        Fish Audio's published S2-Pro serving recipe (fixed text in
+        ``config.py``, pinned by test_prompt_layout_matches_the_reference_segments):
+        a clone puts the
         reference transcript and frames in the system turn, and the target
         text is the user turn, both after a ``<|speaker:N|>`` tag.
         """
