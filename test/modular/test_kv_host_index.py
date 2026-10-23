@@ -12,7 +12,7 @@ import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import PageAllocator
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager, PageArena
@@ -93,7 +93,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
     kv.ingest_request(rid, KVReqConfig(
         prefix_keys={"main": chain([tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
-        prefix_layout={"main": [PrefixSpan(len(tokens), len(tokens), WALK)]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))
 
 

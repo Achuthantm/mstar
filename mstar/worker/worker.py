@@ -33,6 +33,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_torch_config
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
+from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
@@ -795,6 +796,7 @@ class Worker:
             graph_walk=body.request_info.graph_walk,
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+            loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = request_id
 
@@ -816,6 +818,7 @@ class Worker:
             self._fail_requests({request_id: f"Error in worker: {type(err).__name__}: {err}"})
             self._process_unprocessed(body.request_id)
             return
+        body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
         # Create StreamBuffers for consumer connections on this worker. A request
         # with several partitions here arrives once per partition: keep the

@@ -27,6 +27,7 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
+    StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
@@ -128,17 +129,10 @@ class PrefixChain:
     keyed_pages: int
     # tokens the chain accounts for: its prompt, and every token sampled since
     covered_len: int
-    # The prompt's layout, and how far the stream is through it.
-    # `spans` has one span per write.
+    # `spans` are the layout's keyed spans, one per write.
     # `unkeyed_items` are the items on the page `unkeyed` fills.
-    # `done` counts the spans the stream holds, whether written, read in or served from the cache.
-    # `consumed` counts the tokens of those spans.
-    # `probed` is the span the latest probe answered for.
     spans: list[PrefixSpan]
     unkeyed_items: list[PageItem]
-    done: int = 0
-    consumed: int = 0
-    probed: int | None = None
     # The prompt's keys hashed under the root, kept from the first probe so a repeated probe hashes nothing.
     # `rooted` has one key per page.
     # `rooted_ends` has one key per image that ends inside a page, with the token the image ends at.
@@ -191,6 +185,32 @@ class PrefixChain:
 
 
 @dataclass
+class SpanCursor:
+    """How far a stream is through its request's layout."""
+    spans: tuple[PrefixSpan, ...]
+    # `done` counts the spans the stream holds, whether written, read in or served from the cache.
+    # `consumed` counts the tokens of those spans.
+    # `probed` is the span the latest probe answered for.
+    done: int = 0
+    consumed: int = 0
+    probed: int | None = None
+
+    def advance(self, start: int, end: int) -> list[tuple[int, int]]:
+        """Return ``(index, end)`` for each span a write over ``[start, end)`` touched. A span
+        before ``start`` that a probe served or a retrieve read in is passed, not touched."""
+        touched = []
+        while self.done < len(self.spans) and self.consumed < end:
+            span_end = self.consumed + self.spans[self.done].length
+            if span_end > start:
+                touched.append((self.done, span_end))
+            if end < span_end:
+                break
+            self.consumed = span_end
+            self.done += 1
+        return touched
+
+
+@dataclass
 class CacheStream:
     """(request, label) cache stream metadata"""
     page_indices: list[int] = field(default_factory=list)
@@ -239,6 +259,10 @@ class CacheStream:
     # its prefix lookup is in `KVManager.prefix_tokens`, so a re-probe after a
     # miss (a refused admit prepares the step again) is not counted twice
     prefix_counted: bool = False
+    footprint: int | None = None
+    span_cursor: SpanCursor | None = None
+    # kept only under `_DEBUG_ASSERTS`
+    peak: int = 0
     host_copy: "HostCopy | None" = None
 
     def reset(self, freed: bool=False, *, content_reset: bool=True):
@@ -257,12 +281,14 @@ class CacheStream:
             self.page_indices.clear()
 
     def forget_chain(self):
-        """Drop what the chain knows of this stream, for a run that starts over.
+        """Drop what the chain knows of this stream, and its place in the layout, for a run that starts over.
 
         Not part of `reset`, which an offload calls too: a reload brings the
         same tokens back, so the chain that describes them has to survive it.
         """
         self.chain = None
+        if self.span_cursor is not None:
+            self.span_cursor = SpanCursor(self.span_cursor.spans)
 
 
 class KVPageCounts(NamedTuple):
@@ -518,6 +544,7 @@ class KVManager(AttentionResource):
         self._keyed_walks: dict[str, frozenset[str]] = {}
         # nodes already warned that a declared stream reached them unkeyed
         self._warned_unkeyed: set[str] = set()
+        self._overran: set[tuple[str, bool]] = set()
         # streams whose lease still holds a cached image end for `plan` to copy
         self._image_ends: list[CacheStream] = []
         self._rank = joint_comm_group.rank if joint_comm_group is not None else 0
@@ -653,21 +680,21 @@ class KVManager(AttentionResource):
                 self._warn_unkeyed(rid, node_name, graph_walk)
                 return None
             stream = self._ensure_label(rid, label)
-            chain = stream.chain
-            if chain is None or chain.done == len(chain.spans):
+            chain, cursor = stream.chain, stream.span_cursor
+            if chain is None or cursor.done >= len(chain.spans):
                 return None
-            span = chain.spans[chain.done]
+            span = chain.spans[cursor.done]
             self._check_positions(span, graph_walk, inputs)
             if span.walk != graph_walk or span.length != inputs.input_seq_len:
                 self._drop_layout(rid, label, stream, (
                     f"{graph_walk} writes {inputs.input_seq_len} slots where its "
-                    f"layout's span {chain.done} has {span.walk} write {span.length}"
+                    f"layout's span {cursor.done} has {span.walk} write {span.length}"
                 ))
                 return None
             if stream.converted:
-                return self._answer(label, chain, stream.stored_len)
+                return self._answer(label, cursor, stream.stored_len)
             if stream.lease is not None:
-                return self._answer(label, chain, stream.lease_len)
+                return self._answer(label, cursor, stream.lease_len)
             if stream.stored_len or stream.offloaded or stream.read_pending:
                 return None
             keys, rooted = list(chain.keys), chain.rooted
@@ -710,7 +737,7 @@ class KVManager(AttentionResource):
                 if not matched:
                     return None
                 stream.lease, stream.lease_len = matched, held
-            return self._answer(label, chain, stream.lease_len)
+            return self._answer(label, cursor, stream.lease_len)
 
     def _root(
         self, keys: list[bytes], spans: list[PrefixSpan],
@@ -733,18 +760,18 @@ class KVManager(AttentionResource):
         )
 
     @staticmethod
-    def _answer(label: str, chain: PrefixChain, present: int) -> CachedPrefix:
+    def _answer(label: str, cursor: SpanCursor, present: int) -> CachedPrefix:
         """This walk's share of the ``present`` tokens the stream holds, with the
         position past that share. Records the span as the one the probe answered for."""
-        span = chain.spans[chain.done]
-        tokens = min(max(present - chain.consumed, 0), span.length)
-        position = sum(earlier.advance for earlier in chain.spans[:chain.done])
+        span = cursor.spans[cursor.done]
+        tokens = min(max(present - cursor.consumed, 0), span.length)
+        position = sum(earlier.advance for earlier in cursor.spans[:cursor.done])
         if span.digest is None:
             position += tokens
         elif tokens == span.length:
             # A partly held item doesn't move the position. Its walk still runs and advances it.
             position += span.advance
-        chain.probed = chain.done
+        cursor.probed = cursor.done
         return CachedPrefix(label, tokens, position)
 
     def _drop_layout(
@@ -761,13 +788,13 @@ class KVManager(AttentionResource):
         logger.warning(
             "KV %s: %s/%s %s; its chain ends here", self.name, rid, label, disagreement,
         )
-        chain = stream.chain
-        if chain.done and stream.lease is not None:
-            keep, partial = divmod(chain.consumed, self.config.page_size)
+        cursor = stream.span_cursor
+        if cursor.done and stream.lease is not None:
+            keep, partial = divmod(cursor.consumed, self.config.page_size)
             if partial:
                 raise RuntimeError(
                     f"KV {self.name}: {rid}/{label}: the walks the cache served end "
-                    f"inside a page ({chain.consumed} slots), so their KV cannot be kept"
+                    f"inside a page ({cursor.consumed} slots), so their KV cannot be kept"
                 )
             self._adopt(stream, stream.lease[:keep])
             self._arena.release(stream.lease[keep:])
@@ -792,19 +819,20 @@ class KVManager(AttentionResource):
                 return
             if prefix is None:
                 # an unprobed walk never reached the position check in `resolve_cached_prefix`
-                chain = self._ensure_label(rid, label).chain
-                if chain is not None and chain.done < len(chain.spans):
-                    self._check_positions(chain.spans[chain.done], graph_walk, inputs)
+                stream = self._ensure_label(rid, label)
+                chain, cursor = stream.chain, stream.span_cursor
+                if chain is not None and cursor.done < len(chain.spans):
+                    self._check_positions(chain.spans[cursor.done], graph_walk, inputs)
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.lease is None or stream.stored_len:
                 return
             if prefix is None:
                 self._drop_layout(rid, label, stream, f"{graph_walk} writes unprobed")
                 return
-            chain = stream.chain
-            if prefix.tokens == chain.spans[chain.done].length:
+            cursor = stream.span_cursor
+            if prefix.tokens == cursor.spans[cursor.done].length:
                 return
-            held = chain.consumed + prefix.tokens
+            held = cursor.consumed + prefix.tokens
             if held < stream.lease_len:
                 keep = held // self.config.page_size
                 self._arena.release(stream.lease[keep:])
@@ -818,14 +846,16 @@ class KVManager(AttentionResource):
             stream = self._streams.get(rid, {}).get(label)
             if stream is None or stream.chain is None:
                 return
-            chain = stream.chain
-            chain.consumed += chain.spans[chain.done].length
-            chain.done += 1
+            cursor = stream.span_cursor
+            cursor.consumed += cursor.spans[cursor.done].length
+            cursor.done += 1
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
+        touched: list[tuple[int, int]],
     ) -> None:
-        """Offer every page this commit filled to the index.
+        """Offer every page this commit filled to the index. ``touched`` holds
+        ``(index, end)`` for each span of the layout this commit wrote into.
 
         Only whole pages, because the tail is still being written into and a
         second owner would be reading bytes that are still moving. A dummy or
@@ -855,22 +885,16 @@ class KVManager(AttentionResource):
         if stream.released or stream.stored_len - segment.span > chain.covered_len + lag:
             stream.chain = None
             return
-        start = stream.stored_len - segment.span
         ended = None
-        while chain.done < len(chain.spans):
-            end = chain.consumed + chain.spans[chain.done].length
-            # Checking every span would end the chain at the first one the cache filled rather than this walk.
-            if chain.consumed < stream.stored_len and end > start and (
-                chain.spans[chain.done].walk != walk
-            ):
+        for index, end in touched:
+            if index >= len(chain.spans):
+                break
+            span = chain.spans[index]
+            if span.walk != walk:
                 stream.chain = None
                 return
-            if stream.stored_len < end:
-                break
-            if end > start and chain.spans[chain.done].end_key is not None:
-                ended = end, chain.spans[chain.done].end_key
-            chain.consumed = end
-            chain.done += 1
+            if end <= stream.stored_len and span.end_key is not None:
+                ended = end, span.end_key
         filled = chain.pages_filled(stream.stored_len, self.config.page_size)
         if stream.retention is not None:
             filled = min(
@@ -985,14 +1009,18 @@ class KVManager(AttentionResource):
         ):
             return
         keys = overrides.prefix_keys or {}
-        layout = overrides.prefix_layout or {}
+        layouts = overrides.kv_layout or {}
         for label in overrides.get_labels(node_name, graph_walk):
-            if graph_walk in self._keyed_walks.get(label, ()) and not (keys.get(label) and layout.get(label)):
+            layout = layouts.get(label)
+            # a layout that keys no span leaves its request unkeyed on purpose
+            if graph_walk in self._keyed_walks.get(label, ()) and not keys.get(label) and (
+                layout is None or layout.keyed_spans
+            ):
                 self._warned_unkeyed.add(node_name)
                 logger.warning(
                     "KV %s: requests reach %s with no %s for %s, which the "
                     "model declared for prefix reuse, so nothing will be cached",
-                    self.name, node_name, "layout" if keys.get(label) else "keys", label,
+                    self.name, node_name, "layout" if layout is None else "keys", label,
                 )
                 return
 
@@ -1010,9 +1038,9 @@ class KVManager(AttentionResource):
         if overrides is None or not overrides.prefix_cache:
             return None
         keys = overrides.prefix_keys or {}
-        layout = overrides.prefix_layout or {}
+        layouts = overrides.kv_layout or {}
         for label in overrides.get_labels(node_name, graph_walk):
-            if keys.get(label) and layout.get(label):
+            if keys.get(label) and label in layouts:
                 return label
         return None
 
@@ -1022,11 +1050,14 @@ class KVManager(AttentionResource):
         if overrides is None or not overrides.prefix_cache:
             return
         keys = (overrides.prefix_keys or {}).get(label)
-        spans = (overrides.prefix_layout or {}).get(label)
-        if not keys or not spans:
+        # the chain reads the span cursor, which only a label the request opens has
+        layout = self._held_layout(rid, label)
+        if not keys or layout is None:
             return
         tail = list((overrides.prefix_tail or {}).get(label) or ())
-        stream.chain = PrefixChain.seed(keys, tail, spans, self.config.page_size)
+        stream.chain = PrefixChain.seed(
+            keys, tail, layout.spans[:layout.keyed_spans], self.config.page_size,
+        )
 
     @property
     def keys_prefix_chains(self) -> bool:
@@ -1316,8 +1347,24 @@ class KVManager(AttentionResource):
             self._streams.setdefault(rid, {"main": CacheStream()})
             self._overrides.setdefault(rid, overrides)
             for label, stream in self._streams[rid].items():
+                if stream.span_cursor is None:
+                    self._lay_out(rid, label, stream)
                 if stream.chain is None:
                     self._seed_keys(rid, label, stream)
+
+    def _lay_out(self, rid: str, label: str, stream: CacheStream) -> None:
+        """A label the request doesn't open gets a footprint of 0, so the pages a batch writes
+        there for it count as an overrun."""
+        layout = self._held_layout(rid, label)
+        if layout is not None:
+            stream.footprint = layout.pages(self._overrides[rid].loop_caps, self.config.page_size)
+            stream.span_cursor = SpanCursor(layout.spans)
+        elif self._overrides.get(rid) is not None and self._overrides[rid].kv_layout:
+            stream.footprint = 0
+
+    def _held_layout(self, rid: str, label: str) -> StreamLayout | None:
+        overrides = self._overrides.get(rid)
+        return (overrides.kv_layout or {}).get(label) if overrides is not None else None
 
     def admit_retrieve(
         self, rid: str,
@@ -1470,7 +1517,7 @@ class KVManager(AttentionResource):
                 return label
             chain = stream.chain
             if (
-                chain is None or chain.looked_up or chain.done
+                chain is None or chain.looked_up or stream.span_cursor is not None and stream.span_cursor.done
                 or chain.spans[0].walk != graph_walk
                 or stream.stored_len or stream.lease is not None or stream.converted
                 or stream.offloaded or stream.read_pending
@@ -1533,6 +1580,8 @@ class KVManager(AttentionResource):
                 self._forget_step_reservations(ctx)
             if self._host_copies:
                 self._land_host_copies()
+        if _DEBUG_ASSERTS and not step.commit:
+            self._assert_scratch(step, ctx)
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
@@ -1562,7 +1611,7 @@ class KVManager(AttentionResource):
                     and not stream.offloaded
                     and not stream.read_pending
                 ):
-                    assert stream.chain.probed == stream.chain.done, (
+                    assert stream.span_cursor.probed == stream.span_cursor.done, (
                         f"KV {self.name}: {segment.request_id}/{segment.label} admits a "
                         "walk its lease was never probed for, which would write over "
                         "the pages the lease holds for it"
@@ -2380,8 +2429,14 @@ class KVManager(AttentionResource):
                     )
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
+                    touched = []
+                    if stream.span_cursor is not None and (stream.chain is not None or _DEBUG_ASSERTS):
+                        written = stream.stored_len + stream.released
+                        touched = stream.span_cursor.advance(written - segment.span, written)
+                        if _DEBUG_ASSERTS:
+                            self._assert_layout(segment, stream, touched, ctx, policy)
                     if index_on and stream.chain is not None:
-                        self._index_filled_pages(segment, stream, ctx)
+                        self._index_filled_pages(segment, stream, ctx, touched)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
@@ -2402,6 +2457,26 @@ class KVManager(AttentionResource):
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
+
+    def _assert_layout(
+        self, segment: Segment, stream: CacheStream, touched: list[tuple[int, int]],
+        ctx: StepContext, policy: RetentionPolicy | None,
+    ) -> None:
+        """Debug only, since it looks the layout up per segment."""
+        overrides = self._overrides[segment.request_id]
+        layout = overrides.kv_layout[segment.label]
+        walk = ctx.walk_of(segment.request_id) if ctx.request_walks else ctx.graph_walk
+        where = f"KV {self.name}: {segment.request_id}/{segment.label}"
+        for index, _ in touched:
+            assert stream.span_cursor.spans[index].walk == walk, (
+                f"{where}: {walk} wrote into span {index}, which its layout gives to "
+                f"{stream.span_cursor.spans[index].walk}"
+            )
+        written, bound = stream.stored_len + stream.released, layout.slots(overrides.loop_caps)
+        assert written <= bound, f"{where}: committed {written} slots, past its layout's spans and growth ({bound})"
+        assert policy is None or policy == layout.retention, (
+            f"{where}: a step declares {policy}, where its layout declares {layout.retention}"
+        )
 
     # Partial release behind a protected prefix (windowed generation): a
     # request that generates in windows commits each window's K/V and, once
@@ -3085,6 +3160,8 @@ class KVManager(AttentionResource):
                 if stream.read_future is not None:
                     wait([stream.read_future])
         with self._lock:
+            if _DEBUG_ASSERTS and rid in self._streams:
+                self._report_underuse(rid)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(stream)
@@ -3101,6 +3178,18 @@ class KVManager(AttentionResource):
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
+
+    def _report_underuse(self, rid: str) -> None:
+        overrides = self._overrides[rid]
+        for label, layout in (overrides.kv_layout or {}).items():
+            stream = self._streams[rid].get(label)
+            footprint = layout.pages(overrides.loop_caps, self.config.page_size)
+            peak = 0 if stream is None else stream.peak
+            if footprint > peak:
+                logger.warning(
+                    "KV %s: request %s held at most %d pages on label %s against a footprint of %d",
+                    self.name, rid, peak, label, footprint,
+                )
 
     def assert_pages_conserved(self) -> None:
         """Check the owner counts against the streams holding the pages, on the
@@ -3229,8 +3318,9 @@ class KVManager(AttentionResource):
 
     def _ensure_label(self, rid: str, label: str) -> CacheStream:
             if label not in self._streams[rid]:
-                self._streams[rid][label] = CacheStream()
-                self._seed_keys(rid, label, self._streams[rid][label])
+                stream = self._streams[rid][label] = CacheStream()
+                self._lay_out(rid, label, stream)
+                self._seed_keys(rid, label, stream)
             return self._streams[rid][label]
 
     def _check_ready(
@@ -3379,7 +3469,43 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 stream.generation += 1
+                if stream.footprint is not None and len(stream.page_indices) > stream.footprint:
+                    self._report_overrun(request_id, label, stream)
+                if _DEBUG_ASSERTS:
+                    stream.peak = max(stream.peak, len(stream.page_indices))
         return AllocResult(new_pages=new_pages)
+
+    def _assert_scratch(self, step: KVStep, ctx: StepContext) -> None:
+        for segment in step.segments:
+            layout = self._held_layout(segment.request_id, segment.label)
+            if layout is None or self._on_sink(ctx, segment.request_id) or (
+                (segment.request_id, segment.label) in step.sink
+            ):
+                continue
+            scratch = max([layout.scratch, *(span.scratch for span in layout.spans)])
+            assert segment.span <= scratch, (
+                f"KV {self.name}: {segment.request_id}/{segment.label}: a step that commits nothing "
+                f"writes {segment.span} slots, past its layout's scratch of {scratch}"
+            )
+
+    def _report_overrun(self, rid: str, label: str, stream: CacheStream) -> None:
+        """Log once per label that a request took more pages than its layout allows.
+
+        The pool would then promise room it doesn't have, and the request's
+        layout is the likely cause, so the line prints it. A label the request
+        doesn't open is reported on its own, so the pages a batch writes there
+        for every row don't hide a real overrun.
+        """
+        overrides = self._overrides[rid]
+        reported = (label, label in overrides.kv_layout)
+        if reported in self._overran:
+            return
+        self._overran.add(reported)
+        logger.error(
+            "KV %s: request %s took %d pages on label %s against a footprint of %d: layout %s, loop caps %s",
+            self.name, rid, len(stream.page_indices), label, stream.footprint,
+            overrides.kv_layout.get(label), overrides.loop_caps,
+        )
 
     ### Submodule-level functionality
     # Label / layer cursors come from `AttentionResource`; the readers resolve
