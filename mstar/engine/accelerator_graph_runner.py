@@ -1190,6 +1190,7 @@ class AcceleratorGraphRunner:
             per_request_info=dummy_metadata(dummy_rids, graph_walk),
             resources=dict(self._resources),
             captured=True,
+            synthetic=True,
         )
 
     @staticmethod
@@ -2018,6 +2019,7 @@ class PiecewiseAcceleratorGraphRunner:
                 per_request_info=dummy_metadata(step_ids, PIECEWISE_WALK),
                 resources=dict(self._resources),
                 step=step,
+                synthetic=True,
             ),
             kwargs=self._config.forward_kwargs,
         )
