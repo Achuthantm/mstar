@@ -31,6 +31,7 @@ from mstar.model.bagel.components.modeling_utils import (
     get_flattened_position_ids_extrapolate,
     patchify,
     vllm_vae_resize,
+    vllm_vae_size,
     vllm_vit_resize,
 )
 from mstar.model.bagel.components.vit_encoder import VIT_ATTN
@@ -123,6 +124,19 @@ def vit_patches(
     height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
     height, width = _VIT_TRANSFORM.resize_transform.target_size(height, width)
     return (height // patch_size) * (width // patch_size)
+
+
+def vae_latents(
+    height: int, width: int, image_preprocess: str,
+    latent_downsample: int, max_latent_size: int,
+) -> int:
+    """How many latents the VAE encodes an image of this size into. The VAE's
+    ``prepare_inputs`` asserts the same count."""
+    if image_preprocess == "vllm":
+        height, width = vllm_vae_size(height, width, latent_downsample, max_latent_size * latent_downsample)
+    else:
+        height, width = _VAE_TRANSFORM.resize_transform.target_size(height, width)
+    return (height // latent_downsample) * (width // latent_downsample)
 
 
 class ViTEncoderSubmodule(NodeSubmodule):
@@ -543,6 +557,10 @@ class VAEEncoderSubmodule(NodeSubmodule):
         _, img_h, img_w = image_tensor.shape
         h = (img_h // ds)
         w = (img_w // ds)
+        assert h * w == vae_latents(*img.shape[-2:], image_preprocess, ds, self.max_latent_size), (
+            f"the VAE encoded a {tuple(img.shape[-2:])} image into {h * w} latents, "
+            "not the count `vae_latents` gives a layout to size it by"
+        )
 
         packed_vae_position_ids = get_flattened_position_ids_extrapolate(
             img_h, img_w,
@@ -803,6 +821,8 @@ class LLMSubmodule(ARNodeSubmodule):
         # on the step (`cg_key_info`) so a replay lands on its own bucket.
         return [
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 additional_key_info=False,
                 single_request_inputs=ARNodeInputs(
@@ -811,6 +831,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
             BatchedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="decode",
                 additional_key_info=True,
                 single_request_inputs=ARNodeInputs(
@@ -820,6 +842,8 @@ class LLMSubmodule(ARNodeSubmodule):
                 ),
             ),
             PackedAcceleratorGraphConfig(
+                # max-autotune until the default compile level (mstar serve -O) is measured on this model
+                compile_mode="max-autotune-no-cudagraphs",
                 capture_graph_walk="prefill_text",
                 # decode rows of a mixed step are one-token segments
                 replay_graph_walks=["prefill_text", MIXED_TEXT],
