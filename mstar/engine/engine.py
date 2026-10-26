@@ -2659,11 +2659,20 @@ class Engine:
     ) -> None:
         self._runner.ingest_request(request_id, overrides)
 
-    def remove_request(self, request_id: str) -> None:
+    def remove_request(self, request_id: str) -> set[str]:
+        """Tear the request down on every resource. Returns the resources it
+        held pages of that the teardown hands back, which `reclaimable` counts:
+        a KV cache whose pages reach the free list or are left to the prefix
+        index alone. An offloaded request, or one that never ran, frees none."""
         self._loopback_steps.pop(request_id, None)
+        freed = {
+            key for key, resource in self._resources.items()
+            if resource.reclaimable(request_id)
+        }
         self._runner.remove_request(request_id)
         for submodule_mgmt in self._submodules.values():
             submodule_mgmt.submodule.cleanup_request(request_id)
+        return freed
 
     def shutdown(self):
         for resource in self._resources.values():
