@@ -856,7 +856,7 @@ class _RemoveRank:
 
     def __init__(self, consumed: int):
         self.scheduler = SimpleNamespace(last_consumed_tp_seq=consumed)
-        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
+        self._removes_awaiting_step: dict[int, list[str]] = {}
         self.applied: list[str] = []
 
     def _remove_request(self, body):
@@ -888,13 +888,12 @@ def test_an_unstamped_removal_is_not_ordered():
 
 def test_a_held_removal_lands_once_its_step_does():
     rank = _RemoveRank(consumed=5)
-    late = RemoveRequest(request_id="late", after_tp_seq=7)
-    rank._removes_awaiting_step = {7: [late], 4: [RemoveRequest(request_id="early", after_tp_seq=4)]}
+    rank._removes_awaiting_step = {7: ["late"], 4: ["early"]}
 
     rank._apply_removes_whose_step_landed()
 
     assert rank.applied == ["early"], "applied a teardown from a step not reached"
-    assert rank._removes_awaiting_step == {7: [late]}
+    assert rank._removes_awaiting_step == {7: ["late"]}
 
     rank.scheduler.last_consumed_tp_seq = 7
     rank._apply_removes_whose_step_landed()
@@ -907,10 +906,7 @@ def test_held_removals_land_in_step_order():
     """Two teardowns from different gaps have to be applied in the order rank 0
     made them, for the same reason the delta is a queue."""
     rank = _RemoveRank(consumed=9)
-    rank._removes_awaiting_step = {
-        8: [RemoveRequest(request_id="second", after_tp_seq=8)],
-        3: [RemoveRequest(request_id="first", after_tp_seq=3)],
-    }
+    rank._removes_awaiting_step = {8: ["second"], 3: ["first"]}
 
     rank._apply_removes_whose_step_landed()
 
@@ -936,7 +932,7 @@ class _ForwardingLeader:
         self._stream_buffer_rids: set[int] = set()
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
-        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
+        self._removes_awaiting_step: dict[int, list[str]] = {}
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()
@@ -955,10 +951,7 @@ class _ForwardingLeader:
         self.engine_manager = SimpleNamespace(
             remove_request=lambda rid: None, evictable_nodes=lambda: (),
         )
-        self.tensor_manager = SimpleNamespace(
-            force_cleanup_request=lambda rid: None,
-            retire_request=lambda rid, wire_rid: None,
-        )
+        self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
         self.profile_info = SimpleNamespace(pop_request=lambda rid: None)
         self.scheduler = SimpleNamespace(
             clear_rid=lambda rid, wire_rid: None,
@@ -971,18 +964,16 @@ class _ForwardingLeader:
         )
 
 
-@pytest.mark.parametrize("retain_readers", [False, True])
-def test_the_forwarded_teardown_carries_the_step_it_follows(retain_readers):
+def test_the_forwarded_teardown_carries_the_step_it_follows():
     """Without the stamp a follower has nothing to order the teardown against,
     and applies it on whichever side of the step its loop happens to be on."""
     leader = _ForwardingLeader(broadcast_seq=1229)
 
-    leader._remove_request(RemoveRequest(request_id="gone", retain_readers=retain_readers))
+    leader._remove_request(RemoveRequest(request_id="gone"))
 
     assert [w for w, _ in leader.sent] == ["rank1"]
     body = leader.sent[0][1].body
     assert body.request_id == "gone"
-    assert body.retain_readers is retain_readers
     assert body.after_tp_seq == 1228, (
         "the last step broadcast, which is the gap this rank released the pages in"
     )

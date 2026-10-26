@@ -702,15 +702,6 @@ class TensorStore:
     def get_all_uuids(self, request_id: Rid) -> list[int]:
         return list(self._rid_to_uuids.get(request_id, ()))
 
-    def detach_request(self, request_id: Rid) -> None:
-        """Let referenced tensors outlive a request without retaining its handle.
-
-        Their global UUIDs still accept late read ACKs. Removing the ownership
-        links prevents a recycled worker handle from inheriting these buffers.
-        """
-        for uuid in self._rid_to_uuids.pop(request_id, ()):
-            self._uuid_to_rid.pop(uuid, None)
-
     # -- bookkeeping passthrough -------------------------------------------
 
     def can_gc(self, uuid: int) -> bool:

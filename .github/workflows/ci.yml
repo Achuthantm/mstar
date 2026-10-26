@@ -185,7 +185,5 @@ jobs:
           pip install triton
           # the package itself, without its remaining (heavy) deps
           pip install --no-deps -e .
-          # Exercise row storage and successful transport retirement against
-          # the Rust bookkeeper; CPU Core skips cases needing the extension.
-          pytest test/rust/ test/modular/test_row_output_store.py \
-            test/modular/test_shm_tensor_comm.py -v
+          # the row store needs the columnar tensor store; CPU Core skips most of it
+          pytest test/rust/ test/modular/test_row_output_store.py -v

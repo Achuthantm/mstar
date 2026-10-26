@@ -66,9 +66,6 @@ class RemoveRequest(MessageBody):
     # broadcast, so they tear the request down at the same point in the step
     # sequence it did, maintaining KV cache state symmetry.
     after_tp_seq: int = -1
-    # Successful completion has no worker drain barrier: preserve exported
-    # buffers until the existing TENSOR_RECEIVED acknowledgments release them.
-    retain_readers: bool = False
 
 
 @dataclass

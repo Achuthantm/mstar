@@ -169,12 +169,11 @@ def test_done_completes_client_immediately_but_defers_remove():
     c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
     c._process_request_done("r1")
 
-    # Only output delivery needs a barrier; producers retain any still-read
-    # buffers through their existing tensor reference counts.
+    # Client told right away; workers assumed done so only the preprocess worker
+    # must ACK — no Remove yet.
     completes = [m for e, m in c.sent if e == "api_server"
                  and m.message_type == "request_complete"]
     assert len(completes) == 1
-    assert _drain_targets(c, "r1") == set()
     assert _remove_targets(c, "r1") == set()
     assert c.draining["r1"].expected_acks == {PREPROCESS}
     assert "r1" in c.requests
@@ -183,8 +182,6 @@ def test_done_completes_client_immediately_but_defers_remove():
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
     assert "r1" not in c.requests
     assert c.admits == 1
-    removals = _by_type(c, WorkerMessageType.REMOVE_REQUEST)
-    assert all(message.body.retain_readers for _, message in removals)
 
 
 def test_done_unpersists_still_held_signals_with_ref_counts():

@@ -5,16 +5,13 @@ import logging
 import os
 import shutil
 import tempfile
-from concurrent.futures import Future
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
-from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping
 from mstar.communication.tensors import (
-    FutureAndPointers,
     MooncakeCommunicationManager,
     SharedMemoryCommunicationManager,
     _deserialize_tensor,
@@ -571,97 +568,6 @@ def test_force_cleanup_request_reclaims_unacked_buffer():
 
         producer.force_cleanup_request("req1")
         assert not os.path.isfile(shm_path)  # dropped regardless of ref count
-
-
-@pytest.fixture(params=["python", "rust"])
-def retirement_bookkeeping(request):
-    if request.param == "rust":
-        pytest.importorskip("mstar_rust")
-        return RustTensorBookkeeping()
-    return PythonTensorBookkeeping()
-
-
-def test_retirement_waits_for_every_reader_without_keeping_the_handle(tmp_path, retirement_bookkeeping):
-    producer = _make_manager(str(tmp_path), request_id="old")
-    producer.tensor_store.bookkeeping = retirement_bookkeeping
-    _, uuid = _produce_registered_output(producer, "old")
-    producer.increment_ref(uuid)  # two independent readers
-    path = producer._shm_files[uuid]
-
-    producer.retire_request("old", "old#1")
-    assert producer.tensor_store.get_all_uuids("old") == []
-    assert os.path.isfile(path)
-    assert producer.communicator.sent == []
-
-    # A new request may use the same local handle and finish before either ACK.
-    producer.register_request("old", _empty_sharding_config())
-    producer.force_cleanup_request("old")
-    assert os.path.isfile(path)
-    producer.dereference_batch([uuid], [1])
-    assert os.path.isfile(path)
-    producer.dereference_batch([uuid], [1])
-    assert not os.path.isfile(path)
-    assert not producer.tensor_store.check_uuid_presence(uuid)
-
-
-def test_retirement_defers_a_receive_ack_until_its_future_finishes(tmp_path, retirement_bookkeeping):
-    producer = _make_manager(str(tmp_path), request_id="old")
-    receiver = _make_manager(str(tmp_path), entity_id="worker_1", request_id=7)
-    receiver.tensor_store.bookkeeping = retirement_bookkeeping
-    edges, uuid = _produce_registered_output(producer, "old")
-    info = edges[0].tensor_info[0]
-    path = producer._shm_files[uuid]
-    receiver.start_read_tensors(7, [GraphEdge(next_node="LLM", name="out", tensor_info=[info])])
-    future = Future()
-    receiver.pending[0].future = future
-    other_read = FutureAndPointers(Future(), [], 8)
-    receiver.pending.append(other_read)
-
-    producer.retire_request("old", "old#1")
-    receiver.retire_request(7, "old#1")
-    assert receiver.pending == [other_read]
-    assert receiver.tensor_store.get_all_uuids(7) == []
-    assert receiver.get_ready_tensors() == {}
-    assert receiver.communicator.sent == []
-    assert receiver.tensor_store.check_uuid_presence(uuid)
-    assert os.path.isfile(path)
-
-    receiver.register_request(7, _empty_sharding_config())
-    new_info = receiver.store_and_return_tensor_info(7, {"new": [torch.ones(1)]})["new"][0]
-    receiver.rid_to_str = lambda handle: "new#2"
-    future.set_result(None)
-    assert receiver.get_ready_tensors() == {}
-    assert not receiver.tensor_store.check_uuid_presence(uuid)
-    assert receiver.tensor_store.check_uuid_presence(new_info.uuid)
-    assert not receiver._retired_reads
-    assert receiver.pending == [other_read]
-    [(target, ack)] = receiver.communicator.sent
-    assert target == "worker_0"
-    assert ack.body.request_id == "old#1"
-    producer.dereference_batch(list(ack.body.successful_tensors), list(ack.body.successful_tensors.values()))
-    assert not os.path.isfile(path)
-
-
-def test_retirement_keeps_a_failed_read_unacked(tmp_path, retirement_bookkeeping):
-    receiver = _make_manager(str(tmp_path), entity_id="worker_1", request_id=7)
-    receiver.tensor_store.bookkeeping = retirement_bookkeeping
-    tensor = torch.ones(1)
-    info = TensorPointerInfo(
-        dims=tensor.shape, dtype=tensor.dtype, stride=tensor.stride(), nbytes=tensor.nbytes,
-        address=0, uuid=123, source_session_id="peer", source_entity="worker_0",
-    )
-    receiver.tensor_store.put_tensor(7, info.uuid, tensor, info)
-    future = Future()
-    receiver.pending.append(FutureAndPointers(
-        future, [GraphEdge(next_node="LLM", name="out", tensor_info=[info])], 7,
-    ))
-    receiver.retire_request(7, "old#1")
-    future.set_exception(RuntimeError("transfer failed without a drain guarantee"))
-
-    assert receiver.get_ready_tensors() == {}
-    assert receiver.communicator.sent == []
-    assert receiver.tensor_store.check_uuid_presence(info.uuid)
-    assert receiver._retired_reads[0].failed
 
 
 def test_has_inflight_reads_tracks_pending_futures():
