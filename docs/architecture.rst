@@ -78,3 +78,10 @@ Execution flow (simplified)
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
+5. Once all partitions finish and the API server finishes output delivery, the
+   conductor removes the request. Workers release engine state while retaining exported
+   tensors until their existing read acknowledgments arrive. Unexpected in-flight
+   receives retain their buffers until completion and discard their results. Successful
+   completion adds no worker drain round trip; abort and failure use
+   ``DRAIN_REQUEST`` / ``READS_DONE`` before force cleanup. Transfers that fail without
+   a drain guarantee retain their buffers.

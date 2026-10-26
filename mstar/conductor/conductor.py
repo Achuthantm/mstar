@@ -362,15 +362,18 @@ class RequestData:
 
 @dataclass
 class DrainingRequest:
-    """Teardown barrier state: a request whose participants are draining their
-    reads. Once every entity in ``expected_acks`` has sent READS_DONE it is safe
-    to send the hard RemoveRequest to all ``participants``."""
+    """Teardown waits for output delivery or the abort/failure drain barrier.
+
+    Successful removals retain referenced exports; aborted/failed requests
+    have drained every participant and can force-drop their tensor state.
+    """
     expected_acks: set[str]
     participants: set[str]
     # Set for the fail path: the client notification is deferred until the
     # barrier completes (so the API server doesn't tear down mid-read).
     failure_error: str | None = None
     failure_status: int = 500
+    retain_readers: bool = False
 
 
 def _message_name(message) -> str:
@@ -1371,6 +1374,7 @@ class Conductor:
     def _register_draining(
         self, request_id: str, expected_acks: set[str], participants: set[str],
         failure_error: str | None = None, failure_status: int = 500,
+        retain_readers: bool = False,
     ):
         """Start the teardown barrier for a request. Applies any READS_DONE that
         raced ahead of registration, and finalizes immediately if already
@@ -1381,6 +1385,7 @@ class Conductor:
             participants=participants,
             failure_error=failure_error,
             failure_status=failure_status,
+            retain_readers=retain_readers,
         )
         self._draining_deadlines.append(
             (time.perf_counter() + self._drain_ttl_s, request_id)
@@ -1411,8 +1416,8 @@ class Conductor:
             )
 
     def _finalize_draining(self, request_id: str):
-        """Every reader has drained: send the hard RemoveRequest to all
-        participants, notify the client on the fail path, then free state."""
+        """Send removals with the barrier's tensor-retention policy, notify the
+        client on the fail path, then free conductor state."""
         dr = self.draining.pop(request_id, None)
         if dr is None:
             return
@@ -1423,7 +1428,7 @@ class Conductor:
                 request_id, entity,
                 WorkerMessage(
                     message_type=WorkerMessageType.REMOVE_REQUEST,
-                    body=RemoveRequest(request_id),
+                    body=RemoveRequest(request_id, retain_readers=dr.retain_readers),
                 ),
             )
         if dr.failure_error is not None:
@@ -1616,20 +1621,16 @@ class Conductor:
         if still_persisted:
             self._un_persist_tensors(request_id, still_persisted)
 
-        # Workers are done reading (the graph finished); the only remaining
-        # reader is the preprocess worker still delivering outputs. Defer the
-        # hard RemoveRequest until it signals READS_DONE, so a worker output
-        # isn't unlinked under an in-flight read.
-        # NOTE: "workers done reading" assumes a well-behaved graph. A model bug
-        # that emits extra/erroneous tensors could leave a worker read scheduled
-        # past completion, which this path won't wait for. Gating the happy path
-        # on per-worker READS_DONE too (like abort/fail) would handle that
-        # robustly — TODO once the barrier has proven out.
+        # Keep output delivery open until the preprocess worker finishes.
+        # Worker reads need no extra barrier: successful removes retain any
+        # exported buffers until their TENSOR_RECEIVED acknowledgments arrive.
+        # Unexpected in-flight receives retain their buffers until completion.
         workers = self._request_workers(request_data)
         self._register_draining(
             request_id,
             expected_acks={self.PREPROCESS_WORKER},
             participants=workers | {self.PREPROCESS_WORKER},
+            retain_readers=True,
         )
 
     def _process_worker_graphs_done(
