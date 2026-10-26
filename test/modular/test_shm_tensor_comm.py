@@ -692,6 +692,13 @@ class _InProcessTransferEngine:
             ctypes.memmove(dst, src, n)
         return 0
 
+    def batch_transfer_async_read(self, session_id, local_ptrs, remote_ptrs, lengths):
+        self.batch_transfer_sync_read(session_id, local_ptrs, remote_ptrs, lengths)
+        return 1  # any nonzero batch id; every batch is done once submitted
+
+    def transfer_check_status(self, batch_id):
+        return 1  # COMPLETED
+
 
 def _transport(protocol, entity_id, shm_dir):
     if protocol == CommProtocol.SHM:

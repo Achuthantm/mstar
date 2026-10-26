@@ -313,6 +313,10 @@ class ExecutingBatch:
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
     failed_requests: dict[int, str] = field(default_factory=dict)
+    # A lockstep step whose rows' input reads every rank checks before
+    # preparing it: the leader's rows in its order (see
+    # ``Worker._drop_rows_whose_read_failed``); None for no check
+    read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
     # the resource that ran out, so an eviction can be scoped to it
