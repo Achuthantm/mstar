@@ -109,6 +109,14 @@ class FutureAndPointers:
             row[1] += 1
 
 
+@dataclass
+class _RetiredReads:
+    request_id: str
+    reads: list[FutureAndPointers]
+    uuids: set[int]
+    failed: bool = False
+
+
 #: Earlier Mooncake releases let any host that reaches the TCP data port read
 #: or write arbitrary process memory (CVE-2026-103764). NVD lists "before
 #: 0.3.13" because it points at a later refactor; the fix (Mooncake #2314)
@@ -537,6 +545,8 @@ class TensorCommunicationManager(ABC):
         self.rid_to_str: Callable[[Rid], str] = str
         self._uuid_minter = TensorUuidMinter(my_entity_id)
         self.pending: list[FutureAndPointers] = []
+        # Only populated if successful removal finds unexpected receive reads.
+        self._retired_reads: list[_RetiredReads] = []
         self.read_finished: dict[Rid, set[int]] = {}
 
         self.req_rx_info: dict[Rid, SourceAndEdgeToRxInfo] = {}
@@ -1378,6 +1388,8 @@ class TensorCommunicationManager(ABC):
             stats.record(src, dst, row[0], row[1], seconds * row[col] / total)
 
     def get_ready_tensors(self, graph_walk: str | None=None) -> dict[Rid, list[GraphEdge]]:
+        if self._retired_reads:
+            self._finish_retired_reads()
         ready: dict[Rid, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
@@ -1624,7 +1636,64 @@ class TensorCommunicationManager(ABC):
             for ep in self.pending
         )
 
-    def cleanup_request(self, request_id: Rid, force: bool = False):
+    def _is_exported_buffer(self, uuid: int) -> bool:
+        if not self.tensor_store.is_registered(uuid):
+            return False
+        info = self.tensor_store.get_info(uuid)
+        return info is not None and info.source_entity == self.my_entity_id
+
+    def _finish_retired_reads(self) -> None:
+        remaining = []
+        for retired in self._retired_reads:
+            if retired.failed or any(
+                read.future is not None and not read.future.done()
+                for read in retired.reads
+            ):
+                remaining.append(retired)
+                continue
+            try:
+                for read in retired.reads:
+                    if read.future is not None:
+                        read.future.result()
+            except Exception:
+                # A failed Mooncake sync read does not prove that native DMA
+                # has stopped. Keep both endpoints alive instead of ACKing it.
+                retired.failed = True
+                remaining.append(retired)
+                logger.exception("Keeping buffers for failed retired read of request %s", retired.request_id)
+                continue
+            try:
+                self._collect_and_send_acks(
+                    None, [edge for read in retired.reads for edge in read.graph_edges],
+                    wire_request_id=retired.request_id,
+                )
+            except Exception:
+                # Some peer ACKs may already have gone out; retrying the batch
+                # could decrement those producers twice.
+                logger.exception("Could not ACK retired reads of request %s", retired.request_id)
+            for uuid in retired.uuids:
+                if not self.tensor_store.check_uuid_presence(uuid):
+                    continue
+                if self.tensor_store.can_gc(uuid) or not self._is_exported_buffer(uuid):
+                    self._cleanup_by_uuid(uuid)
+        self._retired_reads = remaining
+
+    def retire_request(self, request_id: Rid, wire_request_id: str) -> None:
+        """Release completed graph state without freeing a peer's read buffers.
+
+        Exports stay alive through their existing reference counts and ACKs.
+        Unexpected receives finish off the scheduling path, retaining only
+        UUIDs and the wire id so a recycled worker handle cannot inherit them.
+        """
+        self.cleanup_request(
+            request_id, force=True, retain_readers=True,
+            wire_request_id=wire_request_id,
+        )
+
+    def cleanup_request(
+        self, request_id: Rid, force: bool = False, *,
+        retain_readers: bool = False, wire_request_id: str | None = None,
+    ):
         """Teardown for a request's tensor state.
 
         Default (soft): drop tensors that are safe to GC, defer any still
@@ -1632,14 +1701,26 @@ class TensorCommunicationManager(ABC):
         is the conductor-coordinated hard cleanup, see
         :meth:`force_cleanup_request`.
         """
+        reads = [read for read in self.pending if read.request_id == request_id]
+        # Usually all of this request's reads have already left the queue.
+        # Avoid copying other requests' pending reads on every teardown.
+        if reads:
+            self.pending = [read for read in self.pending if read.request_id != request_id]
+        pending_uuids = {
+            info.uuid for read in reads for edge in read.graph_edges for info in edge.tensor_info
+        } if retain_readers and reads else None
         self.read_finished.pop(request_id, None)
         self.buffered_shards.pop(request_id, None)
         self.sharding_configs.pop(request_id, None)
         self.req_rx_info.pop(request_id, None)
         self.req_tx_info.pop(request_id, None)
         for uuid in self.tensor_store.get_all_uuids(request_id):
-            self.uuid_to_shard_dim.pop(uuid, None)
-            if not self.tensor_store.can_gc(uuid) and not force:
+            if pending_uuids is not None and uuid in pending_uuids:
+                continue
+            collectable = self.tensor_store.can_gc(uuid)
+            if not collectable and retain_readers and self._is_exported_buffer(uuid):
+                continue
+            if not collectable and not force:
                 logger.warning(
                     "Deferring cleanup of tensor uuid %s "
                     "(awaiting TENSOR_RECEIVED ACK or unpersist)", uuid
@@ -1647,11 +1728,17 @@ class TensorCommunicationManager(ABC):
                 continue
             self._cleanup_by_uuid(uuid)
 
-        self._collect_and_send_acks(
-            request_id,
-            sum([ep.graph_edges for ep in self.pending if ep.request_id == request_id], start=[]),
-        )
-        self.pending = [ep for ep in self.pending if ep.request_id != request_id]
+        if retain_readers:
+            self.tensor_store.detach_request(request_id)
+            if reads:
+                wire_request_id = wire_request_id or self.rid_to_str(request_id)
+                for read in reads:
+                    read.request_id = wire_request_id
+                self._retired_reads.append(_RetiredReads(wire_request_id, reads, pending_uuids))
+        else:
+            self._collect_and_send_acks(
+                request_id, [edge for read in reads for edge in read.graph_edges],
+            )
 
     def force_cleanup_request(self, request_id: Rid):
         """Unconditional teardown: drop every tensor for the request and unlink
