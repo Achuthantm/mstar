@@ -1,9 +1,10 @@
 """Teardown barrier (conductor side): the hard RemoveRequest that unlinks a
 segment is sent only after every reader has drained (READS_DONE).
 
-Covers the happy path (defer Remove until the preprocess worker finished
-delivering outputs, and unpersist still-held signals with correct counts) and
-the abort/fail path (drain all workers + preprocess worker, then Remove).
+Covers the happy path (drain the workers, defer Remove until they and the
+preprocess worker have ACKed, and unpersist still-held signals with correct
+counts) and the abort/fail path (drain all workers + preprocess worker, then
+Remove).
 """
 
 import types
@@ -169,16 +170,22 @@ def test_done_completes_client_immediately_but_defers_remove():
     c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
     c._process_request_done("r1")
 
-    # Client told right away; workers assumed done so only the preprocess worker
-    # must ACK — no Remove yet.
+    # Client told right away. Workers are drained (a read may outlive the
+    # graph); the preprocess worker ACKs on its own after delivery.
     completes = [m for e, m in c.sent if e == "api_server"
                  and m.message_type == "request_complete"]
     assert len(completes) == 1
+    assert _drain_targets(c, "r1") == {"w0", "w1"}
     assert _remove_targets(c, "r1") == set()
-    assert c.draining["r1"].expected_acks == {PREPROCESS}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
     assert "r1" in c.requests
 
+    # Output delivery finishing is not enough while a worker may still read.
     c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w0"))
+    assert _remove_targets(c, "r1") == set()
+
+    c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w1"))
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
     assert "r1" not in c.requests
     assert c.admits == 1

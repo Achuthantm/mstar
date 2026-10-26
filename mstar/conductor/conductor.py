@@ -1374,7 +1374,7 @@ class Conductor:
     ):
         """Start the teardown barrier for a request. Applies any READS_DONE that
         raced ahead of registration, and finalizes immediately if already
-        satisfied (e.g. a happy path with no outstanding reader)."""
+        satisfied (every READS_DONE came early)."""
         expected_acks = set(expected_acks) - self._early_reads_done.pop(request_id, set())
         self.draining[request_id] = DrainingRequest(
             expected_acks=expected_acks,
@@ -1548,6 +1548,21 @@ class Conductor:
             return
         self._remove_request(request_id, request_data)
 
+    def _send_drains(self, request_id: str, entities: set[str]):
+        """Send DRAIN_REQUEST ahead of registering the barrier. The drain record
+        is what finishes the teardown (or its TTL does), so a send that raises
+        must not skip it. The sends go first: a barrier whose READS_DONE all
+        came early finalizes on registration, and a DRAIN_REQUEST must not
+        reach a participant after its REMOVE_REQUEST."""
+        for entity in entities:
+            self._send_for_teardown(
+                request_id, entity,
+                WorkerMessage(
+                    message_type=WorkerMessageType.DRAIN_REQUEST,
+                    body=DrainRequest(request_id),
+                ),
+            )
+
     def _remove_request(
         self, request_id: str, request_data: RequestData,
         failure_error: str | None = None,
@@ -1558,19 +1573,7 @@ class Conductor:
         """
         workers = self._request_workers(request_data)
         participants = workers | {self.PREPROCESS_WORKER}
-        # The drain record below is what finishes this teardown (or its TTL
-        # does), so a send that raises must not skip it. The sends go first: a
-        # barrier whose READS_DONE all came early finalizes on registration,
-        # and a DRAIN_REQUEST must not reach a participant after its
-        # REMOVE_REQUEST.
-        for entity in participants:
-            self._send_for_teardown(
-                request_id, entity,
-                WorkerMessage(
-                    message_type=WorkerMessageType.DRAIN_REQUEST,
-                    body=DrainRequest(request_id),
-                ),
-            )
+        self._send_drains(request_id, participants)
         logger.info("Draining request %s (%d participants) before teardown", request_id, len(participants))
         self._register_draining(
             request_id,
@@ -1616,19 +1619,16 @@ class Conductor:
         if still_persisted:
             self._un_persist_tensors(request_id, still_persisted)
 
-        # Workers are done reading (the graph finished); the only remaining
-        # reader is the preprocess worker still delivering outputs. Defer the
-        # hard RemoveRequest until it signals READS_DONE, so a worker output
-        # isn't unlinked under an in-flight read.
-        # NOTE: "workers done reading" assumes a well-behaved graph. A model bug
-        # that emits extra/erroneous tensors could leave a worker read scheduled
-        # past completion, which this path won't wait for. Gating the happy path
-        # on per-worker READS_DONE too (like abort/fail) would handle that
-        # robustly — TODO once the barrier has proven out.
+        # A finished graph does not prove no worker is still reading: an extra
+        # output can leave a read in flight past completion. Drain the
+        # workers as abort/fail does, so the hard RemoveRequest never unlinks a
+        # segment under a read. The preprocess worker needs no DRAIN_REQUEST:
+        # it sends READS_DONE on its own once output delivery finishes.
         workers = self._request_workers(request_data)
+        self._send_drains(request_id, workers)
         self._register_draining(
             request_id,
-            expected_acks={self.PREPROCESS_WORKER},
+            expected_acks=workers | {self.PREPROCESS_WORKER},
             participants=workers | {self.PREPROCESS_WORKER},
         )
 
