@@ -1165,7 +1165,7 @@ class PreprocessWorkerThread:
                 self._begin_drain(body.request_id)
             elif message.message_type == WorkerMessageType.REMOVE_REQUEST:
                 body: RemoveRequest = message.body
-                self._hard_cleanup(body.request_id)
+                self._hard_cleanup(body.request_id, retain_readers=body.retain_readers)
         return did_work
 
     def _send_enable_metrics_if_requested(self) -> None:
@@ -1219,11 +1219,13 @@ class PreprocessWorkerThread:
             ),
         )
 
-    def _hard_cleanup(self, request_id: str) -> None:
-        """Phase-2 teardown: unconditionally drop all tensor state for the rid
-        (unlink the input-signal SHM). Safe now that every reader has drained."""
+    def _hard_cleanup(self, request_id: str, *, retain_readers: bool = False) -> None:
+        """Release request state, retaining exports on successful completion."""
         self._removed(request_id)
-        self.tensor_manager.force_cleanup_request(request_id)
+        if retain_readers:
+            self.tensor_manager.retire_request(request_id, request_id)
+        else:
+            self.tensor_manager.force_cleanup_request(request_id)
         self._drop_request_state(request_id)
 
     def _removed(self, request_id: str) -> None:

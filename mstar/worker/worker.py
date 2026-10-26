@@ -636,11 +636,11 @@ class Worker:
         # _pending_removes: deferred REMOVE_REQUESTs, in the order they were
         #   deferred (a dict for that order: a follower's is rank 0's).
         self._in_flight_rids: set[int] = set()
-        self._pending_removes: dict[int, None] = {}
+        self._pending_removes: dict[int, bool] = {}
 
-        # step seq -> rids rank 0 released after that step, held until this rank
+        # step seq -> removals rank 0 sent after that step, held until this rank
         # has consumed it. See ``_removal_step_reached``.
-        self._removes_awaiting_step: dict[int, list[str]] = {}
+        self._removes_awaiting_step: dict[int, list[RemoveRequest]] = {}
 
         # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
@@ -949,7 +949,7 @@ class Worker:
                 # would park a stamped teardown for good.
                 self._removes_awaiting_step.setdefault(
                     body.after_tp_seq, []
-                ).append(body.request_id)
+                ).append(body)
                 return
             if body.source == MessageSource.TP_RANK_0:
                 # Removals held above came from rank 0 before this one, so the ones
@@ -970,7 +970,7 @@ class Worker:
             and next(iter(self._pending_removes), request_id) != request_id
         )
         if request_id in self._in_flight_rids or behind:
-            self._pending_removes.setdefault(request_id)
+            self._pending_removes.setdefault(request_id, body.retain_readers)
             return
 
         # If we are the TP leader for this request, signal the followers to
@@ -996,21 +996,22 @@ class Worker:
                             # broadcast up to here; followers must do it in the
                             # same gap between steps
                             after_tp_seq=self._tp_broadcast_seq - 1,
+                            retain_readers=body.retain_readers,
                         )
                     )
                 )
 
-        # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
-        # ignoring ref counts / persist. Safe because the conductor only sends
-        # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
-        # on the abort/fail path via a prior DrainRequest, on the happy path
-        # once the api server finished reading the outputs.
+        # Engine teardown keeps rank 0's ordering. Successful tensor teardown
+        # separately retains exported storage until its read ACKs arrive.
         self._mark_removed(body.request_id)
         self.engine_manager.remove_request(request_id)
         if self._stream_buffer_rids:
             self._stream_buffer_rids.discard(request_id)
         self.request_state.remove_request(request_id)
-        self.tensor_manager.force_cleanup_request(request_id)
+        if body.retain_readers:
+            self.tensor_manager.retire_request(request_id, body.request_id)
+        else:
+            self.tensor_manager.force_cleanup_request(request_id)
         self.profile_info.pop_request(request_id)
         self.streaming_buffers.pop(request_id, None)
         self.scheduler.clear_rid(request_id, body.request_id)
@@ -4046,9 +4047,11 @@ class Worker:
             return
         reached = self.scheduler.last_consumed_tp_seq
         for seq in sorted(s for s in self._removes_awaiting_step if s <= reached):
-            for rid in self._removes_awaiting_step.pop(seq):
+            for removal in self._removes_awaiting_step.pop(seq):
                 self._remove_request(RemoveRequest(
-                    request_id=rid, source=MessageSource.SELF,
+                    request_id=removal.request_id,
+                    source=MessageSource.SELF,
+                    retain_readers=removal.retain_readers,
                 ))
 
     def _apply_pending_removes_safe_to_drop(
@@ -4065,6 +4068,7 @@ class Worker:
                 continue
             self._remove_request(RemoveRequest(
                 request_id=self._rid_str(rid), source=MessageSource.SELF,
+                retain_readers=bool(self._pending_removes[rid]),
             ))
             # torn down above, unless its handle was already gone
             self._pending_removes.pop(rid, None)

@@ -41,6 +41,7 @@ def _worker(
     w.cleared = []
     w.failed = set()
     w.forced = []
+    w.retired = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
     w._in_flight_rids = set(in_flight)
     w._pending_drains = set(pending_drains)
@@ -84,6 +85,7 @@ def _worker(
     w.tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
         force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
+        retire_request=lambda rid, wire_rid: w.retired.append((rid, wire_rid)),
     )
     return w
 
@@ -313,6 +315,31 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
     w = _worker(known_rids=(), tp_follow=("X",))
     Worker._remove_request(w, RemoveRequest(request_id="X"))
     assert w.cleared == ["X"]
+
+
+def test_successful_removal_preserves_retention_after_gpu_deferral():
+    w = _worker(in_flight=("X",))
+    w._remove_request(RemoveRequest(request_id="X", retain_readers=True))
+    assert w.retired == [] and w.forced == []
+    w._in_flight_rids.clear()
+    w._apply_pending_removes_safe_to_drop(set())
+    assert w.retired == [("X", "X")]
+    assert w.forced == []
+
+
+def test_successful_removal_preserves_retention_after_tp_step_deferral():
+    w = _worker(is_follower=True)
+    w._removes_awaiting_step = {}
+    w.scheduler.last_consumed_tp_seq = 0
+    w._remove_request(RemoveRequest(
+        request_id="X", source=MessageSource.TP_RANK_0,
+        after_tp_seq=1, retain_readers=True,
+    ))
+    assert w.retired == [] and w.forced == []
+    w.scheduler.last_consumed_tp_seq = 1
+    w._apply_removes_whose_step_landed()
+    assert w.retired == [("X", "X")]
+    assert w.forced == []
 
 
 def test_drain_deferred_behind_inflight_gpu_step():

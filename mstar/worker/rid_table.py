@@ -14,6 +14,10 @@ clear_rid), Worker.{_last_active, _pending_removes, _pending_loop_stops,
 streaming_buffers}, the engine's and tensor manager's per-request state, and
 WorkerProfileInfo.
 
+Successful tensor teardown detaches retained buffers from the handle. They
+remain keyed only by global UUID; unfinished receives retain the wire id for
+their eventual ACK, so neither can attach to a later user of this handle.
+
 MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
 stays keyed by the wire string and is purged by clear_wire_rid.
