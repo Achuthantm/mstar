@@ -4679,9 +4679,9 @@ class Worker:
         # on prev_advance_event (signaled right after advance_seq_lens(N) on
         # the GPU thread, ~tens of µs into replay)
         #
-        # Default ON. Set MSTAR_PRE_PLAN_SPEC=0 to fall back to the
-        # double-buffer-without-pre-plan baseline.
-        pre_plan_spec = os.environ.get("MSTAR_PRE_PLAN_SPEC", "1") == "1"
+        # Default ON; `knobs: {pre_plan: false}` or MSTAR_PRE_PLAN_SPEC=0
+        # falls back to the double-buffer-without-pre-plan baseline.
+        pre_plan_spec = knobs.pre_plan_enabled()
         launch_wait_s = self._launch_wait_s
         plan_executor = None
         if pre_plan_spec:
