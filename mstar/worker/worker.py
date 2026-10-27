@@ -7,7 +7,7 @@ import threading
 import time
 import time as _time
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -2038,10 +2038,12 @@ class Worker:
     def _register_outputs(
         self,
         route_output: RouteOutput,
-    ):
+    ) -> frozenset[int]:
         """Register the tensors the runtime says remote consumers (other
         workers, the api server, the conductor via persist) will read. It has
-        already deduped them by uuid.
+        already deduped them by uuid. A request whose tensors the transfer
+        engine refuses fails alone; returns those rids, so that nothing of
+        theirs is sent.
         """
         # Uuids, not descriptors: registration only ever reads ``uuid`` off
         # them and takes the tensor from the store.
@@ -2053,13 +2055,21 @@ class Worker:
         ):
             per_rid.setdefault(request_id, []).append(uuid)
         if not per_rid:
-            return
+            return frozenset()
         # One staging pass for the batch: the arena collapses what would be one
         # host-blocking D2H stream sync per request into one.
-        self.tensor_manager.register_for_send_uuids(
+        failed = self.tensor_manager.register_for_send_uuids(
             ParallelList(list(per_rid), list(per_rid.values())),
             skip_cuda_sync=True,
         )
+        if not failed:
+            return frozenset()
+        # A follower still runs a failed rid while rank 0 sends it; report once.
+        self._fail_requests({
+            rid: f"Error in worker: {msg}" for rid, msg in failed.items()
+            if rid not in self.scheduler.failed_rids
+        })
+        return frozenset(failed)
 
 
     # ------------------------------------------------------------------
@@ -3485,6 +3495,27 @@ class Worker:
         # pending stops are only needed for one iteration, so can be cleared now
         self._graph_runtime.clear_pending_loop_stops()
 
+        # A rid failed or drained after this step was built is torn down, so
+        # none of its outputs may leave: the step can already be in flight
+        # when the rid fails (the stop check of the step before it, say).
+        # Not on a follower: rank 0 decides what runs there, and may still
+        # send a step that needs this one's loop-back.
+        if (
+            self.scheduler.failed_rids
+            and not self._is_tp_follower_node(batch_N.node_name)
+        ):
+            torn_down = self.scheduler.failed_rids & valid_rids
+            if torn_down:
+                self._drop_failed_rids(batch_N, outputs, torn_down)
+                valid_rids -= torn_down
+                if not valid_rids:
+                    # no outputs leave, but the step's kernels may still be
+                    # running in the capture slot a later step reuses
+                    self._wait_for_step(batch_N)
+                    if self.enable_nvtx:
+                        range_pop(synchronize=False)
+                    return
+
         # An engine can drop rids that were skipped during execution (a
         # submodule's prepare_inputs returned None) from node_batch.request_ids,
         # but it cannot reach the worker-side ScheduledBatch. Reconcile it here so
@@ -3655,7 +3686,7 @@ class Worker:
         if self.enable_nvtx:
             range_pop(synchronize=False)
             range_push("worker.postprocess.register_outputs", synchronize=False)
-        self._register_outputs(route_output)
+        failed_rids = self._register_outputs(route_output)
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("register_outputs")
@@ -3681,7 +3712,7 @@ class Worker:
 
         self._stream_and_send(
             batch_N, rids, stored, route_output, signals,
-            engine, buffered_publish,
+            engine, buffered_publish, failed_rids,
         )
 
         _pp_stage("send_outputs")
@@ -3823,6 +3854,7 @@ class Worker:
     def _stream_and_send(
         self, batch_N: PendingBatch, rids: list[int], stored, route_output, signals,
         engine=None, buffered_publish: set[int] | None = None,
+        failed_rids: frozenset[int] = frozenset(),
     ) -> None:
         # Shared across the per-walk calls, so a rid is not buffered twice.
         buffered_publish = set() if buffered_publish is None else buffered_publish
@@ -3853,7 +3885,10 @@ class Worker:
         # streamed tensor.
         self.tensor_manager.dereference_batch_uniform(streamed)
 
-        send_rids = list(rids)
+        send_rids = (
+            [rid for rid in rids if rid not in failed_rids] if failed_rids
+            else list(rids)
+        )
         # Timed apart from the send: these comprehensions are per rid, and
         # building them is the worker's cost, not the runtime's.
         _t_prep = _time.perf_counter() if self._phase_period else 0.0
@@ -3913,6 +3948,7 @@ class Worker:
                     for rid in info_rids
                 ],
             ),
+            failed_rids=failed_rids,
         )
         _t_send = _time.perf_counter() if self._phase_period else 0.0
         if self._phase_period:
@@ -4276,9 +4312,9 @@ class Worker:
     def _drop_failed_rids(
         self, pending: PendingBatch,
         outputs: dict[int, NameToTensorList],
-        failed_requests: dict[int, str],
+        failed_requests: Collection[int],
     ) -> None:
-        """Excise ``failed_requests`` from a finished batch.
+        """Excise ``failed_requests`` (rids, or a rid -> error map) from a finished batch.
 
         A rid that raised in ``postprocess`` is still carried in the batch (the
         engine only recorded the error), and one that raised in
