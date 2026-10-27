@@ -569,9 +569,12 @@ The spec types are:
        ``SamplingReqConfig`` above.
    * - ``RecurrentStateSpec(config=RecurrentStateConfig(...))``
      - Fixed-size per-request state that carries between steps (an LSTM's ``h`` and
-       ``c``, a cursor, a conv tail): one slot per request, ``blocks`` naming a shape and
-       dtype for each piece, ``num_layers`` copies of each, ``max_slots`` slots with slot 0
-       the sink that padding rows address. ``declare_step`` gives each row a
+       ``c``, a cursor, a conv tail, a Mamba or gated-DeltaNet layer's conv window and SSM
+       state, a streaming encoder's caches): one slot per request and label, ``blocks``
+       naming a shape and dtype for each piece (dtype None: the engine's compute dtype,
+       what its KV caches store), ``num_layers`` copies of each, ``max_slots`` slots
+       (deployment-tunable) with slot 0 the sink that padding rows address. A recurrent
+       kernel reads the step's ``addressing``. ``declare_step`` gives each row a
        ``RecurrentStep`` segment with span >= 1. The forward reads its rows with
        ``pool.gather(name, start=...)`` and writes them back with
        ``pool.scatter_(name, value)``; both follow the step's plan, so there is no
@@ -866,7 +869,9 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 ``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
 ``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
 ``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
-compute in it.
+compute in it. Nemotron VoiceChat's streaming encoder (``ENCODER_KV``,
+``encoder_kv_config`` in ``mstar/model/nemotron_duplex/components/conformer.py``) is the
+per-query example.
 
 Step 3 — Declare the computation graph
 --------------------------------------
