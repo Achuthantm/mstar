@@ -1165,19 +1165,34 @@ class Worker:
 
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
-        # Handle producer_done signal: mark all StreamBuffers for this request as done
-        if body.producer_done:
-            if req_info:
-                for edge_name, sbuf in req_info.stream_buffers.items():
-                    if sbuf.from_partition in body.producer_done:
-                        # If we have multiple consumer partitions colocated, we need to signal
-                        # the right one
-                        sbuf.signal_done(body.producer_done_items.get(edge_name, 0))
+        # Handle producer_done signal: end the producer's streams it counts.
+        # The conductor (its only sender) counts every edge it ends, with 0
+        # items too, so a producer partition's end names each of its edges into
+        # this consumer, and a client's names only the streams the client ended.
+        if body.producer_done and req_info:
+            counts = body.producer_done_items
+            for edge_name, sbuf in req_info.stream_buffers.items():
+                if sbuf.from_partition in body.producer_done and edge_name in counts:
+                    sbuf.signal_done(counts[edge_name])
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
         non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
-        streaming_with_tensors = [edge for edge in body.inputs if edge.is_streaming and edge.tensor_info]
+        buffers = req_info.stream_buffers if req_info else {}
+        streaming_with_tensors = []
+        unbuffered = []
+        for edge in body.inputs:
+            if edge.is_streaming and edge.tensor_info:
+                (streaming_with_tensors if edge.name in buffers else unbuffered).append(edge)
+        if unbuffered:
+            # Nothing here will consume it: ack it unread so the producer frees
+            # it. Expected when the request's ingest failed on this worker.
+            if request_id not in self.scheduler.failed_rids:
+                logger.warning(
+                    "Worker %s: no stream buffer for %s of request %s; dropping it",
+                    self.worker_id, [edge.name for edge in unbuffered], body.request_id,
+                )
+            self.tensor_manager.ack_unread_tensors(body.request_id, unbuffered)
 
         # Only update fwd_info when there are non-streaming edges (i.e., this is
         # a conductor-triggered forward pass, not just streaming data from another
