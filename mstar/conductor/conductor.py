@@ -23,6 +23,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     CurrentForwardPassInfo,
@@ -40,7 +41,7 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
-from mstar.platforms import apply_process_env_defaults
+from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.streaming.topology import CLIENT
@@ -253,11 +254,14 @@ def _worker_process_target(
     tensor_comm_protocol=CommProtocol.RDMA,
     tcp_transfer_device="",
     status_interval_s: float | None = None,
+    env: dict[str, str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics."""
-    # before anything in this process touches the device runtime
+    # before anything in this process touches the device runtime; the MPS pipe
+    # directory in ``env`` decides whether this process becomes an MPS client
     apply_process_env_defaults()
+    os.environ.update(env or {})
     # SIGTERM (the conductor's p.terminate()) defaults to immediate death:
     # no unwinding, no atexit, no finalizers — so a worker's shared-memory
     # segments were never unlinked and leaked into /dev/shm for the life of
@@ -500,6 +504,12 @@ class Conductor:
             int(rank): int(index)
             for rank, index in (self.model_config.get("rank_devices") or {}).items()
         }
+        # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
+        # conductor owns, so workers sharing a GPU overlap their kernels instead
+        # of time-slicing. validate_deployment checked the value.
+        self._mps_requested = self.model_config.get("mps", False)
+        self._mps: MpsDaemon | None = None
+
         self.default_sharding_config = deployment.sharding_config
         # The conductor is the only process that sees every worker graph, so it
         # owns the numbering. Workers receive their graphs (and these ids) at
@@ -759,6 +769,13 @@ class Conductor:
 
             _cuda_op_available()
         ctx = mp.get_context("spawn")
+        atexit.register(self.shutdown)
+        if self._mps_requested:
+            # a host check, not a config one: shipped configs validate on any machine
+            if not current_platform.is_cuda():
+                raise ValueError(f"mps: true needs an NVIDIA GPU, not {current_platform!r}")
+            self._mps = MpsDaemon()
+            self._mps.start()
         for rank, worker_id in zip(self._sorted_ranks, self.worker_ids, strict=True):
             p = ctx.Process(
                 target=_worker_process_target,
@@ -783,16 +800,22 @@ class Conductor:
                     "tensor_comm_protocol": self.tensor_comm_protocol,
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
+                    "env": self._mps.client_env if self._mps is not None else None,
                 },
                 daemon=False,
             )
             p.start()
             self._worker_processes.append(p)
 
-        atexit.register(self.shutdown)
-
     def shutdown(self):
-        """Terminate and join all worker processes."""
+        """Terminate and join all worker processes, then stop the MPS daemon if any."""
+        try:
+            self._stop_workers()
+        finally:
+            if self._mps is not None:
+                self._mps.stop()
+
+    def _stop_workers(self):
         if not self._worker_processes:
             return  # already done (run()'s caller and the atexit hook both call this)
         logger.info("Shutting down conductor...")
