@@ -4250,6 +4250,8 @@ class Worker:
         """Queue a non-blocking copy of each device tensor in ``buffers`` into
         a pinned buffer of ``purpose``; anything else passes through."""
         host: dict[str, torch.Tensor] = {}
+        # a tensor under two names is copied once
+        landed: dict[int, torch.Tensor] = {}
         for index, (name, tensor) in enumerate(buffers.items()):
             if not (
                 torch.is_tensor(tensor)
@@ -4258,11 +4260,14 @@ class Worker:
             ):
                 host[name] = tensor
                 continue
+            if id(tensor) in landed:
+                host[name] = landed[id(tensor)]
+                continue
             buf = self._get_pinned_d2h_buffer(
                 purpose, tensor.shape, tensor.dtype, index,
             )
             buf.copy_(tensor, non_blocking=True)
-            host[name] = buf
+            host[name] = landed[id(tensor)] = buf
         return host
 
     @staticmethod
@@ -4328,6 +4333,8 @@ class Worker:
         reused by the next step.
         """
         host: dict[str, torch.Tensor] = {}
+        # a tensor under two names is copied once
+        landed: dict[int, torch.Tensor] = {}
         with side:
             for index, (name, tensor) in enumerate(buffers.items()):
                 if not (
@@ -4336,11 +4343,14 @@ class Worker:
                 ):
                     host[name] = tensor
                     continue
+                if id(tensor) in landed:
+                    host[name] = landed[id(tensor)]
+                    continue
                 buf = self._get_pinned_d2h_buffer(
                     "check_stop_batched", tensor.shape, tensor.dtype, index,
                 )
                 buf.copy_(tensor, non_blocking=True)
-                host[name] = buf
+                host[name] = landed[id(tensor)] = buf
         side.synchronize()
         return host
 
