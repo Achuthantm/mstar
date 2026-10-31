@@ -278,6 +278,23 @@ def test_drain_waits_for_inflight_reads_then_acks():
     assert len(_reads_done(w)) == 1
 
 
+def test_worker_pass_does_not_rescan_acknowledged_drains():
+    w = _worker(draining=("X",), reads_done=("X",))
+
+    def unexpected_scan(rid):
+        pytest.fail(f"ACKed drain {rid} was scanned again")
+
+    w._complete_drain_if_ready = unexpected_scan
+    Worker._apply_pending_drains(w, set())
+
+    # An unfinished read on a different request does not rescan X either.
+    w._draining_rids.add("Y")
+    scanned = []
+    w._complete_drain_if_ready = scanned.append
+    Worker._apply_pending_drains(w, set())
+    assert scanned == ["Y"]
+
+
 def test_drain_waits_for_committed_tp_follow_batches():
     """A queued TP-follow batch (leader already sent the ZMQ) must drain before
     READS_DONE, or REMOVE tears the worker-graph queues out from under it."""

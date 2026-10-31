@@ -44,4 +44,21 @@ The fixed cost dominates small tensors and the bandwidth large ones, so the fit 
 
 ## Related
 
+`python -m benchmark.transport.request_cleanup --workers 2 --concurrency 1 32 64
+--json /tmp/cleanup.json` measures the CPU cost of successful request teardown,
+including the conductor and worker handlers and their actual ZMQ exchange.
+Workers have no GPU resources or pending reads, and the API delivery ACK is
+local: this isolates the normal-case drain cost, not end-to-end serving
+performance. Run the same script against each checkout using `PYTHONPATH` for
+adjacent A/B measurements; `MSTAR_RUST_ZMQ` selects the control transport.
+`--other-reads 64` adds synthetic pending read records for a different request
+to measure scanning overhead while the completing requests have no reads.
+The [GPU validation runbook](request_cleanup_gpu.md) and
+`request_cleanup_gpu.py` prepare the serving A/B for later execution.
+
 The `*-pool` copy and zero-copy modes and the GPU-resident buffers follow a cross-node Mooncake throughput test that runs between two nodes in copy, zero-copy and GPUDirect modes. This tool adds per-size latency fitting, the inline crossover and control-channel interference for M\*'s own paths.
+
+For an agent-operated two-A40 rental, use [a40/AGENT.md](a40/AGENT.md),
+[a40/setup.sh](a40/setup.sh), and [a40/run.py](a40/run.py). The orchestrator
+uses the existing clients and server lifecycle helper and records each repeated
+base/fix run separately. Real A40 execution is pending.

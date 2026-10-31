@@ -78,3 +78,13 @@ Execution flow (simplified)
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
+
+Successful completion notifies the client immediately, then drains every worker before
+removing request state. A worker blocks new reads and sends ``READS_DONE`` after its
+in-flight work and tensor reads finish. The API data worker sends its own ``READS_DONE``
+after delivering all expected output chunks; it receives no success-path drain that
+could cut delivery short. The conductor waits for every participant before sending
+``REMOVE_REQUEST`` to free tensor storage. Abort and failure use the same barrier,
+including an explicit drain of the API data worker.
+The existing drain deadline can still force teardown if an ACK never arrives;
+that failure escape hatch does not establish that a stalled reader stopped.

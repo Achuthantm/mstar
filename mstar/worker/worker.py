@@ -618,7 +618,7 @@ class Worker:
         # has consumed it. See ``_removal_step_reached``.
         self._removes_awaiting_step: dict[int, list[str]] = {}
 
-        # Teardown drain (abort/fail): _pending_drains hold DrainRequests deferred
+        # Teardown drain: _pending_drains hold DrainRequests deferred
         # behind an in-flight GPU step; _draining_rids have stopped reading and
         # persist until REMOVE_REQUEST (so no read can restart after READS_DONE);
         # _reads_done_sent tracks which have already ACKed. These three are keyed
@@ -998,10 +998,8 @@ class Worker:
                 )
 
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
-        # ignoring ref counts / persist. Safe because the conductor only sends
-        # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
-        # on the abort/fail path via a prior DrainRequest, on the happy path
-        # once the api server finished reading the outputs.
+        # ignoring ref counts / persist. The conductor waits for every reader's
+        # READS_DONE first, including the API worker's output-delivery ACK.
         self._mark_removed(body.request_id)
         freed = self.engine_manager.remove_request(request_id)
         if freed:
@@ -1024,7 +1022,7 @@ class Worker:
         self._graph_runtime.remove_request(request_id)
 
     def _drain_request(self, body: DrainRequest) -> None:
-        """Phase-1 teardown (abort/fail): stop scheduling and reading this rid,
+        """Phase-1 teardown: stop scheduling and reading this rid,
         then ACK READS_DONE once its in-flight reads finish. The hard cleanup
         (force_cleanup_request) waits for the conductor's REMOVE_REQUEST, sent
         only after every reader has ACKed."""
@@ -1117,8 +1115,11 @@ class Worker:
         ]:
             self._pending_drains.discard(rid)
             self._begin_drain(rid)
-        for rid in list(self._draining_rids):
-            self._complete_drain_if_ready(rid)
+        # Only removal discards from either set, and ACKed rids stay draining
+        # to block new reads. Avoid scanning them again on every worker pass.
+        if len(self._draining_rids) != len(self._reads_done_sent):
+            for rid in self._draining_rids - self._reads_done_sent:
+                self._complete_drain_if_ready(rid)
 
     def _handle_tensor_received(self, body: TensorReceived) -> None:
         """Sender-side cleanup: receiver confirmed RDMA read, free source buffers."""
