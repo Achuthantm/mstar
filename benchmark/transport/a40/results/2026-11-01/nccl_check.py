@@ -1,7 +1,9 @@
 import os
 from datetime import timedelta
+
 import torch
 import torch.distributed as dist
+
 rank=int(os.environ['LOCAL_RANK'])
 torch.cuda.set_device(rank)
 dist.init_process_group('nccl', timeout=timedelta(seconds=30), device_id=torch.device('cuda',rank))

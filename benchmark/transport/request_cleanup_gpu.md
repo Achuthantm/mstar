@@ -41,6 +41,11 @@ close to the variation between the two baseline runs.
 
 ## Sensitive normal case: Qwen3.5 0.8B
 
+**Hardware gate:** the pinned FlashInfer GDN prefill path does not support
+Ampere (including A40 and A100). An A40 baseline startup failed before any
+serving measurements. Run this Qwen test only on a supported GPU/backend;
+the A40-specific runner excludes it and leaves this gate unverified.
+
 From the selected arm's worktree, terminal 1 (activate the same environment in
 both terminals). Give every server instance a new absolute results directory.
 

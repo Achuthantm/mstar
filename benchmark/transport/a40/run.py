@@ -13,7 +13,7 @@ from pathlib import Path
 BASE = '3e98682a8fff4b506136a53541d868b3ceb804eb'
 # name, model, config, GPUs, TP async, protocol
 SCENARIOS = {
-    'qwen': ('qwen3_5_0.8b', 'qwen3_5_0.8b.yaml', '0', '0', 'SHM'),
+    'colocated': ('orpheus', 'orpheus_colocated.yaml', '0', '0', 'SHM'),
     'streaming': ('orpheus', 'orpheus_pd_disaggregated.yaml', '0,1', '0', 'SHM'),
     'tp-sync': ('orpheus', 'orpheus_tp2.yaml', '0,1', '0', 'SHM'),
     'tp-async': ('orpheus', 'orpheus_tp2.yaml', '0,1', '1', 'SHM'),
@@ -49,7 +49,7 @@ def commands(checkout, fix, case, scenario, port, concurrency):
         client = [sys.executable, str(fix / 'benchmark/transport/request_cleanup_gpu.py'),
                   '--checkout', str(checkout), '--out', str(case / 'clients'),
                   '--url', f'http://127.0.0.1:{port}',
-                  '--model', 'qwen' if scenario == 'qwen' else 'orpheus',
+                  '--model', 'orpheus',
                   '--concurrency', *map(str, concurrency)]
     return server, client
 
@@ -134,12 +134,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True, help='setup.sh output directory')
     parser.add_argument('--out', type=Path, required=True, help='new results directory')
-    parser.add_argument('--suite', nargs='+', choices=['all', *SCENARIOS], default=['all'])
+    parser.add_argument('--suite', nargs='+', choices=['all', 'qwen', *SCENARIOS], default=['all'])
     parser.add_argument('--concurrency', type=int, nargs='+', default=[1, 32, 64])
     parser.add_argument('--runtime', choices=['rust', 'python'], default='rust')
     parser.add_argument('--port', type=int, default=8100)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)
+    if 'qwen' in args.suite:
+        parser.error('Qwen3.5 GDN prefill is unavailable on A40 with the pinned FlashInfer; '
+                     'use --suite colocated for Orpheus, and keep Qwen validation blocked')
     if min(args.concurrency) < 1:
         parser.error('concurrency must be positive')
     root, out = args.root.resolve(), args.out.resolve()

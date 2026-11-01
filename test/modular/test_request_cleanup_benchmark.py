@@ -83,7 +83,7 @@ def test_uncommitted_checkout_is_refused_before_starting_clients(tmp_path, monke
         sweep.main(["--out", str(tmp_path / "later")])
 
 
-@pytest.mark.parametrize('suite, count', [('qwen', 4), ('streaming', 4), ('tp-async', 4), ('tcp', 2), ('all', 18)])
+@pytest.mark.parametrize('suite, count', [('colocated', 4), ('streaming', 4), ('tp-async', 4), ('tcp', 2), ('all', 18)])
 def test_a40_schedule_dry_run_is_read_only(tmp_path, monkeypatch, capsys, suite, count):
     from benchmark.transport.a40 import run
 
@@ -103,8 +103,8 @@ def test_a40_commands_use_each_arms_config_and_separate_tcp_smoke(tmp_path):
     from benchmark.transport.a40.run import commands
 
     base, fix, case = [tmp_path / name for name in ('base', 'fix', 'case')]
-    server, client = commands(base, fix, case, 'qwen', 8100, [1, 32, 64])
-    assert str(base / 'configs/qwen3_5_0.8b.yaml') in server
+    server, client = commands(base, fix, case, 'colocated', 8100, [1, 32, 64])
+    assert str(base / 'configs/orpheus_colocated.yaml') in server
     assert str(fix / 'benchmark/transport/request_cleanup_gpu.py') in client
     assert client[client.index('--checkout') + 1] == str(base)
     server, client = commands(base, fix, case, 'tcp', 8100, [1, 32, 64])
@@ -126,7 +126,7 @@ def test_a40_startup_failure_still_stops_owned_server(tmp_path, monkeypatch):
     monkeypatch.setattr(run.subprocess, 'run', execute)
     with pytest.raises(RuntimeError, match='startup failed'):
         run.run_case(tmp_path, tmp_path / 'base', tmp_path / 'fix', tmp_path / 'case',
-                     'qwen', 8100, [1], 'rust')
+                     'colocated', 8100, [1], 'rust')
     assert [command[2] for command in calls] == ['start', 'stop']
 
 
@@ -134,9 +134,9 @@ def test_a40_comparison_preserves_repeated_measurements(tmp_path):
     from benchmark.transport.a40.run import summarize
 
     for index, arm in enumerate(('base', 'fix', 'fix', 'base'), 1):
-        case = tmp_path / 'qwen' / f'{index}-{arm}'
+        case = tmp_path / 'colocated' / f'{index}-{arm}'
         (case / 'clients').mkdir(parents=True)
-        (case / 'metadata.json').write_text(json.dumps({'scenario': 'qwen'}))
+        (case / 'metadata.json').write_text(json.dumps({'scenario': 'colocated'}))
         (case / 'clients/summary.json').write_text(json.dumps([
             {'case': 'c64-tokens16', 'request_throughput': 10.0 + index,
              'jct_median_ms': 20.0, 'aggregate': {'total_text_tokens': 1024}},
@@ -189,3 +189,31 @@ def test_a40_tcp_client_and_monitor_cleanup(tmp_path, monkeypatch, fail_client):
                      'tcp', 8100, [1, 32, 64], 'rust')
     assert calls == ['start', 'client', 'terminate-monitor', 'reap-monitor', 'stop']
     assert (tmp_path / 'case/PASS').exists() is not fail_client
+
+
+def test_a40_qwen_is_refused_before_any_gpu_probe_or_server_start(tmp_path, monkeypatch, capsys):
+    from benchmark.transport.a40 import run
+
+    def forbidden(*args, **kwargs):
+        pytest.fail('unsupported Qwen run started a subprocess')
+
+    monkeypatch.setattr(run.subprocess, 'run', forbidden)
+    monkeypatch.setattr(run.subprocess, 'check_output', forbidden)
+    out = tmp_path / 'results'
+    with pytest.raises(SystemExit) as exc:
+        run.main(['--root', str(tmp_path), '--out', str(out), '--suite', 'qwen'])
+    assert exc.value.code == 2
+    assert 'GDN prefill is unavailable on A40' in capsys.readouterr().err
+    assert not out.exists()
+
+
+def test_a40_default_schedule_uses_only_orpheus_and_keeps_qwen_blocked(tmp_path, capsys):
+    from benchmark.transport.a40 import run
+
+    run.main(['--root', str(tmp_path), '--out', str(tmp_path / 'out'), '--dry-run'])
+    output = capsys.readouterr().out
+    assert 'qwen3_5' not in output
+    assert output.count('--tensor-comm-protocol') == 18
+    assert 'orpheus_colocated.yaml' in output
+    assert 'orpheus_pd_disaggregated.yaml' in output
+    assert 'orpheus_tp2.yaml' in output

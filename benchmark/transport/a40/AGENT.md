@@ -2,7 +2,17 @@
 
 Task: validate request cleanup correctness and normal-case serving overhead. Do
 not claim completion from the CPU microbenchmark alone. The GPU runs have not
-been executed on the development Mac.
+been executed on the development Mac. An external A40 baseline startup reported
+Qwen3.5 failing with `GDN prefill DSL kernel is unavailable`; it produced no
+serving measurements. Preserve those logs and verify GPU/port cleanup.
+
+The pinned FlashInfer GDN prefill dispatch has no A40/Ampere implementation.
+Qwen3.5 is excluded from this A40 suite; `--suite qwen` now fails before startup.
+Do not disable capture, change kernels/dependencies, or patch the model to make
+this run proceed. A100 is also Ampere and does not resolve this limitation.
+Qwen3.5 validation needs a separately supported device/build (for example, an
+H100 with its SM90 backend installed). This is an outstanding validation gate.
+See the [pinned kernel dispatch](https://github.com/flashinfer-ai/flashinfer/blob/v0.7.2/flashinfer/gdn_prefill.py).
 
 ## Repository and notification boundary
 
@@ -62,7 +72,7 @@ these checkpoints before timing (this may require accepting their model terms):
 ```bash
 python - <<'PY'
 from huggingface_hub import snapshot_download
-for repo in ('Qwen/Qwen3.5-0.8B', 'canopylabs/orpheus-3b-0.1-pretrained', 'hubertsiuzdak/snac_24khz'):
+for repo in ('canopylabs/orpheus-3b-0.1-pretrained', 'canopylabs/orpheus-3b-0.1-ft', 'hubertsiuzdak/snac_24khz'):
     snapshot_download(repo)
 PY
 ```
@@ -70,6 +80,25 @@ PY
 The clients load their datasets and the server config's startup inputs on demand.
 The five warmup waves per cell must absorb compilation/dataset cold starts.
 Check both arms become stable; repeat if there is a first-run trend.
+
+## Updating a rental that already tried Qwen
+
+After the agent finishes cleanup and confirms the prior server is stopped, keep
+all failed-run logs. In the **clean detached fix worktree**, fetch this branch
+from the fork and advance only that worktree. Do not rerun setup or delete the
+environment, baseline or results:
+
+```bash
+git -C "$ROOT/fix" status --short
+git -C "$ROOT/fix" fetch origin request-cleanup-a40
+git -C "$ROOT/fix" switch --detach FETCH_HEAD
+git -C "$ROOT/fix" rev-parse HEAD > "$ROOT/fix.sha"
+```
+
+Stop and inspect any local edits before switching; do not reset/discard them.
+The update changes benchmark tooling/instructions, not production or Rust code.
+Keep the same installed environment. Use new output directories for the revised
+suite and record the new fix commit. Preserve the failed Qwen result separately.
 
 ## Check before spending time on the full suite
 
@@ -91,19 +120,23 @@ failures. Do not modify either committed worktree during measurements.
 ## Execute serial A/B runs
 
 Use tmux so an SSH interruption does not terminate a long run. Run one suite at
-a time on otherwise idle GPUs. Start with Qwen; inspect logs before proceeding.
+a time on otherwise idle GPUs. Start with colocated Orpheus; inspect logs before
+proceeding. Orpheus uses the existing Llama attention path, without GDN. Its
+A40 CUDA execution still has to be checked; this handoff is not a passing run.
 All commands below are from `$ROOT/fix`, with the venv active.
 
 ```bash
-python -m benchmark.transport.a40.run --root "$ROOT" --out "$ROOT/results/qwen-1" --suite qwen
+python -m benchmark.transport.a40.run --root "$ROOT" --out "$ROOT/results/colocated-1" --suite colocated
 python -m benchmark.transport.a40.run --root "$ROOT" --out "$ROOT/results/audio-1" --suite streaming
 python -m benchmark.transport.a40.run --root "$ROOT" --out "$ROOT/results/tp-1" --suite tp-sync tp-async
 python -m benchmark.transport.a40.run --root "$ROOT" --out "$ROOT/results/tcp-1" --suite tcp
 ```
 
 Alternatively, `--suite all` runs all five scenarios. Each timing scenario uses
-fresh servers in base/fix/fix/base order with concurrency 1/32/64; Qwen requests
-16 and 512 output tokens. TCP runs just two requests on each arm and is untimed.
+fresh servers in base/fix/fix/base order with concurrency 1/32/64. Colocated
+Orpheus is additional single-GPU evidence, not a substitute for the missing
+Qwen3.5 0.8B short/long text test. Do not force EOS or decode lengths for speech.
+TCP runs just two requests on each arm and is untimed.
 The runner uses the existing server.sh lifecycle helper, health/port ownership
 checks, a 60-minute startup timeout, and stop in a finally block. Ctrl-C/TERM
 enters cleanup. SIGKILL cannot run cleanup: inspect the saved server-state and
