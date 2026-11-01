@@ -1,0 +1,3 @@
+{"concurrency": 1, "wall_us": 518.2594759389758, "conductor_cpu_us": 397.7554999998745, "worker_cpu_us": 449.594500000039}
+{"concurrency": 32, "wall_us": 79.73689207574353, "conductor_cpu_us": 110.6925156249966, "worker_cpu_us": 140.369187499996}
+{"concurrency": 64, "wall_us": 68.21289753133897, "conductor_cpu_us": 95.19564843749745, "worker_cpu_us": 129.91179687499994}

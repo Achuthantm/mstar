@@ -1,0 +1,50 @@
+{
+  "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+  "cpu": "x86_64",
+  "mesh": "ZMQCommunicator",
+  "codec": "WireCodec",
+  "workers": 2,
+  "waves": 200,
+  "other_reads": 0,
+  "drain_poll_us": {
+    "0": 0.25714960182085633,
+    "32": 2.5655776262283325,
+    "64": 4.868075566392549,
+    "1024": 77.54314597696066
+  },
+  "loadavg": [
+    9.86181640625,
+    7.9599609375,
+    8.64404296875
+  ],
+  "results": [
+    {
+      "concurrency": 1,
+      "wall_us": 518.2594759389758,
+      "conductor_cpu_us": 397.7554999998745,
+      "worker_cpu_us": 449.594500000039
+    },
+    {
+      "concurrency": 32,
+      "wall_us": 79.73689207574353,
+      "conductor_cpu_us": 110.6925156249966,
+      "worker_cpu_us": 140.369187499996
+    },
+    {
+      "concurrency": 64,
+      "wall_us": 68.21289753133897,
+      "conductor_cpu_us": 95.19564843749745,
+      "worker_cpu_us": 129.91179687499994
+    }
+  ],
+  "sources": {
+    "Conductor": {
+      "path": "/workspace/cleanup-bench/base/mstar/conductor/conductor.py",
+      "sha256": "9c5b4cd1c9a9ea74dfc0524ca72012d2f2a3ed0823f3a97ee1066c213e1bc3a6"
+    },
+    "Worker": {
+      "path": "/workspace/cleanup-bench/base/mstar/worker/worker.py",
+      "sha256": "4cdafb7a96aef59b00cd859b8524dac08acbe6860522b7a9a7d9d79f1486b8cd"
+    }
+  }
+}
