@@ -15,6 +15,9 @@ to end GPU spending. This is evidence for further development, not full acceptan
 The inherited forced-drain timeout remains a safety limit; these tests do not
 prove safety for an indefinitely stalled transfer. No cross-host/RDMA claim.
 
+The later [CPU review](CPU_REVIEW.md) extracts the archived CPU phase timings
+and records subsequent CPU validation separately from these GPU measurements.
+
 ## Environment and method
 
 Two A40 GPUs, CUDA toolkit 12.8, driver 595.91.07, PyTorch 2.10.0+cu128,
