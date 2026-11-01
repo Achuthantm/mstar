@@ -101,7 +101,6 @@ def _worker(entity_id, manager, rid_table):
     w._reads_done_sent = set()
     w._removed_rids = RecentSet(16)
     w._unprocessed_messages = {}
-    w._last_active = {}
     w.streaming_buffers = {}
     w.communicator = manager.communicator
     w.tensor_manager = manager
@@ -110,7 +109,7 @@ def _worker(entity_id, manager, rid_table):
         get_sharding_config=lambda handle: SimpleNamespace(groups=[]),
         remove_request=rid_table.release,
     )
-    w.engine_manager = SimpleNamespace(remove_request=lambda handle: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(remove_request=lambda handle: None)
     w.request_state = SimpleNamespace(remove_request=lambda handle: None)
     w.streams = StreamBufferManager(w.request_state, manager, [])
     w.profile_info = SimpleNamespace(pop_request=lambda handle: None)
@@ -202,15 +201,6 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             if entity in drains:
                 workers[entity]._drain_request(drains[entity])
 
-        # Once draining, a late descriptor must not start another read, even
-        # if this worker already ACKed. The real handler rejects it up front.
-        if "w1" in drains:
-            pending = list(receiver.pending)
-            workers["w1"]._process_new_inputs(InputSignals(
-                request_id="request", inputs=[edge], request_info=None,
-            ))
-            assert receiver.pending == pending
-
         def deliver_reads_done():
             for manager in managers.values():
                 for _, msg in manager.communicator.sent:
@@ -232,6 +222,16 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             assert receiver.get_ready_tensors()
             workers["w1"]._apply_pending_drains(set())
             deliver_reads_done()
+
+        # Until READS_DONE, a committed TP step may still need a late input.
+        # After the ACK, the real handler must not start any additional read.
+        if "w1" in drains:
+            assert "request" in workers["w1"]._reads_done_sent
+            pending = list(receiver.pending)
+            workers["w1"]._process_new_inputs(InputSignals(
+                request_id="request", inputs=[edge], request_info=None,
+            ))
+            assert receiver.pending == pending
 
         removals = {
             entity: msg.body for entity, msg in c.communicator.sent

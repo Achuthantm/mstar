@@ -39,3 +39,14 @@ and TP CUDA execution still need to be checked on the rental. CPU-only test
 passes and dry runs cannot substitute for those checks. The inherited drain
 expiry can force removal without every ACK; safety for a reader that remains
 active after that deadline is not established by this change.
+
+## Main refresh
+
+The branch was merged with `3e98682a8fff4b506136a53541d868b3ceb804eb`.
+Clean main still fails eight late-read regression cases and passes four normal
+cases. With the cleanup fix, 758 focused worker/scheduler/native tests passed
+and 109 skipped after rebuilding the Rust extension. The late-input assertion
+now checks the READS_DONE boundary, preserving main's newer TP input handling.
+Benchmark baseline pins were advanced to this main commit. Earlier performance
+measurements against the old baseline are historical, not evidence for the
+merged version. GPU serving validation still needs to be run.

@@ -5,7 +5,7 @@ REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 ROOT=${1:?Usage: bash setup.sh /workspace/cleanup-bench}
 mkdir -p "$ROOT"
 ROOT=$(realpath "$ROOT")
-BASE=9f84f18cd7e1b4f3851d0bde85b8da45cabec06f
+BASE=3e98682a8fff4b506136a53541d868b3ceb804eb
 FIX=$(git -C "$REPO" rev-parse HEAD)
 for tool in uv rustup nvcc nvidia-smi ss setsid curl cmake pkg-config; do
     command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 1; }

@@ -66,7 +66,6 @@ def _worker_loop(worker_id, prefix, other_reads):
     w._reads_done_sent = set()
     w._removed_rids = RecentSet(1024)
     w._unprocessed_messages = {}
-    w._last_active = {}
     w.streaming_buffers = {}
     w._graph_runtime = SimpleNamespace(
         get_rid_handle=rids.handle, get_rid_string=rids.name,
@@ -93,7 +92,7 @@ def _worker_loop(worker_id, prefix, other_reads):
             FutureAndPointers(future=Future(), graph_edges=[], request_id=other)
             for _ in range(other_reads)
         ]
-    w.engine_manager = SimpleNamespace(remove_request=lambda rid: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(remove_request=lambda rid: None)
     w.request_state = SimpleNamespace(remove_request=lambda rid: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)

@@ -80,8 +80,8 @@ Execution flow (simplified)
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
 
 Successful completion notifies the client immediately, then drains every worker before
-removing request state. A worker blocks new reads and sends ``READS_DONE`` after its
-in-flight work and tensor reads finish. The API data worker sends its own ``READS_DONE``
+removing request state. A worker stops scheduling new work and sends ``READS_DONE``
+after its in-flight work and tensor reads finish; no read starts after that ACK. The API data worker sends its own ``READS_DONE``
 after delivering all expected output chunks; it receives no success-path drain that
 could cut delivery short. The conductor waits for every participant before sending
 ``REMOVE_REQUEST`` to free tensor storage. Abort and failure use the same barrier,

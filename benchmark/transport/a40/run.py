@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-BASE = '9f84f18cd7e1b4f3851d0bde85b8da45cabec06f'
+BASE = '3e98682a8fff4b506136a53541d868b3ceb804eb'
 # name, model, config, GPUs, TP async, protocol
 SCENARIOS = {
     'qwen': ('qwen3_5_0.8b', 'qwen3_5_0.8b.yaml', '0', '0', 'SHM'),

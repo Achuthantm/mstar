@@ -22,12 +22,12 @@ validation bundle includes `.ci-results/issue244.patch`. Copy that patch to
 the GPU host, apply it to this base, then review and commit it there:
 
 ```bash
-git switch -c fix-244-gpu 9f84f18cd7e1b4f3851d0bde85b8da45cabec06f
+git switch -c fix-244-gpu 3e98682a8fff4b506136a53541d868b3ceb804eb
 git apply /path/to/issue244.patch
 ```
 
 ```bash
-BASE=9f84f18cd7e1b4f3851d0bde85b8da45cabec06f
+BASE=3e98682a8fff4b506136a53541d868b3ceb804eb
 FIX=FIX_COMMIT
 git worktree add --detach ../mstar-244-base "$BASE"
 git worktree add --detach ../mstar-244-fix "$FIX"
