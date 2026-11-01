@@ -1,0 +1,200 @@
+{
+  "scope": "Seven completed runs; excludes intentionally cancelled baseline async. Log records prove cleanup methods reached their final log, not allocator emptiness. Client IDs are ordinal and cannot be joined to server UUIDs; server sets are matched exactly and their sizes checked against measured plus warmup counts.",
+  "phase_selection": "Longest consecutive worker_1 run with bs 60..64; includes warmup. Means weighted by sample count; spans not added together. Worker_0 has no comparable sustained bs 60..64 segment.",
+  "rows": [
+    {
+      "case": "raw/main/streaming/1-base",
+      "commit": "3e98682a8fff4b506136a53541d868b3ceb804eb",
+      "server_log_sha256": "ad06e3bf5a51e22981a16cc8296c72e3ff2c3f6400f5d1ace52fa170256294c9",
+      "measured_requests": 128,
+      "requests_including_warmup": 256,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 2,
+      "worker_1_steady_batch": {
+        "iterations": [
+          20,
+          380
+        ],
+        "records": 37,
+        "batch_mean": 63.58378378378378,
+        "batch_range": [
+          61.7,
+          64.0
+        ],
+        "phases": {
+          "iter_total": {
+            "mean_ms": 30.25621621621622,
+            "samples": 370
+          },
+          "worker.main.process_messages.cpu": {
+            "mean_ms": 1.7042972972972974,
+            "samples": 370
+          },
+          "worker.main.teardown.cpu": {
+            "mean_ms": 0.009567567567567568,
+            "samples": 370
+          },
+          "worker.postprocess.event_sync": {
+            "mean_ms": 0.1904054054054055,
+            "samples": 370
+          }
+        }
+      },
+      "audio_duration_mean_s": 4.481333333333334
+    },
+    {
+      "case": "raw/main/streaming/2-fix",
+      "commit": "eabb5f568529cad51058379691cf1a43e74915f0",
+      "server_log_sha256": "85da673bc77eafc5b8acbd2a2bc0077c9c7e39fb94f1025335e4ee8de9f4b4fd",
+      "measured_requests": 128,
+      "requests_including_warmup": 256,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 2,
+      "worker_1_steady_batch": {
+        "iterations": [
+          20,
+          600
+        ],
+        "records": 59,
+        "batch_mean": 63.320338983050846,
+        "batch_range": [
+          60.4,
+          64.0
+        ],
+        "phases": {
+          "iter_total": {
+            "mean_ms": 32.60711864406781,
+            "samples": 590
+          },
+          "worker.main.process_messages.cpu": {
+            "mean_ms": 1.8339661016949147,
+            "samples": 590
+          },
+          "worker.main.teardown.cpu": {
+            "mean_ms": 0.00988135593220339,
+            "samples": 590
+          },
+          "worker.postprocess.event_sync": {
+            "mean_ms": 0.17745762711864407,
+            "samples": 590
+          }
+        }
+      },
+      "audio_duration_mean_s": 4.423333333333333
+    },
+    {
+      "case": "raw/main/streaming/3-fix",
+      "commit": "eabb5f568529cad51058379691cf1a43e74915f0",
+      "server_log_sha256": "5aea81e2dee58d4a1322afdf44a2eb391bf9e941f081e4e594ce95f7b9527dd1",
+      "measured_requests": 128,
+      "requests_including_warmup": 256,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 2,
+      "worker_1_steady_batch": {
+        "iterations": [
+          20,
+          600
+        ],
+        "records": 59,
+        "batch_mean": 63.003389830508475,
+        "batch_range": [
+          60.0,
+          64.0
+        ],
+        "phases": {
+          "iter_total": {
+            "mean_ms": 31.868101694915254,
+            "samples": 590
+          },
+          "worker.main.process_messages.cpu": {
+            "mean_ms": 1.7278474576271194,
+            "samples": 590
+          },
+          "worker.main.teardown.cpu": {
+            "mean_ms": 0.008949152542372881,
+            "samples": 590
+          },
+          "worker.postprocess.event_sync": {
+            "mean_ms": 0.250864406779661,
+            "samples": 590
+          }
+        }
+      },
+      "audio_duration_mean_s": 4.462666666666666
+    },
+    {
+      "case": "raw/main/streaming/4-base",
+      "commit": "3e98682a8fff4b506136a53541d868b3ceb804eb",
+      "server_log_sha256": "3c64f927186080dc5994c6a4fb709cdef2702eaeb78c0e6eeb4b3793fea9f318",
+      "measured_requests": 128,
+      "requests_including_warmup": 256,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 2,
+      "worker_1_steady_batch": {
+        "iterations": [
+          1400,
+          1720
+        ],
+        "records": 33,
+        "batch_mean": 63.52727272727273,
+        "batch_range": [
+          60.9,
+          64.0
+        ],
+        "phases": {
+          "iter_total": {
+            "mean_ms": 27.43154545454546,
+            "samples": 330
+          },
+          "worker.main.process_messages.cpu": {
+            "mean_ms": 1.41730303030303,
+            "samples": 330
+          },
+          "worker.main.teardown.cpu": {
+            "mean_ms": 0.008151515151515154,
+            "samples": 330
+          },
+          "worker.postprocess.event_sync": {
+            "mean_ms": 0.3031515151515152,
+            "samples": 330
+          }
+        }
+      },
+      "audio_duration_mean_s": 4.532666666666667
+    },
+    {
+      "case": "raw/main/tp-sync/1-base",
+      "commit": "3e98682a8fff4b506136a53541d868b3ceb804eb",
+      "server_log_sha256": "68a8f0cb90312237d45b7d52444d699497959de92f0e1cbdaac90ee37ac1ca88",
+      "measured_requests": 66,
+      "requests_including_warmup": 131,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 0
+    },
+    {
+      "case": "raw/main/tp-sync/2-fix",
+      "commit": "eabb5f568529cad51058379691cf1a43e74915f0",
+      "server_log_sha256": "915ccdd25adfa9e665d23239c0350f281ee76bb7972dc89c5250f376e42fc5b8",
+      "measured_requests": 66,
+      "requests_including_warmup": 131,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 0
+    },
+    {
+      "case": "raw/fix-async/tp-async/2-fix",
+      "commit": "eabb5f568529cad51058379691cf1a43e74915f0",
+      "server_log_sha256": "6f835e0db8cfc0931d42258c3142aa13643fdce253dc57063cd7a445906f01e0",
+      "measured_requests": 66,
+      "requests_including_warmup": 131,
+      "exactly_once_conductor_and_both_worker_cleanup": true,
+      "errors_or_forced_teardowns": 0,
+      "cuda_ipc_shutdown_warnings": 0
+    }
+  ]
+}
