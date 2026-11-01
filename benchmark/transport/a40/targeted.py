@@ -50,6 +50,7 @@ def main(argv=None):
     parser.add_argument('--budget-seconds', type=int, default=1800)
     parser.add_argument('--suite', nargs='+', choices=['streaming', 'tp-sync', 'tp-async'],
                         default=['streaming', 'tp-sync', 'tp-async'])
+    parser.add_argument('--arm', nargs='+', choices=['base', 'fix'], default=['base', 'fix'])
     parser.add_argument('--client', choices=['streaming', 'tp-sync', 'tp-async'])
     parser.add_argument('--checkout', type=Path)
     parser.add_argument('--dry-run', action='store_true')
@@ -60,7 +61,8 @@ def main(argv=None):
     jobs = [(scenario, index, arm)
             for scenario in dict.fromkeys(args.suite)
             for index, arm in enumerate(('base', 'fix', 'fix', 'base')
-                                       if scenario == 'streaming' else ('base', 'fix'), 1)]
+                                       if scenario == 'streaming' else ('base', 'fix'), 1)
+            if arm in args.arm]
     for scenario, index, arm in jobs:
         print(scenario, index, arm, flush=True)
     if args.dry_run:
