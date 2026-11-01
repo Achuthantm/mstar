@@ -1,0 +1,9 @@
+[
+  {
+    "scenario": "tp-async",
+    "arm": "base",
+    "case": "/workspace/cleanup-bench/results/current-a40-async-20261101T093854Z/tp-async/1-base",
+    "status": "failed",
+    "error": "KeyboardInterrupt()"
+  }
+]

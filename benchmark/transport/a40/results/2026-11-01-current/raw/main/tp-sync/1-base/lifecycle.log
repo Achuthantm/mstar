@@ -1,0 +1,5 @@
+started 'bench' pid 46766, log /workspace/cleanup-bench/results/current-a40-20261101T091115Z/tp-sync/1-base/server.log
+'bench' ready on 8100 after 181s (listener pid 46766)
+stopped 'bench'
+0, 0 MiB
+1, 0 MiB

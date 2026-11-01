@@ -1,0 +1,19 @@
++ python -m benchmark.runner --url http://127.0.0.1:8100 --model orpheus --profiling-type closed_loop --request-type text_to_speech --num-requests 64 --max-concurrency 64 --num-warmup 1 --inference-system ours --dataset seed_tts --output-dir /workspace/cleanup-bench/results/current-a40-20261101T091115Z/tp-sync/2-fix/clients/c64
+
+--- Benchmark Results (wall time: 18.64s) ---
+Closed-Loop Benchmark Results (64 requests, max_concurrency=64)
+──────────────────────────────────────────────────
+Request type breakdown: text_to_speech=64
+Requests : 64/64 succeeded
+TTFT (audio)  : mean=1.176s  p50=1.163s  p95=1.260s  p99=1.265s
+E2E           : mean=12.619s  p50=12.619s  p95=17.357s  p99=18.178s
+ITL  (audio)  : mean=0.782s  p50=0.910s  p95=1.050s  p99=1.068s
+Audio SV      : mean=0.045s  p50=0.054s  p05=0.000s  p10=0.000s  (higher is better)
+RTF           : mean=2.774  p50=2.838  p95=2.881  p99=2.884  (lower is better; <1.0 = real-time)
+Audio dur    : mean=4.603s
+Output bytes (audio): 14139392 total (1001 chunks)
+Throughput: 3.43 req/s (successful only)
+Throughput: 15.80 audio sec/s (synthesized audio per wall second)
+Total wall time: 18.64s
+
+Saved 64 outputs to /workspace/cleanup-bench/results/current-a40-20261101T091115Z/tp-sync/2-fix/clients/c64/

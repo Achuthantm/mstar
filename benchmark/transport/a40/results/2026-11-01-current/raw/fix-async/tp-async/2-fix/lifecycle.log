@@ -1,0 +1,5 @@
+started 'bench' pid 56926, log /workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z/tp-async/2-fix/server.log
+'bench' ready on 8100 after 181s (listener pid 56926)
+stopped 'bench'
+0, 0 MiB
+1, 0 MiB

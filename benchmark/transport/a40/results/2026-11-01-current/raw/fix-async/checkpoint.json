@@ -1,0 +1,8 @@
+[
+  {
+    "scenario": "tp-async",
+    "arm": "fix",
+    "case": "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z/tp-async/2-fix",
+    "status": "passed"
+  }
+]

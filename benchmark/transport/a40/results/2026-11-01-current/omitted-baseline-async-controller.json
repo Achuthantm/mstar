@@ -1,0 +1,35 @@
+{
+  "pid": 53638,
+  "command": [
+    "/workspace/cleanup-bench/venv/bin/python",
+    "/workspace/mstar/benchmark/transport/a40/targeted.py",
+    "--root",
+    "/workspace/cleanup-bench",
+    "--out",
+    "/workspace/cleanup-bench/results/current-a40-async-20261101T093854Z",
+    "--suite",
+    "tp-async",
+    "--budget-seconds",
+    "660"
+  ],
+  "out": "/workspace/cleanup-bench/results/current-a40-async-20261101T093854Z",
+  "log": "/workspace/cleanup-bench/results/current-a40-async-20261101T093854Z.log",
+  "started_at": "2026-11-01T09:38:54.672045+00:00",
+  "prior_controller": {
+    "pid": 34674,
+    "command": [
+      "/workspace/cleanup-bench/venv/bin/python",
+      "/workspace/mstar/benchmark/transport/a40/targeted.py",
+      "--root",
+      "/workspace/cleanup-bench",
+      "--out",
+      "/workspace/cleanup-bench/results/current-a40-20261101T091115Z",
+      "--budget-seconds",
+      "1500"
+    ],
+    "out": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z",
+    "log": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z.log",
+    "started_at": "2026-11-01T09:11:15.745715+00:00"
+  },
+  "cancellation_reason": "Optional baseline async control omitted for rental time; fix-only async is the remaining correctness check"
+}

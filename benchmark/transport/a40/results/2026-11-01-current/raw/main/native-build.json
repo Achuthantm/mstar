@@ -1,0 +1,14 @@
+{
+  "torch": "2.10.0+cu128",
+  "cuda": "12.8",
+  "native": [
+    {
+      "path": "/workspace/cleanup-bench/venv/lib/python3.12/site-packages/mstar_rust/mstar_rust.cpython-312-x86_64-linux-gnu.so",
+      "sha256": "26a2be16c88fdb348b79a2255893b8db7a027be5a137cb9261772dfa02851666"
+    }
+  ],
+  "rust_trees": {
+    "base": "dfd9eccbbb4f6afb141d7236fc9a93d6f78fb120",
+    "fix": "dfd9eccbbb4f6afb141d7236fc9a93d6f78fb120"
+  }
+}

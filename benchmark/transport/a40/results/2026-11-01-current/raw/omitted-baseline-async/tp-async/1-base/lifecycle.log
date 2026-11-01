@@ -1,0 +1,6 @@
+started 'bench' pid 53655, log /workspace/cleanup-bench/results/current-a40-async-20261101T093854Z/tp-async/1-base/server.log
+'bench' ignored SIGINT for 60s; SIGTERM to its process groups
+reaping leftover processes of 'bench': 53692 53720 53735
+stopped 'bench'
+0, 0 MiB
+1, 0 MiB

@@ -1,0 +1,48 @@
+{
+  "checkout": "/workspace/cleanup-bench/current-fix",
+  "commit": "eabb5f568529cad51058379691cf1a43e74915f0",
+  "scenario": "tp-async",
+  "runtime": "rust",
+  "server": [
+    "/workspace/cleanup-bench/venv/bin/python",
+    "-m",
+    "mstar.cli.main",
+    "serve",
+    "orpheus",
+    "--config",
+    "/workspace/cleanup-bench/current-fix/configs/orpheus_tp2.yaml",
+    "--gpus",
+    "0,1",
+    "--port",
+    "8100",
+    "-O2",
+    "--tensor-comm-protocol",
+    "SHM"
+  ],
+  "client": [
+    "/workspace/cleanup-bench/venv/bin/python",
+    "/workspace/mstar/benchmark/transport/a40/targeted.py",
+    "--root",
+    "/workspace/cleanup-bench",
+    "--out",
+    "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z/tp-async/2-fix/clients",
+    "--checkout",
+    "/workspace/cleanup-bench/current-fix",
+    "--client",
+    "tp-async",
+    "--port",
+    "8100"
+  ],
+  "environment": {
+    "OMP_NUM_THREADS": "2",
+    "HF_HOME": "/workspace/cleanup-bench/cache/huggingface",
+    "TORCHINDUCTOR_CACHE_DIR": "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z/tp-async/2-fix/cache/inductor",
+    "TRITON_CACHE_DIR": "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z/tp-async/2-fix/cache/triton",
+    "MSTAR_RUST_GRAPH": "1",
+    "MSTAR_RUST_ZMQ": "1",
+    "MSTAR_SHM_ARENA": "1",
+    "MSTAR_TP_ASYNC_SCHED": "1",
+    "MSTAR_PHASE_TIMING": "10"
+  },
+  "source": "/workspace/cleanup-bench/current-fix/mstar/__init__.py"
+}

@@ -1,0 +1,44 @@
+[
+  {
+    "scenario": "streaming",
+    "arm": "base",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/streaming/1-base",
+    "status": "passed"
+  },
+  {
+    "scenario": "streaming",
+    "arm": "fix",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/streaming/2-fix",
+    "status": "passed"
+  },
+  {
+    "scenario": "streaming",
+    "arm": "fix",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/streaming/3-fix",
+    "status": "passed"
+  },
+  {
+    "scenario": "streaming",
+    "arm": "base",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/streaming/4-base",
+    "status": "passed"
+  },
+  {
+    "scenario": "tp-sync",
+    "arm": "base",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/tp-sync/1-base",
+    "status": "passed"
+  },
+  {
+    "scenario": "tp-sync",
+    "arm": "fix",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/tp-sync/2-fix",
+    "status": "passed"
+  },
+  {
+    "scenario": "tp-async",
+    "arm": "base",
+    "case": "/workspace/cleanup-bench/results/current-a40-20261101T091115Z/tp-async/1-base",
+    "status": "running"
+  }
+]

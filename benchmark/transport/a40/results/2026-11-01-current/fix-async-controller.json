@@ -1,0 +1,20 @@
+{
+  "pid": 56909,
+  "command": [
+    "/workspace/cleanup-bench/venv/bin/python",
+    "/workspace/mstar/benchmark/transport/a40/targeted.py",
+    "--root",
+    "/workspace/cleanup-bench",
+    "--out",
+    "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z",
+    "--suite",
+    "tp-async",
+    "--arm",
+    "fix",
+    "--budget-seconds",
+    "420"
+  ],
+  "out": "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z",
+  "log": "/workspace/cleanup-bench/results/current-a40-fix-async-20261101T094234Z.log",
+  "started_at": "2026-11-01T09:42:34.778125+00:00"
+}

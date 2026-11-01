@@ -1,0 +1,27 @@
+tp-async 1 base
+tp-async 2 fix
+SERVER /workspace/cleanup-bench/venv/bin/python -m mstar.cli.main serve orpheus --config /workspace/cleanup-bench/current-base/configs/orpheus_tp2.yaml --gpus 0,1 --port 8100 -O2 --tensor-comm-protocol SHM CLIENT /workspace/cleanup-bench/venv/bin/python /workspace/mstar/benchmark/transport/a40/targeted.py --root /workspace/cleanup-bench --out /workspace/cleanup-bench/results/current-a40-async-20261101T093854Z/tp-async/1-base/clients --checkout /workspace/cleanup-bench/current-base --client tp-async --port 8100
+Traceback (most recent call last):
+  File "/workspace/mstar/benchmark/transport/a40/targeted.py", line 123, in <module>
+    main()
+  File "/workspace/mstar/benchmark/transport/a40/targeted.py", line 108, in main
+    run.run_case(args.root, checkout, args.root / 'current-fix', case,
+  File "/workspace/mstar/benchmark/transport/a40/run.py", line 77, in run_case
+    subprocess.run([*lifecycle, 'start', 'bench', str(port), '--timeout', '3600',
+  File "/usr/lib/python3.12/subprocess.py", line 550, in run
+    stdout, stderr = process.communicate(input, timeout=timeout)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 1201, in communicate
+    self.wait()
+  File "/usr/lib/python3.12/subprocess.py", line 1264, in wait
+    return self._wait(timeout=timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 2053, in _wait
+    (pid, sts) = self._try_wait(0)
+                 ^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 2011, in _try_wait
+    (pid, sts) = os.waitpid(self.pid, wait_flags)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/mstar/benchmark/transport/a40/run.py", line 183, in interrupt
+    raise KeyboardInterrupt
+KeyboardInterrupt
