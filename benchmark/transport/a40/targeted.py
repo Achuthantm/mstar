@@ -48,6 +48,8 @@ def main(argv=None):
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--port', type=int, default=8100)
     parser.add_argument('--budget-seconds', type=int, default=1800)
+    parser.add_argument('--suite', nargs='+', choices=['streaming', 'tp-sync', 'tp-async'],
+                        default=['streaming', 'tp-sync', 'tp-async'])
     parser.add_argument('--client', choices=['streaming', 'tp-sync', 'tp-async'])
     parser.add_argument('--checkout', type=Path)
     parser.add_argument('--dry-run', action='store_true')
@@ -56,7 +58,7 @@ def main(argv=None):
         client(args.checkout, args.out, args.client, args.port)
         return
     jobs = [(scenario, index, arm)
-            for scenario in ('streaming', 'tp-sync', 'tp-async')
+            for scenario in dict.fromkeys(args.suite)
             for index, arm in enumerate(('base', 'fix', 'fix', 'base')
                                        if scenario == 'streaming' else ('base', 'fix'), 1)]
     for scenario, index, arm in jobs:
@@ -94,9 +96,11 @@ def main(argv=None):
         if run.capture(['git', 'status', '--porcelain', '--untracked-files=no'], checkout):
             raise RuntimeError(f'{arm} checkout is dirty')
         entry = dict(scenario=scenario, arm=arm, case=str(case), status='running')
+        remaining = int(deadline - time.monotonic())
+        if remaining < 60:
+            entry.update(status='not_started', error='Rental time budget exhausted')
         checkpoint.append(entry)
         (args.out / 'checkpoint.json').write_text(json.dumps(checkpoint, indent=2) + '\n')
-        remaining = int(deadline - time.monotonic())
         if remaining < 60:
             raise TimeoutError('Rental time budget exhausted')
         signal.alarm(min(420, remaining))
