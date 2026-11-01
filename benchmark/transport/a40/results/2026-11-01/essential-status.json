@@ -1,0 +1,10 @@
+{
+  "streaming": 1,
+  "tp-sync": 1,
+  "tp-async": 1,
+  "tcp": 1,
+  "python-streaming-base": 0,
+  "python-streaming-fix": 0,
+  "python-tcp-base": 0,
+  "python-tcp-fix": 0
+}

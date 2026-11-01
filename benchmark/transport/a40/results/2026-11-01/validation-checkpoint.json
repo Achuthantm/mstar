@@ -1,0 +1,242 @@
+{
+  "started_at": "2026-11-01T08:35:43.815052+00:00",
+  "tests": {
+    "tcp-1-base": {
+      "attempts": [
+        {
+          "started_at": "2026-11-01T08:35:43.815555+00:00",
+          "command": [
+            "/workspace/cleanup-bench/venv/bin/python",
+            "/workspace/cleanup-bench/resume_validation.py",
+            "--worker",
+            "{\"id\": \"tcp-1-base\", \"scenario\": \"tcp\", \"arm\": \"base\", \"concurrency\": [1, 64]}",
+            "--case",
+            "/workspace/cleanup-bench/results/final-validation/tcp-1-base-attempt1"
+          ],
+          "log": "/workspace/cleanup-bench/results/final-validation/tcp-1-base-attempt1.log",
+          "case": "/workspace/cleanup-bench/results/final-validation/tcp-1-base-attempt1",
+          "pid": 29311,
+          "exit_code": 0,
+          "finished_at": "2026-11-01T08:37:00.908596+00:00"
+        }
+      ],
+      "status": "passed",
+      "case": "/workspace/cleanup-bench/results/final-validation/tcp-1-base-attempt1"
+    },
+    "tcp-2-fix": {
+      "attempts": [
+        {
+          "started_at": "2026-11-01T08:37:00.909510+00:00",
+          "command": [
+            "/workspace/cleanup-bench/venv/bin/python",
+            "/workspace/cleanup-bench/resume_validation.py",
+            "--worker",
+            "{\"id\": \"tcp-2-fix\", \"scenario\": \"tcp\", \"arm\": \"fix\", \"concurrency\": [1, 64]}",
+            "--case",
+            "/workspace/cleanup-bench/results/final-validation/tcp-2-fix-attempt1"
+          ],
+          "log": "/workspace/cleanup-bench/results/final-validation/tcp-2-fix-attempt1.log",
+          "case": "/workspace/cleanup-bench/results/final-validation/tcp-2-fix-attempt1",
+          "pid": 30097,
+          "exit_code": 0,
+          "finished_at": "2026-11-01T08:38:24.100489+00:00"
+        }
+      ],
+      "status": "passed",
+      "case": "/workspace/cleanup-bench/results/final-validation/tcp-2-fix-attempt1"
+    },
+    "streaming-1-base": {
+      "attempts": [
+        {
+          "started_at": "2026-11-01T08:38:24.101724+00:00",
+          "command": [
+            "/workspace/cleanup-bench/venv/bin/python",
+            "/workspace/cleanup-bench/resume_validation.py",
+            "--worker",
+            "{\"id\": \"streaming-1-base\", \"scenario\": \"streaming\", \"arm\": \"base\", \"concurrency\": [64]}",
+            "--case",
+            "/workspace/cleanup-bench/results/final-validation/streaming-1-base-attempt1"
+          ],
+          "log": "/workspace/cleanup-bench/results/final-validation/streaming-1-base-attempt1.log",
+          "case": "/workspace/cleanup-bench/results/final-validation/streaming-1-base-attempt1",
+          "pid": 30990
+        }
+      ],
+      "status": "cancelled_by_user",
+      "case": "/workspace/cleanup-bench/results/final-validation/streaming-1-base-attempt1"
+    },
+    "streaming-2-fix": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "streaming-3-fix": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "streaming-4-base": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-sync-1-base": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-sync-2-fix": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-sync-3-fix": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-sync-4-base": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-async-1-base": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-async-2-fix": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-async-3-fix": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    },
+    "tp-async-4-base": {
+      "attempts": [],
+      "status": "cancelled_by_user"
+    }
+  },
+  "plan": [
+    {
+      "id": "tcp-1-base",
+      "scenario": "tcp",
+      "arm": "base",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tcp-2-fix",
+      "scenario": "tcp",
+      "arm": "fix",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "streaming-1-base",
+      "scenario": "streaming",
+      "arm": "base",
+      "concurrency": [
+        64
+      ]
+    },
+    {
+      "id": "streaming-2-fix",
+      "scenario": "streaming",
+      "arm": "fix",
+      "concurrency": [
+        64
+      ]
+    },
+    {
+      "id": "streaming-3-fix",
+      "scenario": "streaming",
+      "arm": "fix",
+      "concurrency": [
+        64
+      ]
+    },
+    {
+      "id": "streaming-4-base",
+      "scenario": "streaming",
+      "arm": "base",
+      "concurrency": [
+        64
+      ]
+    },
+    {
+      "id": "tp-sync-1-base",
+      "scenario": "tp-sync",
+      "arm": "base",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-sync-2-fix",
+      "scenario": "tp-sync",
+      "arm": "fix",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-sync-3-fix",
+      "scenario": "tp-sync",
+      "arm": "fix",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-sync-4-base",
+      "scenario": "tp-sync",
+      "arm": "base",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-async-1-base",
+      "scenario": "tp-async",
+      "arm": "base",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-async-2-fix",
+      "scenario": "tp-async",
+      "arm": "fix",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-async-3-fix",
+      "scenario": "tp-async",
+      "arm": "fix",
+      "concurrency": [
+        1,
+        64
+      ]
+    },
+    {
+      "id": "tp-async-4-base",
+      "scenario": "tp-async",
+      "arm": "base",
+      "concurrency": [
+        1,
+        64
+      ]
+    }
+  ],
+  "controller_pid": 29309,
+  "updated_at": "2026-11-01T08:38:24.103252+00:00",
+  "active": null,
+  "finished_at": "2026-11-01T08:39:23.528987+00:00",
+  "stop_reason": "User requested preserving current evidence and cancelling queued GPU reruns."
+}

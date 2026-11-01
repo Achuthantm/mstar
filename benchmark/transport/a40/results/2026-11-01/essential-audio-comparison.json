@@ -1,0 +1,212 @@
+[
+  {
+    "suite": "streaming",
+    "concurrency": 1,
+    "metrics": {
+      "audio_seconds_throughput": {
+        "repeats": {
+          "base": [
+            0.45781270394423834,
+            0.45810578611108194
+          ],
+          "fix": [
+            0.4582538783569742,
+            0.4583560390653492
+          ]
+        },
+        "fix_median_change_pct": 0.07549005446558787,
+        "same_code_range_pct": {
+          "base": 0.0640179191880419,
+          "fix": 0.022293473814416487
+        }
+      },
+      "jct_median_ms": {
+        "repeats": {
+          "base": [
+            9343.49920018576,
+            9128.678777022287
+          ],
+          "fix": [
+            9149.317295989022,
+            9142.565542133525
+          ]
+        },
+        "fix_median_change_pct": -0.9760361734710399,
+        "same_code_range_pct": {
+          "base": 2.3532476978398664,
+          "fix": 0.07384966314303298
+        }
+      },
+      "audio_duration_mean_s": {
+        "repeats": {
+          "base": [
+            4.677333333333333,
+            4.629333333333333
+          ],
+          "fix": [
+            4.629333333333333,
+            4.629333333333333
+          ]
+        },
+        "fix_median_change_pct": -0.5157593123209181,
+        "same_code_range_pct": {
+          "base": 1.0368663594469973,
+          "fix": 0.0
+        }
+      }
+    }
+  },
+  {
+    "suite": "streaming",
+    "concurrency": 64,
+    "metrics": {
+      "audio_seconds_throughput": {
+        "repeats": {
+          "base": [
+            15.751350114237436,
+            16.09266672658101
+          ],
+          "fix": [
+            15.54931857624624,
+            15.449633847488975
+          ]
+        },
+        "fix_median_change_pct": -2.653761996507953,
+        "same_code_range_pct": {
+          "base": 2.166903851848634,
+          "fix": 0.645223891655311
+        }
+      },
+      "jct_median_ms": {
+        "repeats": {
+          "base": [
+            16255.44195389375,
+            16036.276021040976
+          ],
+          "fix": [
+            16726.324134971946,
+            16556.766817113385
+          ]
+        },
+        "fix_median_change_pct": 3.0700533738097224,
+        "same_code_range_pct": {
+          "base": 1.3666884541349233,
+          "fix": 1.0240967921545163
+        }
+      },
+      "audio_duration_mean_s": {
+        "repeats": {
+          "base": [
+            4.616533333333333,
+            4.6090700104493205
+          ],
+          "fix": [
+            4.6584,
+            4.641333333333333
+          ]
+        },
+        "fix_median_change_pct": 0.803524569486691,
+        "same_code_range_pct": {
+          "base": 0.1619268717353517,
+          "fix": 0.3677104280379373
+        }
+      }
+    }
+  },
+  {
+    "suite": "tp-sync",
+    "concurrency": 1,
+    "metrics": {
+      "audio_seconds_throughput": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "jct_median_ms": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "audio_duration_mean_s": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      }
+    }
+  },
+  {
+    "suite": "tp-sync",
+    "concurrency": 64,
+    "metrics": {
+      "audio_seconds_throughput": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "jct_median_ms": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "audio_duration_mean_s": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      }
+    }
+  },
+  {
+    "suite": "tp-async",
+    "concurrency": 1,
+    "metrics": {
+      "audio_seconds_throughput": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "jct_median_ms": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "audio_duration_mean_s": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      }
+    }
+  },
+  {
+    "suite": "tp-async",
+    "concurrency": 64,
+    "metrics": {
+      "audio_seconds_throughput": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "jct_median_ms": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      },
+      "audio_duration_mean_s": {
+        "repeats": {
+          "base": [],
+          "fix": []
+        }
+      }
+    }
+  }
+]
