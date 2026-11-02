@@ -1328,6 +1328,9 @@ class StepExecutor:
                 ],
             ),
             failed_rids=failed_rids,
+            inflight_read_rids=(
+                self.tensor_manager.inflight_read_rids(info_rids) if info_rids else frozenset()
+            ),
         )
 
     def _inline_emit_values(

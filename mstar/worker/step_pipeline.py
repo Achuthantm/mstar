@@ -950,10 +950,9 @@ class StepPipeline:
             ),
         ))
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
-        # ignoring ref counts / persist. Safe because the conductor only sends
-        # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE):
-        # on the abort/fail path via a prior DrainRequest, on the happy path
-        # once the api server finished reading the outputs.
+        # ignoring ref counts / persist. The conductor gates REMOVE_REQUEST on
+        # completion reports and output delivery, adding the READS_DONE barrier
+        # for outstanding worker reads, client streams, and abort/failure.
         laps = PhaseLaps("worker.msg.remove_request.")
         for message in self.lifecycle.removed(rid, wire_rid):
             self.ingest.drop_for_removed(message)
@@ -989,7 +988,7 @@ class StepPipeline:
         laps.lap("runtime")
 
     def _apply_drains(self, in_flight: Collection[int]) -> None:
-        """Phase-1 teardown (abort/fail): stop scheduling a rid, then ACK
+        """Phase-1 teardown: stop scheduling a rid, then ACK
         READS_DONE once its in-flight reads finish. The hard cleanup waits for
         the conductor's REMOVE_REQUEST, sent only after every reader has ACKed."""
         lifecycle = self.lifecycle

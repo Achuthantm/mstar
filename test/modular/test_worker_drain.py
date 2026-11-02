@@ -71,6 +71,7 @@ def _worker(
     forced = []
     tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
+        inflight_read_rids=lambda rids: frozenset(rids) if inflight_reads else frozenset(),
         force_cleanup_request=lambda rid: forced.append(rid), # noqa: PLW0108
     )
     cleared = []
@@ -328,6 +329,19 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
     assert w.lockstep.pending_follow_count("X") == 1
     _remove(w, request_id="X")
     assert w.lockstep.pending_follow_count("X") == 0
+
+
+@pytest.mark.parametrize("known_rids", [(), ("X",)], ids=["never-admitted", "removed"])
+@pytest.mark.parametrize("source", [MessageSource.CONDUCTOR, MessageSource.TP_RANK_0])
+def test_late_drain_does_not_recreate_removed_request_state(known_rids, source):
+    w = _worker(known_rids=known_rids)
+    _remove(w, request_id="X")
+    _drain(w, request_id="X", source=source)
+
+    assert not w.lifecycle.draining
+    assert not w.lifecycle.pending_drains
+    assert not w.lifecycle._reads_done_sent
+    assert not _reads_done(w)
 
 
 def test_drain_deferred_behind_inflight_gpu_step():

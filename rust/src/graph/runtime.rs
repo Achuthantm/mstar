@@ -346,6 +346,7 @@ pub struct GraphRuntime {
         publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
         speculative: bool,
+        has_inflight_reads: bool,
     ) -> PyResult<Vec<u8>> {
         let request_id = self.rid_name(rid)?;
         // `and not speculative`, as Python has it: a speculatively-scheduled
@@ -369,6 +370,8 @@ pub struct GraphRuntime {
 
         let frame = frames::WorkerGraphsDone {
             request_id: &request_id,
+            worker_id: self.interner.name(self.shard.me),
+            has_inflight_reads,
             worker_graph_ids,
             is_first_tp_rank,
             persist_signals,
@@ -3516,7 +3519,7 @@ impl GraphRuntime {
     /// `send_outputs` takes them.
     #[pyo3(signature = (
         info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
-        publish_rids, publications, skip_rids = Vec::new(),
+        publish_rids, publications, skip_rids = Vec::new(), inflight_read_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn resume_postprocess_send(
@@ -3526,10 +3529,11 @@ impl GraphRuntime {
         prof_rids: Vec<u32>, profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>, publications: Vec<Option<Vec<u8>>>,
         skip_rids: Vec<u32>,
+        inflight_read_rids: Vec<u32>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let args = postprocess::SendArgs {
             info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
-            publish_rids, publications, skip_rids,
+            publish_rids, publications, skip_rids, inflight_read_rids,
         };
         self.pp_resume_send(py, args)
     }
@@ -3622,7 +3626,7 @@ impl GraphRuntime {
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts, prof_rids, profiling,
-        publish_rids, publications, skip_rids = Vec::new(),
+        publish_rids, publications, skip_rids = Vec::new(), inflight_read_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3640,6 +3644,7 @@ impl GraphRuntime {
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
         skip_rids: Vec<u32>,
+        inflight_read_rids: Vec<u32>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
@@ -3664,7 +3669,7 @@ impl GraphRuntime {
         let t_body = std::time::Instant::now();
         let built = self.build_send_frames(
             completion_id, info_rids, request_infos, ntc_rids, new_token_counts,
-            prof_rids, profiling, publish_rids, publications, skip_rids,
+            prof_rids, profiling, publish_rids, publications, skip_rids, inflight_read_rids,
         );
         send_timing::record_body(t_body);
         let (out, frames) = built?;
@@ -3996,6 +4001,7 @@ impl GraphRuntime {
         publications: Vec<Option<Vec<u8>>>,
         // failed after routing: none of their frames go out
         skip_rids: Vec<u32>,
+        inflight_read_rids: Vec<u32>,
     ) -> PyResult<(Vec<u32>, Vec<(String, Vec<u8>)>)> {
         let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
         let sent = (|| -> PyResult<Vec<u32>> {
@@ -4241,6 +4247,7 @@ impl GraphRuntime {
                 }
             }
 
+            let inflight_reads: FxHashSet<u32> = inflight_read_rids.into_iter().collect();
             for (rid, wg_ids, is_first_tp_rank, walk) in plan.completed {
                 let graph_walk = walk
                     .map(|w| self.interner.name(w).to_string())
@@ -4250,6 +4257,7 @@ impl GraphRuntime {
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
+                    inflight_reads.contains(&rid),
                 )?;
                 frames.push(("conductor".to_string(), bytes));
                 sent_rids.push(rid);
