@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="../../../../../../_static/searchtools.js"></script>
@@ -811,8 +811,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1087,9 +1089,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># replicated stream, or a cross-attention from the rank's query shard.</span>
     <span class="n">shard_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
-    <span class="c1"># Each label's FlashInfer workspace, per slot; None takes</span>
-    <span class="c1"># MSTAR_WORKSPACE_BUFFER_MB. A ragged prefill only spends it on split-KV</span>
-    <span class="c1"># partials (tens of MB), so a resource with many labels can declare less.</span>
+    <span class="c1"># Where each label's FlashInfer workspace starts, per slot; None takes</span>
+    <span class="c1"># MSTAR_WORKSPACE_BUFFER_MB, which a declared size wins over. A floor: a plan that</span>
+    <span class="c1"># asks for more grows it. A ragged prefill only spends it on split-KV partials, so a</span>
+    <span class="c1"># resource with many labels can declare less.</span>
     <span class="n">workspace_mb</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1275,7 +1278,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>

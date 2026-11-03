@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="../../../../../_static/searchtools.js"></script>
@@ -811,8 +811,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1314,8 +1316,11 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    ``max_slots`` adapters are resident on the device at once, beside a zero adapter that</span>
 <span class="sd">    base-model rows use, and up to ``cpu_capacity`` are kept pinned on the host.</span>
 <span class="sd">    ``adapters`` maps the names requests ask for to safetensors paths. ``module_map``</span>
-<span class="sd">    places each checkpoint module on a target; ``convert_keys`` rewrites a model-native</span>
-<span class="sd">    checkpoint layout first.</span>
+<span class="sd">    places each checkpoint module on a target; a node's spec comes from</span>
+<span class="sd">    ``module_lora_spec`` (``mstar.model.components.lora.modules``), whose</span>
+<span class="sd">    ``ModuleLoraMap`` is what binds the node's modules (a spec with any other resolver</span>
+<span class="sd">    is refused as the deployment's specs are declared, ``declared_lora_specs``).</span>
+<span class="sd">    ``convert_keys`` rewrites a model-native checkpoint layout first.</span>
 <span class="sd">    """</span>
 
     <span class="n">num_layers</span><span class="p">:</span> <span class="nb">int</span>
@@ -1618,7 +1623,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>

@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -726,35 +728,6 @@ documented here as they are introduced.</p>
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code></p></td>
-<td><p>Transport selection for the ZeroMQ control mesh (see
-<a class="reference internal" href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator" title="mstar.communication.communicator.make_communicator"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.communication.communicator.make_communicator()</span></code></a>).
-<code class="docutils literal notranslate"><span class="pre">AUTO</span></code>: the Rust-backed <code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code> when the vendored
-<code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension imports successfully, pyzmq otherwise.
-<code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust communicator, raising if the extension is missing.
-<code class="docutils literal notranslate"><span class="pre">0</span></code>: always pyzmq. The two transports are wire-compatible, so
-this can be set per-process while the rest of the mesh stays on
-pyzmq. Under <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH=AUTO</span></code>, <code class="docutils literal notranslate"><span class="pre">0</span></code> also keeps that
-worker’s graph runtime on Python – the Rust one cannot share a
-pyzmq transport. An extension built before 0.1.1 has no
-non-blocking <code class="docutils literal notranslate"><span class="pre">try_send</span></code>, which the API server’s preprocess thread
-sends with: for that thread alone, <code class="docutils literal notranslate"><span class="pre">AUTO</span></code> then uses pyzmq with a
-warning and <code class="docutils literal notranslate"><span class="pre">1</span></code> raises, asking for a rebuild. The conductor, the
-workers and the rest of the API server keep the Rust transport.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">AUTO</span></code></p></td>
-<td><p>Which graph runtime a worker builds (see
-<code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.graph.runtime.utils.resolve_graph_runtime_type()</span></code>).
-<code class="docutils literal notranslate"><span class="pre">AUTO</span></code>: Rust where the vendored <code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension imports <em>and</em>
-the Rust transport is in use, Python otherwise. <code class="docutils literal notranslate"><span class="pre">1</span></code>: the Rust
-runtime, failing at startup if the transport or the tensor bookkeeper
-is a Python one – it holds a share of both, so there is no degraded
-mode to fall back to. <code class="docutils literal notranslate"><span class="pre">0</span></code>: always the Python runtime. Resolved once
-per process, because it also selects the tensor bookkeeper the
-runtime and the tensor store must share.</p></td>
-</tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WIRE_CODEC</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">msgpack</span></code></p></td>
 <td><p>How messages are encoded on every communicator edge (see
@@ -1403,17 +1376,7 @@ is not a number, is <code class="docutils literal notranslate"><span class="pre"
 worker starts and <code class="docutils literal notranslate"><span class="pre">5</span></code> is used; a negative value is raised to <code class="docutils literal notranslate"><span class="pre">0</span></code>
 with a warning.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">32,64,128,256,512,1024,2048,2176,4096,4352,8192,8704</span></code></p></td>
-<td><p>Total tokens of a packed Qwen3.5 text-prefill step that get a captured
-graph (one per bucket and batch size). A prompt past the top bucket
-prefills eagerly, which is launch-bound: an eager 8k prefill on 0.8B
-spends 78 ms of wall time on 36 ms of kernels. 2176, 4352 and 8704 add
-1/16 of slack above the powers of two from 2048 up, for a mixed step’s
-decode rows and for batches a few tokens over. Narrow it to save graph
-memory and capture time, or extend it.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_chain_lazy_steps</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>How many decode steps of sampled ids the KV manager holds back before
 it extends the requests’ prefix chains (the per-page keys the prefix
@@ -1425,6 +1388,17 @@ already allows; a request that finishes in between may leave its last
 page unindexed. The default <code class="docutils literal notranslate"><span class="pre">1</span></code> extends on every step: <code class="docutils literal notranslate"><span class="pre">16</span></code>
 measured as noise at c64/c128 on 0.8B (the extension is a small part
 of the stop check’s tail).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
+<td><p>The size each FlashInfer attention workspace starts at, per (plan label, slot), read
+by <code class="docutils literal notranslate"><span class="pre">workspace_bytes</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/attn/workspace.py</span></code>). A floor: a plan
+at startup that asks for more grows that workspace to what it asked for. Raise it for
+an eager step that wants more than startup’s plans left it, which raises with the bytes
+it asked for, since a captured graph holds the workspace’s address by then. A ragged
+resource that declares <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> starts there instead, and this doesn’t reach
+it: LTX-2.5’s twelve workspaces hold 1.5 GiB at its 128, and would hold 6 GiB at
+<code class="docutils literal notranslate"><span class="pre">512</span></code> and 24 GiB at <code class="docutils literal notranslate"><span class="pre">2048</span></code> if this applied.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_pinned_indptrs</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
@@ -1704,7 +1678,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>

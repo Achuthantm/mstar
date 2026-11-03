@@ -410,7 +410,7 @@ window.runMermaid = runMermaid;</script>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="../../../../_static/searchtools.js"></script>
@@ -811,8 +811,10 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1264,7 +1266,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">continue</span>
             <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">request_ids</span><span class="p">:</span>
                 <span class="n">per_rid</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
-                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">per_rid</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">per_rid</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">):</span>
                     <span class="n">resource</span><span class="o">.</span><span class="n">extend_prefix_chain</span><span class="p">(</span>
                         <span class="n">rid</span><span class="p">,</span> <span class="n">node_name</span><span class="p">,</span>
                         <span class="n">walk_of</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">walk_of</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="n">walk_of</span><span class="p">(</span><span class="n">rid</span><span class="p">),</span> <span class="n">per_rid</span><span class="p">,</span>
@@ -1930,7 +1932,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>

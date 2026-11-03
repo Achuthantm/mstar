@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -961,8 +963,11 @@ any worker sees it.</p>
 <p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code> adapters are resident on the device at once, beside a zero adapter that
 base-model rows use, and up to <code class="docutils literal notranslate"><span class="pre">cpu_capacity</span></code> are kept pinned on the host.
 <code class="docutils literal notranslate"><span class="pre">adapters</span></code> maps the names requests ask for to safetensors paths. <code class="docutils literal notranslate"><span class="pre">module_map</span></code>
-places each checkpoint module on a target; <code class="docutils literal notranslate"><span class="pre">convert_keys</span></code> rewrites a model-native
-checkpoint layout first.</p>
+places each checkpoint module on a target; a node’s spec comes from
+<code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar.model.components.lora.modules</span></code>), whose
+<code class="docutils literal notranslate"><span class="pre">ModuleLoraMap</span></code> is what binds the node’s modules (a spec with any other resolver
+is refused as the deployment’s specs are declared, <code class="docutils literal notranslate"><span class="pre">declared_lora_specs</span></code>).
+<code class="docutils literal notranslate"><span class="pre">convert_keys</span></code> rewrites a model-native checkpoint layout first.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1667,7 +1672,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>

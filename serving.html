@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1164,7 +1166,8 @@ overrides it).</p></td>
 <td><p><em>(optional)</em> Requests the data worker prepares at once, for a model that
 declares <code class="docutils literal notranslate"><span class="pre">PREPROCESS_PARALLEL</span></code>. Default: as many as fit the CPUs left
 beside the API server’s intra-op threads (<code class="docutils literal notranslate"><span class="pre">preprocess_torch_threads</span></code>),
-at most 8; <code class="docutils literal notranslate"><span class="pre">1</span></code> prepares inline. See <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></td>
+at most 8; <code class="docutils literal notranslate"><span class="pre">1</span></code> prepares inline. It must be a positive integer, for any
+model: the server refuses to start on another value. See <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
@@ -1456,7 +1459,9 @@ Pi0.5 DROID variant fixes the action horizon:</p>
 </pre></div>
 </div>
 <p>Per-request knobs (<code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">voice</span></code>, <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, …) are sent by the
-client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
+client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. A <code class="docutils literal notranslate"><span class="pre">seed</span></code> fixes a request’s random stream whatever
+it is batched with, so requests sent with the same seed and settings sample the same
+tokens; give each request its own seed for independent samples.</p>
 </section>
 <section id="restarts-and-the-compile-cache">
 <h2>Restarts and the compile cache<a class="headerlink" href="#restarts-and-the-compile-cache" title="Link to this heading">#</a></h2>
@@ -1724,9 +1729,8 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 <code class="docutils literal notranslate"><span class="pre">api_server</span></code> stands for the request’s inputs (as <code class="docutils literal notranslate"><span class="pre">src</span></code>) and its results (as <code class="docutils literal notranslate"><span class="pre">dst</span></code>),
 which the API server’s data worker sends and reads. <code class="docutils literal notranslate"><span class="pre">transport</span></code> is the protocol:
-<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (per-tensor files or the arena, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>), <code class="docutils literal notranslate"><span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. The
-Python and Rust runtimes and communicators (<code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_GRAPH</span></code>, <code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_ZMQ</span></code>)
-report the same series. A tensor already on the reader (one it made, or one it read once
+<code class="docutils literal notranslate"><span class="pre">SHM</span></code> (per-tensor files or the arena, see <code class="docutils literal notranslate"><span class="pre">MSTAR_SHM_ARENA</span></code>), <code class="docutils literal notranslate"><span class="pre">TCP</span></code> or <code class="docutils literal notranslate"><span class="pre">RDMA</span></code>. A
+tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
 replicated, so an edge two ranks read is two reads. Like the data worker, the workers
@@ -1885,7 +1889,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>

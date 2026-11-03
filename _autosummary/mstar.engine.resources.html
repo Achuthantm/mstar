@@ -55,7 +55,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 02, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 03, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -458,8 +458,10 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
 </ul>
 </details></li>
@@ -1041,6 +1043,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.reset_request"><code class="docutils literal notranslate"><span class="pre">Resource.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.rollback_admit"><code class="docutils literal notranslate"><span class="pre">Resource.rollback_admit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.seal_capture_buffers"><code class="docutils literal notranslate"><span class="pre">Resource.seal_capture_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.step_host_rows"><code class="docutils literal notranslate"><span class="pre">Resource.step_host_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.supports_eviction"><code class="docutils literal notranslate"><span class="pre">Resource.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.supports_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.supports_preplan</span></code></a></li>
@@ -3657,9 +3660,8 @@ resource to ask; LRU never calls it.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.Resource.ingest_request">
 <span class="sig-name descname"><span class="pre">ingest_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">overrides</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.ingest_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.ingest_request" title="Link to this definition">#</a></dt>
-<dd><p>Must be idempotent: the conductor sends one NewRequest per partition,
-so a worker serving several partitions of a request ingests it once
-for each, possibly after a node has already run a step for it.</p>
+<dd><p>Open the request’s state. The worker calls this once per request, on
+its first NewRequest, though one comes per partition it serves.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -4027,6 +4029,18 @@ lease converted onto a stream, belongs to whoever else holds it.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.Resource.seal_capture_buffers">
+<span class="sig-name descname"><span class="pre">seal_capture_buffers</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.seal_capture_buffers"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.Resource.seal_capture_buffers" title="Link to this definition">#</a></dt>
+<dd><p>Every bucket on the device has been sized and none captured yet: from here on,
+what a captured graph reads keeps its address. Called once, by the engine.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -5880,6 +5894,7 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.reset_request"><code class="docutils literal notranslate"><span class="pre">Resource.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.resolve_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.rollback_admit"><code class="docutils literal notranslate"><span class="pre">Resource.rollback_admit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.seal_capture_buffers"><code class="docutils literal notranslate"><span class="pre">Resource.seal_capture_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.step_host_rows"><code class="docutils literal notranslate"><span class="pre">Resource.step_host_rows()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.supports_eviction"><code class="docutils literal notranslate"><span class="pre">Resource.supports_eviction</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.Resource.supports_preplan"><code class="docutils literal notranslate"><span class="pre">Resource.supports_preplan</span></code></a></li>
@@ -6072,7 +6087,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 02, 2026.
+  Last updated on Nov 03, 2026.
   <br/>
 </p>
   </div>
