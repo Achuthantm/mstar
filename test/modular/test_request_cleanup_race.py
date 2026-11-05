@@ -227,7 +227,9 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             entity: msg.body for entity, msg in c.communicator.sent
             if msg.message_type == WorkerMessageType.DRAIN_REQUEST
         }
-        assert set(drains) == (set() if read_timing == "normal" else {"w0", "w1"})
+        # This fixture reports snapshots without sealing admission, so even a
+        # completed read requires the barrier. Native seals have separate tests.
+        assert set(drains) == {"w0", "w1"}
         for entity in teardown_order:
             if entity in drains:
                 workers[entity]._drain_request(drains[entity])

@@ -130,7 +130,7 @@ def _step(w, value):
             step_context=StepContext(request_ids=(), graph_walk=WALK, slot=0, capture=False),
         ),
         node_name=NODE, partition="default", graph_walk=WALK, loop_name=None,
-        speculative_new_iter=False,
+        speculative_new_iter=False, lane=0,
     )
     outputs = BatchedModelOutput(per_rid_outputs={RID: {"pred": [torch.full((1, 4), value)]}})
     Worker._postprocess_batch(w, pending, outputs)

@@ -295,7 +295,7 @@ def _decode_step(rids, final_stream=()):
     pending = SimpleNamespace(
         batch=batch, node_batch=node_batch, node_name="llm",
         partition="p", graph_walk="decode", loop_name="decode",
-        speculative_new_iter=False,
+        speculative_new_iter=False, lane=0,
     )
     return pending, outputs
 

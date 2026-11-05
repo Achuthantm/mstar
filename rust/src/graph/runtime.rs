@@ -344,6 +344,7 @@ pub struct GraphRuntime {
         profiling_encoded: Option<&[u8]>,
         speculative: bool,
         has_inflight_reads: bool,
+        input_epoch: Option<u64>,
     ) -> PyResult<Vec<u8>> {
         let request_id = self.rid_name(rid)?;
         // `and not speculative`, as Python has it: a speculatively-scheduled
@@ -357,6 +358,10 @@ pub struct GraphRuntime {
                 .unwrap_or(false);
 
         let partition = self.interner.get(partition_name);
+        let closed_input_epoch = partition
+            .and_then(|p| self.info(rid).and_then(|i| i.partitions.get(&p)))
+            .filter(|p| p.input_sealed && p.input_epoch == input_epoch)
+            .and_then(|p| p.input_epoch);
         let (persist, new_tokens, output_signals, stream_items) =
             match self.requests[rid as usize].as_mut() {
                 Some(info) => info.pending.take_for_send(partition),
@@ -369,6 +374,7 @@ pub struct GraphRuntime {
             request_id: &request_id,
             worker_id: self.interner.name(self.shard.me),
             has_inflight_reads,
+            closed_input_epoch,
             worker_graph_ids,
             is_first_tp_rank,
             persist_signals,
@@ -450,6 +456,12 @@ pub struct GraphRuntime {
         // borrowing all of `self`; `requests`, `graphs` and `states` are
         // disjoint fields, so `state_in` lets all three be held at once.
         for part in info.partitions.values() {
+            if part.input_sealed {
+                // A read may have finished before the clear snapshot while
+                // its result still waits in Python's ready queue. It must not
+                // restart this pass after reset, even though no read remains.
+                continue;
+            }
             for &wg in &part.walk_worker_graphs {
                 let g = &self.graphs[wg as usize];
                 let Some(node) = g.by_name.get(&dest).copied() else {
@@ -1707,6 +1719,11 @@ impl GraphRuntime {
     // Struct-of-arrays across the boundary, as everywhere else here: a dict
     // per worker graph would be a Python allocation per admission.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        request_id, partition, graph_walk, partition_worker_graph_ids,
+        worker_graph_ids, worker_graph_workers, workers_per_worker_graph,
+        loop_names, loop_caps, input_epoch = -1,
+    ))]
     fn add_request(
         &mut self,
         request_id: String,
@@ -1718,6 +1735,7 @@ impl GraphRuntime {
         workers_per_worker_graph: Vec<usize>,
         loop_names: Vec<String>,
         loop_caps: Vec<u32>,
+        input_epoch: i64,
     ) -> PyResult<u32> {
         let (handle, grew) = self.rids.intern(&request_id);
         if grew {
@@ -1819,7 +1837,10 @@ impl GraphRuntime {
                 info.worker_graphs.push(wg);
             }
         }
-        info.set_partition(partition_sym, walk_sym, live);
+        info.set_partition(partition_sym, walk_sym, live, mine);
+        if input_epoch >= 0 {
+            info.partitions.get_mut(&partition_sym).unwrap().open_inputs(input_epoch as u64);
+        }
 
         Ok(handle)
     }
@@ -1890,6 +1911,37 @@ impl GraphRuntime {
             return false;
         };
         info.set_walk(p, walk_sym, || live)
+    }
+
+    /// Non-streaming admission: a new authorized epoch opens the pass, while
+    /// same/older descriptors cannot reopen a sealed one.
+    fn accept_input_pass(
+        &mut self, rid: u32, partition: &str, walk: &str, input_epoch: i64,
+    ) -> bool {
+        let Some(p) = self.interner.get(partition) else { return false };
+        let Some(walk_sym) = self.interner.get(walk) else { return false };
+        let mut live = self.live_wgs_for(rid, walk_sym);
+        let Some(info) = self.requests.get_mut(rid as usize).and_then(|r| r.as_mut())
+        else { return false };
+        let Some(part) = info.partitions.get(&p) else { return false };
+        let enabled = part.input_epoch;
+        if let Some(current) = enabled {
+            live.retain(|wg| part.worker_graphs.contains(wg));
+            if input_epoch < 0 || (input_epoch as u64) < current {
+                return false;
+            }
+            if input_epoch as u64 == current {
+                return !part.input_sealed && part.graph_walk == walk_sym;
+            }
+            if !part.input_pending_wgs.is_empty() || live.is_empty() {
+                return false;
+            }
+        }
+        info.set_walk(p, walk_sym, || live);
+        if enabled.is_some() {
+            info.partitions.get_mut(&p).unwrap().open_inputs(input_epoch as u64);
+        }
+        true
     }
 
     /// Python's `is_partition_idle`: whether the walk can change without
@@ -3442,6 +3494,8 @@ impl GraphRuntime {
         info_rids, request_infos, ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
         publish_rids, publications, skip_rids = Vec::new(), inflight_read_rids = Vec::new(),
+        input_closure_rids = Vec::new(),
+        input_epochs = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn resume_postprocess_send(
@@ -3453,11 +3507,15 @@ impl GraphRuntime {
         publish_rids: Vec<u32>, publications: Vec<Option<Vec<u8>>>,
         skip_rids: Vec<u32>,
         inflight_read_rids: Vec<u32>,
+        input_closure_rids: Vec<u32>,
+        input_epochs: Vec<i64>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let args = postprocess::SendArgs {
             info_rids, request_infos, ntc_rids, new_token_counts, consumed_rids,
             stream_tokens_consumed, prof_rids, profiling, publish_rids, publications, skip_rids,
             inflight_read_rids,
+            input_closure_rids,
+            input_epochs,
         };
         self.pp_resume_send(py, args)
     }
@@ -3552,6 +3610,8 @@ impl GraphRuntime {
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
         publish_rids, publications, skip_rids = Vec::new(), inflight_read_rids = Vec::new(),
+        input_closure_rids = Vec::new(),
+        input_epochs = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3572,6 +3632,8 @@ impl GraphRuntime {
         publications: Vec<Option<Vec<u8>>>,
         skip_rids: Vec<u32>,
         inflight_read_rids: Vec<u32>,
+        input_closure_rids: Vec<u32>,
+        input_epochs: Vec<i64>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
@@ -3597,7 +3659,7 @@ impl GraphRuntime {
         let built = self.build_send_frames(
             completion_id, info_rids, request_infos, ntc_rids, new_token_counts,
             consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-            publish_rids, publications, skip_rids, inflight_read_rids,
+            publish_rids, publications, skip_rids, inflight_read_rids, input_closure_rids, input_epochs,
         );
         send_timing::record_body(t_body);
         let (out, frames) = built?;
@@ -3926,9 +3988,14 @@ impl GraphRuntime {
         // failed after routing: none of their frames go out
         skip_rids: Vec<u32>,
         inflight_read_rids: Vec<u32>,
+        input_closure_rids: Vec<u32>,
+        input_epochs: Vec<i64>,
     ) -> PyResult<(Vec<u32>, Vec<(String, Vec<u8>)>)> {
         let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
         let sent = (|| -> PyResult<Vec<u32>> {
+            let input_epochs: FxHashMap<u32, u64> = info_rids.iter().copied()
+                .zip(input_epochs).filter(|(_, epoch)| *epoch >= 0)
+                .map(|(rid, epoch)| (rid, epoch as u64)).collect();
             let request_infos: Vec<(u32, Option<Vec<u8>>)> =
                 info_rids.into_iter().zip(request_infos).collect();
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
@@ -4149,7 +4216,34 @@ impl GraphRuntime {
             }
 
             let inflight_reads: FxHashSet<u32> = inflight_read_rids.into_iter().collect();
+            let can_close: FxHashSet<u32> = input_closure_rids.into_iter().collect();
             for (rid, wg_ids, is_first_tp_rank, walk) in plan.completed {
+                let input_epoch = input_epochs.get(&rid).copied();
+                let completed: Vec<_> = wg_ids.iter().filter_map(|&wg| self.wg_index(wg)).collect();
+                // The main thread took the read snapshot immediately before
+                // this call; input handlers cannot run between it and the seal.
+                if let Some(part) = self.requests[rid as usize].as_mut()
+                    .and_then(|info| info.partitions.get_mut(&partition_sym))
+                {
+                    if input_epoch.is_some() && part.input_epoch == input_epoch {
+                        for wg in completed {
+                            part.complete_inputs(wg);
+                        }
+                        if can_close.contains(&rid) && part.input_pending_wgs.is_empty() {
+                            // A graph that finished earlier may have received
+                            // a late input while another local graph ran. Its
+                            // queued work could start more reads after this
+                            // report, so it also requires the drain barrier.
+                            let idle = part.walk_worker_graphs.iter().all(|&wg| {
+                                self.states[wg as usize][rid as usize].as_ref()
+                                    .is_some_and(|s| s.ready.iter().all(|&bits| bits == 0))
+                            });
+                            if idle {
+                                part.seal_inputs();
+                            }
+                        }
+                    }
+                }
                 let graph_walk = walk
                     .map(|w| self.interner.name(w).to_string())
                     .unwrap_or_default();
@@ -4160,6 +4254,7 @@ impl GraphRuntime {
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
                     inflight_reads.contains(&rid),
+                    input_epoch,
                 )?;
                 frames.push(("conductor".to_string(), bytes));
                 sent_rids.push(rid);

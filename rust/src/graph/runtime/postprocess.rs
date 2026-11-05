@@ -510,6 +510,8 @@ impl GraphRuntime {
             args.new_token_counts, args.consumed_rids, args.stream_tokens_consumed,
             args.prof_rids, args.profiling, args.publish_rids, args.publications, args.skip_rids,
             args.inflight_read_rids,
+            args.input_closure_rids,
+            args.input_epochs,
         )
     }
 
@@ -561,6 +563,9 @@ pub(super) struct SendArgs {
     pub skip_rids: Vec<u32>,
     /// Sparse read snapshot from the worker's tensor manager.
     pub inflight_read_rids: Vec<u32>,
+    /// Rows with no other step that can still need this pass's inputs.
+    pub input_closure_rids: Vec<u32>,
+    pub input_epochs: Vec<i64>,
 }
 
 #[cfg(test)]

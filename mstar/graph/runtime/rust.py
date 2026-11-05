@@ -319,6 +319,7 @@ class RustGraphRuntime(GraphRuntime):
         partition_worker_graph_ids: list[int],
         worker_graph_to_workers: ParallelList[int, list[str]],
         loop_caps: dict[str, int],
+        input_epoch: int = -1,
     ) -> int:
         flat: list[str] = []
         counts: list[int] = []
@@ -334,6 +335,7 @@ class RustGraphRuntime(GraphRuntime):
             list(partition_worker_graph_ids),
             list(worker_graph_to_workers.keys), flat, counts,
             list(loop_caps), list(loop_caps.values()),
+            input_epoch,
         )
         # One NewRequest arrives PER PARTITION, all carrying the same map, so
         # the first one settles it.
@@ -363,6 +365,9 @@ class RustGraphRuntime(GraphRuntime):
 
     def set_walk(self, rid: int, partition: str, walk: str):
         self._rust.set_walk(rid, partition, walk)
+
+    def accept_input_pass(self, rid: int, partition: str, walk: str, input_epoch: int) -> bool:
+        return self._rust.accept_input_pass(rid, partition, walk, input_epoch)
 
     def is_partition_idle(self, rid: int, partition: str) -> bool:
         return self._rust.is_partition_idle(rid, partition)
@@ -910,4 +915,11 @@ class RustGraphRuntime(GraphRuntime):
             ),
             skip_rids=list(input.failed_rids),
             inflight_read_rids=list(input.inflight_read_rids),
+            input_closure_rids=list(input.input_closure_rids),
+            input_epochs=(
+                input.input_epochs if input.input_epochs is not None else [
+                    getattr(info, "input_epoch", -1)
+                    for info in input.per_request_info.values
+                ]
+            ),
         )

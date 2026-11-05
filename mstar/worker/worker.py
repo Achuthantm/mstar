@@ -989,6 +989,15 @@ class Worker:
     def _add_new_request(self, body: NewRequest) -> None:
         if not self._takes_input(body.request_id):
             return
+        known = self._rid(body.request_id)
+        existing = self.request_state.per_request_info.get(known)
+        if existing:
+            part = existing.per_partition_info.get(body.request_info.partition_name)
+            if part is not None and part.current_fwd_info.input_epoch >= 0:
+                # One NEW_REQUEST opens each partition. A delayed duplicate
+                # cannot reset its seal, including one with a missing epoch.
+                self.tensor_manager.ack_unread_tensors(body.initial_inputs)
+                return
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         laps = PhaseLaps("worker.msg.new_request.")
         # The one place a handle is minted; a request with several partitions
@@ -1000,6 +1009,7 @@ class Worker:
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
             loop_caps=body.loop_caps,
+            input_epoch=body.request_info.input_epoch if self._side_steps is None else -1,
         )
         body.request_info.rid_handle = request_id
         if body.request_id in self._draining_rids:
@@ -1169,8 +1179,8 @@ class Worker:
 
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
         # ignoring ref counts / persist. The conductor gates REMOVE_REQUEST on
-        # completion reports and output delivery, adding the READS_DONE barrier
-        # for outstanding worker reads, client streams, and abort/failure.
+        # sealed, clear completion reports and output delivery, or the
+        # READS_DONE barrier when closure is not certified or on abort/failure.
         laps = PhaseLaps("worker.msg.remove_request.")
         self._mark_removed(body.request_id)
         freed = self.engine_manager.remove_request(request_id)
@@ -1339,6 +1349,14 @@ class Worker:
             return
         req_info = self.request_state.per_request_info.get(request_id)
 
+        non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
+        if non_streaming and not self._graph_runtime.accept_input_pass(
+            request_id, body.partition_name, body.request_info.graph_walk,
+            body.request_info.input_epoch,
+        ):
+            self.tensor_manager.ack_unread_tensors(body.inputs)
+            return
+
         if self.enable_nvtx:
             range_push("process_new_inputs.routing_update")
         # Handle producer_done signal: end the producer's streams it counts.
@@ -1354,7 +1372,6 @@ class Worker:
 
         # Separate streaming edges — they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in _check_ready_tensors)
-        non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
         buffers = req_info.stream_buffers if req_info else {}
         streaming_with_tensors = []
         unbuffered = []
@@ -1373,9 +1390,6 @@ class Worker:
             # handle); stamp this worker's so submodules keying per-request
             # state can use it directly.
             body.request_info.rid_handle = request_id
-            self._graph_runtime.set_walk(
-                request_id, body.partition_name, body.request_info.graph_walk,
-            )
             for _rid, _iters in self._graph_runtime.get_dynamic_loop_iters(
                 [request_id], partition=body.partition_name,
             ):
@@ -2619,7 +2633,10 @@ class Worker:
         self._drop_failed_rids(step, outputs, failed)
         self._fail_requests(failed)
 
-    def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+    def _finish_step(
+        self, step: PendingBatch, outputs: BatchedModelOutput,
+        *, next_step_rids: Iterable[int] = (),
+    ) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
         self.scheduler.clear_batch_limit(
@@ -2633,7 +2650,9 @@ class Worker:
             set_step_key(_step_key(step.node_name, step.graph_walk))
         try:
             with self._span(span, cpu=f"{span}.cpu"):
-                self._postprocess_batch(step, outputs, clear_loop_stops=chain)
+                self._postprocess_batch(
+                    step, outputs, clear_loop_stops=chain, next_step_rids=next_step_rids,
+                )
         finally:
             if keyed:
                 set_step_key(None)
@@ -3670,6 +3689,7 @@ class Worker:
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
         clear_loop_stops: bool = True,
+        next_step_rids: Iterable[int] = (),
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
@@ -3863,7 +3883,9 @@ class Worker:
                 _t_rt = _time.perf_counter() if self._phase_period else 0.0
                 step = rt.resume_postprocess(stored=route_tensors)
             else:
-                send = self._send_input(batch_N, request, step, stored, engine)
+                send = self._send_input(
+                    batch_N, request, step, stored, engine, next_step_rids=next_step_rids,
+                )
                 sent_here = True
                 stage = "send_prep"
                 _t_rt = _time.perf_counter() if self._phase_period else 0.0
@@ -4165,6 +4187,7 @@ class Worker:
     def _send_input(
         self, batch_N: PendingBatch, request: PostprocessRequest, step: PostprocessStep,
         stored: StoredOutputs | None, engine,
+        *, next_step_rids: Iterable[int] = (),
     ) -> SendInput:
         """SEND: what the send needs of the worker, after the stopped rows'
         finalize, the step's publication and the route's tensor work."""
@@ -4261,14 +4284,18 @@ class Worker:
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         consumed = self.streams.consumption_batch(send_rids)
         laps.lap("consumption")
+        infos = [
+            self.request_state.get_fwd_info(rid, batch_N.partition)
+            for rid in info_rids
+        ]
+        close_inputs = self._input_closure_candidates(
+            info_rids, infos, batch_N.lane, next_step_rids,
+        )
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
                 info_rids,
-                [
-                    self.request_state.get_fwd_info(rid, batch_N.partition)
-                    for rid in info_rids
-                ],
+                infos,
             ),
             new_token_counts=ParallelList(
                 ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
@@ -4291,7 +4318,28 @@ class Worker:
             inflight_read_rids=(
                 self.tensor_manager.inflight_read_rids(info_rids) if info_rids else frozenset()
             ),
+            input_closure_rids=close_inputs,
+            input_epochs=[
+                getattr(batch_N.node_batch.per_request_info.get(rid), "input_epoch", -1)
+                for rid in info_rids
+            ],
         )
+
+    def _input_closure_candidates(
+        self, rids: list[int], infos: list, lane: int, next_step_rids: Iterable[int],
+    ) -> frozenset[int]:
+        if self._side_steps is not None:
+            return frozenset()
+        candidates = {
+            rid for rid, info in zip(rids, infos, strict=True)
+            if info is not None and info.input_epoch >= 0
+        }
+        if candidates:
+            candidates.difference_update(next_step_rids)
+            for other, held in self._rows_by_lane.items():
+                if other != lane:
+                    candidates.difference_update(held)
+        return frozenset(candidates)
 
     def _walk_signals(self, batch: ScheduledBatch, walk: str):
         signals = batch.walk_output_signals.get(walk)
@@ -5445,7 +5493,12 @@ class Worker:
                     # failed rids upstream.
                     laps.skip()
                     if pending.node_batch.admit_error is None:
-                        self._finish_step(pending, outputs)
+                        self._finish_step(
+                            pending, outputs,
+                            next_step_rids=(
+                                spec_pending.batch.request_to_worker_graph if spec_pending is not None else ()
+                            ),
+                        )
                         laps.skip()
 
                     # After N, while N+1 runs: the same thread, but not ahead of

@@ -50,6 +50,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     processed, failed, registered = [], [], []
     w._graph_runtime = SimpleNamespace(
         add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
+        get_rid_handle=lambda rid: None,
         register_stop_limits=lambda rid, info: None,
     )
     w.engine_manager = SimpleNamespace(
@@ -67,7 +68,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
         request_info=SimpleNamespace(
-            partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
+            partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None, input_epoch=-1,
         ),
     )
     Worker._add_new_request(w, body)

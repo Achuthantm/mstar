@@ -34,7 +34,7 @@ def _conductor():
     pstate = SimpleNamespace(fwd_pass_number=0, random_seed=0, resource_publish_info=None)
     c.requests = {"r": SimpleNamespace(
         sharding_config=cfg, partition_states={"Thinker": pstate},
-        max_output_tokens=8, resource_configs={},
+        max_output_tokens=8, resource_configs={}, input_closure_enabled=False,
     )}
     c._update_persist_ref_counts = lambda rid, edges: None
     sent = {}
