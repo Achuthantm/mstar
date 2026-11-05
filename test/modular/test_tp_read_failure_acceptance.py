@@ -598,12 +598,17 @@ class _Reads:
 
     def fire(self):
         """The follower's reads of r1 resolve."""
+        from mstar.communication.tensors import _TRANSFER_FAILED, AsyncReadError
+
         if self.fired:
             return
         self.fired = True
+        # Every harness variant injects terminal Mooncake failures here,
+        # including subclasses that build their own pending reads.
+        self.tm._transfer_status = lambda _batch_id: _TRANSFER_FAILED
         for future, buffers, fails in self.late:
             if fails:
-                future.set_exception(RuntimeError("Mooncake read failed. Status: -1"))
+                future.set_exception(AsyncReadError("Mooncake read failed. Status: -1", {}, set()))
             else:
                 self._land(future, buffers)
 
