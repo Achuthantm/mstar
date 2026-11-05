@@ -42,31 +42,6 @@ Per path the tool prints p50 and p99 per size, throughput, the p50 of each phase
 
 The fixed cost dominates small tensors and the bandwidth large ones, so the fit is weighted to treat them alike. The measured crossover is the first size at which the cheaper path changes; the fitted one can fall between measured sizes or outside the range. Python-side costs (codec, polling) are part of every path, as in a worker. The receiver polls without blocking while reads are in flight, the way a worker loop does. Host copies of 32K elements or more fan out to torch's intra-op thread pool, which on a busy host adds milliseconds; M\* workers keep torch's default pool, so the default here does too, and `--torch-threads 1` takes that out to see the transport alone. With CUDA buffers the receiver process may print `terminate called without an active exception` as it exits, after the results are written. Results on a busy host are noisy: the JSON records the host, devices, mesh and Mooncake version, and the load average is worth noting alongside.
 
-## Input closure prototype
-
-`input_closure.py` compares the CPU cost of admission, repeated conductor-driven
-passes, completion and teardown. It uses real worker admission handlers, native
-Rust graph completion, conductor transitions and ZMQ; model execution, engine
-resources, GPU scheduling and tensor payloads are omitted. The API delivery ack
-is local. It does **not** measure client latency or serving throughput.
-
-```bash
-python -m benchmark.transport.input_closure --workers 2 --concurrency 1 32 64 --passes 16 --waves 30 --warmup 10 --json closure.json
-```
-
-Run the same script with each checkout's `PYTHONPATH` and a separately rebuilt
-Rust extension. `--force-drain` exercises the existing unconditional barrier on
-that same revision. `--pending-step` passes all rows to the production closure
-eligibility check as having another submitted step, forcing the prototype's
-fallback without simulating GPU work or a GPU wait.
-
-The JSON includes per-wave process CPU and wall time per request, source/native
-hashes, certificate and drain counts, and load average. Total CPU is conductor
-plus all worker processes; it covers the whole synthetic request, not cleanup
-alone. Every run checks completion/removal counts, the expected fast/fallback
-path, and unchanged source hashes. Use serial, interleaved repetitions on an idle
-host; increase `--passes` to expose costs paid again on each pass.
-
 ## Related
 
 The `*-pool` copy and zero-copy modes and the GPU-resident buffers follow a cross-node Mooncake throughput test that runs between two nodes in copy, zero-copy and GPUDirect modes. This tool adds per-size latency fitting, the inline crossover and control-channel interference for M\*'s own paths.
