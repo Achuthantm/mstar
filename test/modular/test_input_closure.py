@@ -33,13 +33,10 @@ from mstar.worker.worker import Worker
 
 
 def _info(epoch=0, request="r", partition="default", walk="run"):
-    info = CurrentForwardPassInfo(
+    return CurrentForwardPassInfo(
         request_id=request, graph_walk=walk, fwd_index=0,
-        random_seed=0, max_tokens=8, partition_name=partition,
+        random_seed=0, max_tokens=8, partition_name=partition, input_epoch=epoch,
     )
-    # Also usable against the unmodified PR2 as a negative control.
-    info.input_epoch = epoch
-    return info
 
 
 class _Case:
@@ -113,21 +110,15 @@ class _Case:
                 tensors=[], num_tensors=[0],
             ))
         info = self.worker.request_state.get_fwd_info(self.rid, "default")
-        kwargs = {}
-        # Keep the reproduction runnable against PR2, where the certificate
-        # does not exist; its real report leaves admission open.
-        if "input_closure_rids" in SendInput._fields:
-            kwargs["input_closure_rids"] = self.worker._input_closure_candidates(
-                [self.rid], [info], 0, other_work,
-            )
-            if reported_epoch is not None:
-                kwargs["input_epochs"] = [reported_epoch]
         send = SendInput(
             completion_id=route.completion_id,
             per_request_info=ParallelList([self.rid], [info]),
             new_token_counts=ParallelList([], []),
             inflight_read_rids=frozenset({self.rid}) if reads else frozenset(),
-            **kwargs,
+            input_closure_rids=self.worker._input_closure_candidates(
+                [self.rid], [info], 0, other_work,
+            ),
+            input_epochs=None if reported_epoch is None else [reported_epoch],
         )
         if native:
             assert self.rt.resume_postprocess(send=send).need is PostprocessNeed.DONE

@@ -82,37 +82,25 @@ Execution flow (simplified)
 Successful request cleanup
 --------------------------
 
-The conductor emits ``request_complete`` before cleanup. The preprocess
-worker acknowledges once it has delivered the expected output chunks.
-Compute workers either certify closed input admission in their completion
-reports or participate in the existing ``DRAIN_REQUEST`` / ``READS_DONE``
-barrier before ``REMOVE_REQUEST``.
+The conductor emits ``request_complete`` before cleanup. ``REMOVE_REQUEST``
+waits for the preprocess worker's output-delivery acknowledgement and for
+compute workers to certify closed input admission or finish the
+``DRAIN_REQUEST`` / ``READS_DONE`` barrier.
 
-This branch prototypes input closure for non-streaming, single-rank worker
-graphs. The conductor stamps each partition's inputs with ``input_epoch``;
-it advances this generation before sending a new pass, including a repeated
-walk. It is separate from ``fwd_index``, whose existing update order is
-unchanged. Workers forward the generation with peer inputs.
+For non-streaming, single-rank graphs, the conductor advances ``input_epoch``
+before sending each new pass. The runtime can seal admission once every local
+graph in that pass finishes and no queued or submitted work remains. Completion
+reports carry the executing batch's epoch and a request-wide read snapshot,
+taken on the main thread without interleaved input handling. Skipping the drain
+requires a valid seal from every participant for its last authorized pass and
+no outstanding reads. Workers absent from a later walk keep their earlier seal.
 
-Once every local graph in a pass finishes, the runtime can seal that
-partition's admission. Same-generation or older input descriptors are
-acknowledged unread, and already-read edges waiting for graph ingestion
-cannot restart a sealed pass. A newer conductor-authorized generation
-reopens admission. The seal survives graph-state reset and is destroyed
-with the request, before its local handle can be reused.
+A sealed pass acknowledges same-generation or older input descriptors unread;
+already-read queued edges cannot restart it. A newer authorized epoch reopens
+admission. Seals survive graph reset and are removed with the request before
+its handle is reused.
 
-The worker supplies the executing batch's generation and a request-wide
-read snapshot to the completion report. Snapshot and seal run on the main
-thread without interleaved input handling. The conductor skips compute
-draining only when every participating worker has a valid seal for its
-last authorized pass and no worker reports outstanding reads. Workers
-absent from a later walk keep their earlier seal; participating workers
-must certify the new generation. Output delivery still needs its own ack.
-
-Streaming, TP/SP, side-step deployments, cached rows without execution
-metadata, and requests with queued work or another submitted step retain the drain
-barrier. In particular, an async loop's speculative final step can prevent
-the fast path. Abort/failure cleanup and the existing forced-drain timeout
-are unchanged. This prototype does not establish the fast path's benefit
-for GPU workloads; ``benchmark/transport/input_closure.py`` measures only
-the CPU protocol cost.
+Streaming, TP/SP, side-step deployments, missing execution metadata, and queued
+or submitted work require the drain barrier. Read failures whose transfer
+status is unknown keep that barrier pending until forced removal. The existing
+forced-drain timeout still applies.
