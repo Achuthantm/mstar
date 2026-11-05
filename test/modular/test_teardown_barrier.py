@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionState
+from mstar.conductor.request_info import PartitionState
 from mstar.graph.base import TensorPointerInfo
 from mstar.utils.ipc_format import (
     FailRequests,
@@ -104,7 +104,7 @@ def _report_reads(c, worker, inflight, partition="default", rid="r1"):
     rd = c.requests[rid]
     rd.partition_states.setdefault(partition, PartitionState(
         partition_name=partition,
-        metadata=CurrentForwardConductorMetadata(graph_walk="decode", is_prefill=False),
+        graph_walk="decode",
         current_worker_graph_ids={0},
     ))
     return c._process_worker_graphs_done(WorkerGraphsDone(
@@ -188,16 +188,19 @@ def test_done_completes_client_immediately_but_defers_remove():
     c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
     c._process_request_done("r1")
 
-    # Client told right away; no worker reported reads so only the preprocess worker
-    # must ACK — no Remove yet.
+    # Client told right away; without closure certificates every participant
+    # must ACK before removal.
     completes = [m for e, m in c.sent if e == "api_server"
                  and m.message_type == "request_complete"]
     assert len(completes) == 1
     assert _remove_targets(c, "r1") == set()
-    assert c.draining["r1"].expected_acks == {PREPROCESS}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
     assert "r1" in c.requests
 
     c._handle_reads_done(ReadsDone(request_id="r1", entity_id=PREPROCESS))
+    assert _remove_targets(c, "r1") == set()
+    c._handle_reads_done(ReadsDone("r1", "w0"))
+    c._handle_reads_done(ReadsDone("r1", "w1"))
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
     assert "r1" not in c.requests
     assert c.admits == 1
@@ -226,15 +229,18 @@ def test_done_with_a_followers_extra_read_drains_all_workers(early_preprocess_ac
     assert "r1" not in c.requests and c.admits == 1
 
 
-def test_clear_reports_keep_the_no_drain_path():
+def test_clear_snapshots_without_seals_still_drain():
     c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
     _report_reads(c, "w0", False)
     _report_reads(c, "w1", False)
     assert c.requests["r1"].workers_with_inflight_reads is None
     c._process_request_done("r1")
-    assert _drain_targets(c, "r1") == set()
-    assert c.draining["r1"].expected_acks == {PREPROCESS}
+    assert _drain_targets(c, "r1") == {"w0", "w1"}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
     c._handle_reads_done(ReadsDone("r1", PREPROCESS))
+    assert _remove_targets(c, "r1") == set()
+    c._handle_reads_done(ReadsDone("r1", "w0"))
+    c._handle_reads_done(ReadsDone("r1", "w1"))
     assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
 
 
@@ -245,9 +251,10 @@ def test_a_later_clear_report_supersedes_only_that_workers_snapshot():
     _report_reads(c, "w0", False, partition="consumer")
     assert c.requests["r1"].workers_with_inflight_reads == {"w1"}
     _report_reads(c, "w1", False, partition="consumer")
+    assert not c.requests["r1"].workers_with_inflight_reads
     c._process_request_done("r1")
-    assert _drain_targets(c, "r1") == set()
-    assert c.draining["r1"].expected_acks == {PREPROCESS}
+    assert _drain_targets(c, "r1") == {"w0", "w1"}
+    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
 
 
 def test_read_reports_do_not_hold_another_requests_teardown():
@@ -255,7 +262,8 @@ def test_read_reports_do_not_hold_another_requests_teardown():
     _report_reads(c, "w0", True, rid="r1")
     _report_reads(c, "w0", False, rid="r2")
     c._process_request_done("r2")
-    assert _drain_targets(c, "r2") == set()
+    assert _drain_targets(c, "r2") == {"w0"}
+    c._handle_reads_done(ReadsDone("r2", "w0"))
     c._handle_reads_done(ReadsDone("r2", PREPROCESS))
     assert "r2" not in c.requests
     assert c.requests["r1"].workers_with_inflight_reads == {"w0"}

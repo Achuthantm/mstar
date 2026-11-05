@@ -312,11 +312,11 @@ def test_postprocess_snapshots_reads_once_for_the_whole_batch():
 
     w.tensor_manager.inflight_read_rids = snapshot
     w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
-    Worker._postprocess_batch(w, *_decode_step([0, 1]))
+    w.executor.postprocess(*_decode_step([0, 1]))
     assert snapshots == [frozenset({0})]
     assert sends[0].inflight_read_rids == frozenset({0})
     pending.set_result(None)
-    Worker._postprocess_batch(w, *_decode_step([0, 1]))
+    w.executor.postprocess(*_decode_step([0, 1]))
     assert snapshots == [frozenset({0}), frozenset()]
     assert sends[1].inflight_read_rids == frozenset()
 

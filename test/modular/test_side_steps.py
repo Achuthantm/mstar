@@ -207,8 +207,8 @@ def test_finishing_a_step_lifts_its_limit_then_postprocesses():
     worker.pipeline._finish_step(_step([2], lane=CHAIN_LANE), "outputs")
 
     assert worker.log == [
-        "clear limit", ("postprocess", "outputs", {"clear_loop_stops": False}),
-        "clear limit", ("postprocess", "outputs", {"clear_loop_stops": True}),
+        "clear limit", ("postprocess", "outputs", {"clear_loop_stops": False, "next_step_rids": ()}),
+        "clear limit", ("postprocess", "outputs", {"clear_loop_stops": True, "next_step_rids": ()}),
     ]
 
 
@@ -277,7 +277,7 @@ def test_postprocess_runs_after_the_step_has_landed_and_its_flags_are_down():
 
     assert worker.log == [
         "wait for step", "clear in flight", "clear limit",
-        ("postprocess", "outputs of [1, 2]", {"clear_loop_stops": False}),
+        ("postprocess", "outputs of [1, 2]", {"clear_loop_stops": False, "next_step_rids": ()}),
     ]
     assert pipeline.side_pending is None and pipeline.in_flight_rids == {9}
 
@@ -302,7 +302,7 @@ def test_block_waits_for_a_step_still_running():
     worker.pipeline._finish_side(block=True)
 
     assert worker.log[0] == "wait for step"
-    assert ("postprocess", "outputs of [1]", {"clear_loop_stops": False}) in worker.log
+    assert ("postprocess", "outputs of [1]", {"clear_loop_stops": False, "next_step_rids": ()}) in worker.log
 
 
 def test_failed_rows_are_reported_before_the_step_routes():
@@ -312,7 +312,7 @@ def test_failed_rows_are_reported_before_the_step_routes():
     worker.pipeline._finish_side()
 
     assert worker.log.index(("fail", [2])) < worker.log.index(
-        ("postprocess", "outputs of [1, 2]", {"clear_loop_stops": False}),
+        ("postprocess", "outputs of [1, 2]", {"clear_loop_stops": False, "next_step_rids": ()}),
     )
 
 

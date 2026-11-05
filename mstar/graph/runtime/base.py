@@ -567,6 +567,12 @@ class SendInput(NamedTuple):
     failed_rids: frozenset[int] = frozenset()
     # Sparse request-wide read snapshot; only positive reports cross into Rust.
     inflight_read_rids: frozenset[int] = frozenset()
+    # The runtime may seal these rows once all local graphs for their epoch
+    # have completed. The worker excludes other in-flight work first.
+    input_closure_rids: frozenset[int] = frozenset()
+    # Epoch of the executing batch, parallel to per_request_info. An older
+    # speculative step can retire after newer forward-pass metadata arrives.
+    input_epochs: list[int] | None = None
 
 
 class PostprocessNeed(IntEnum):
@@ -875,6 +881,7 @@ class GraphRuntime(PhasedPostprocess, ABC):
         partition_worker_graph_ids: list[int],
         worker_graph_to_workers: ParallelList[int, list[str]],
         loop_caps: Mapping[str, int],
+        input_epoch: int = -1,
     ) -> int:
         """
         Returns the integer handle for this request. Each loop named in
@@ -926,6 +933,11 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     @abstractmethod
     def set_walk(self, rid: int, partition: str, walk: str):
+        pass
+
+    @abstractmethod
+    def accept_input_pass(self, rid: int, partition: str, walk: str, input_epoch: int) -> bool:
+        """Authorize non-streaming input before any transport read starts."""
         pass
 
     @abstractmethod

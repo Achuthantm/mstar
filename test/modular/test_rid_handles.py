@@ -272,7 +272,7 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
 
     w.request_state.add_request = _state_add
     info = SimpleNamespace(
-        rid_handle=-1, resource_configs={}, graph_walk="decode",
+        input_epoch=-1, rid_handle=-1, resource_configs={}, graph_walk="decode",
         partition_name="p",
     )
     body = SimpleNamespace(
@@ -311,14 +311,14 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
             chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3),
         )],
     )
-    req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
+    req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={}, per_partition_info={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
     w.streams.consumer_node = {"codec_tokens": "Codec"}
 
     def new(partition, lead):
         info = SimpleNamespace(
-            rid_handle=-1, resource_configs={}, graph_walk="w", partition_name=partition,
+            input_epoch=-1, rid_handle=-1, resource_configs={}, graph_walk="w", partition_name=partition,
             stream_lead_items=lead,
         )
         body = SimpleNamespace(

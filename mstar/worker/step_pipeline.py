@@ -408,7 +408,12 @@ class StepPipeline:
         # valid; ``_handle_admit_failure`` already rehabilitated the failed rids.
         laps.skip()
         if pending.node_batch.admit_error is None:
-            self._finish_step(pending, outputs)
+            self._finish_step(
+                pending, outputs,
+                next_step_rids=(
+                    self._spec_pending.batch.request_to_worker_graph if self._spec_pending is not None else ()
+                ),
+            )
             laps.skip()
 
         # After N, while N+1 runs: the same thread, but not ahead of the step the
@@ -655,7 +660,10 @@ class StepPipeline:
         self.executor.drop_failed_rids(step, outputs, failed)
         self._fail_requests(failed)
 
-    def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+    def _finish_step(
+        self, step: PendingBatch, outputs: BatchedModelOutput,
+        *, next_step_rids: Iterable[int] = (),
+    ) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
         self.admission.clear_batch_limit(
@@ -669,7 +677,10 @@ class StepPipeline:
             set_step_key(step_key(step.node_name, step.graph_walk))
         try:
             with self.timer.span(span, cpu=f"{span}.cpu"):
-                self.executor.postprocess(step, outputs, clear_loop_stops=chain)
+                self.executor.postprocess(
+                    step, outputs, clear_loop_stops=chain,
+                    next_step_rids=next_step_rids, rows_by_lane=self._rows_by_lane,
+                )
         finally:
             if keyed:
                 set_step_key(None)
@@ -951,8 +962,8 @@ class StepPipeline:
         ))
         # Hard cleanup: force-drop every tensor for the rid (unlink SHM),
         # ignoring ref counts / persist. The conductor gates REMOVE_REQUEST on
-        # completion reports and output delivery, adding the READS_DONE barrier
-        # for outstanding worker reads, client streams, and abort/failure.
+        # sealed, clear completion reports and output delivery, or the
+        # READS_DONE barrier when closure is not certified or on abort/failure.
         laps = PhaseLaps("worker.msg.remove_request.")
         for message in self.lifecycle.removed(rid, wire_rid):
             self.ingest.drop_for_removed(message)

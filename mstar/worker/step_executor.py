@@ -9,7 +9,7 @@ import math
 import threading
 import time
 import time as _time
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -703,6 +703,8 @@ class StepExecutor:
         self, batch_N: PendingBatch,
         outputs: BatchedModelOutput,
         clear_loop_stops: bool = True,
+        next_step_rids: Iterable[int] = (),
+        rows_by_lane: Mapping[int, frozenset[int]] | None = None,
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
@@ -904,7 +906,10 @@ class StepExecutor:
                 _t_rt = _time.perf_counter() if self.timer.period else 0.0
                 step = rt.resume_postprocess(stored=route_tensors)
             else:
-                send = self._send_input(batch_N, request, step, stored, engine)
+                send = self._send_input(
+                    batch_N, request, step, stored, engine,
+                    next_step_rids=next_step_rids, rows_by_lane=rows_by_lane,
+                )
                 sent_here = True
                 stage = "send_prep"
                 _t_rt = _time.perf_counter() if self.timer.period else 0.0
@@ -1206,6 +1211,8 @@ class StepExecutor:
     def _send_input(
         self, batch_N: PendingBatch, request: PostprocessRequest, step: PostprocessStep,
         stored: StoredOutputs | None, engine,
+        *, next_step_rids: Iterable[int] = (),
+        rows_by_lane: Mapping[int, frozenset[int]] | None = None,
     ) -> SendInput:
         """SEND: what the send needs of the worker, after the stopped rows'
         finalize, the step's publication and the route's tensor work."""
@@ -1304,14 +1311,15 @@ class StepExecutor:
         # runtime side. A rid left out gets nothing added,
         # which is what an empty entry did.
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
+        infos = [self.request_state.get_fwd_info(rid, batch_N.partition) for rid in info_rids]
+        close_inputs = self._input_closure_candidates(
+            info_rids, infos, batch_N.lane, next_step_rids, rows_by_lane,
+        )
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
                 info_rids,
-                [
-                    self.request_state.get_fwd_info(rid, batch_N.partition)
-                    for rid in info_rids
-                ],
+                infos,
             ),
             new_token_counts=ParallelList(
                 ntc_rids, [new_token_counts[rid] for rid in ntc_rids],
@@ -1331,7 +1339,30 @@ class StepExecutor:
             inflight_read_rids=(
                 self.tensor_manager.inflight_read_rids(info_rids) if info_rids else frozenset()
             ),
+            input_closure_rids=close_inputs,
+            input_epochs=[
+                getattr(batch_N.node_batch.per_request_info.get(rid), "input_epoch", -1)
+                for rid in info_rids
+            ],
         )
+
+    def _input_closure_candidates(
+        self, rids: list[int], infos: list, lane: int, next_step_rids: Iterable[int],
+        rows_by_lane: Mapping[int, frozenset[int]] | None = None,
+    ) -> frozenset[int]:
+        if self._layout.side_keys:
+            return frozenset()
+        candidates = {
+            rid for rid, info in zip(rids, infos, strict=True)
+            if info is not None and info.input_epoch >= 0
+        }
+        if candidates:
+            candidates.difference_update(next_step_rids)
+            if rows_by_lane:
+                for other, held in rows_by_lane.items():
+                    if other != lane:
+                        candidates.difference_update(held)
+        return frozenset(candidates)
 
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",

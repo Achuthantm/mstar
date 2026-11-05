@@ -54,6 +54,7 @@ def _worker(
         get_rid_handle=lambda r: r if r in known_rids else None,
         register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
+        accept_input_pass=lambda *a: True,
         remove_request=lambda h: None,
         # The TP fan-out reads the sharding config off the runtime now; no
         # groups means no followers, which is what these tests assume.
@@ -235,6 +236,7 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
             step_context=StepContext(request_ids=(), graph_walk="prefill", slot=0, capture=False),
         ),
         node_name="LLM", partition="default", graph_walk="prefill", loop_name=None, speculative_new_iter=False,
+        lane=0,
     )
 
     w.executor.postprocess(pending, BatchedModelOutput())
@@ -444,7 +446,7 @@ def test_a_follower_takes_in_a_new_request_that_follows_rank_0s_drain_without_re
     _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
     assert len(_reads_done(w)) == 1
     _remove(w, request_id="X", source=MessageSource.TP_RANK_0)
-    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p", input_epoch=-1)
     w.ingest._add_new_request(SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
@@ -512,7 +514,7 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
 
     _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
     assert not _reads_done(w)
-    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p", input_epoch=-1)
     w.ingest._add_new_request(SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
@@ -558,7 +560,7 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
         wakeup_event=SimpleNamespace(register_futures=lambda f: None),
         streams=StreamBufferManager(request_state, tensor_manager, []),
     )
-    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
+    info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p", input_epoch=-1)
     w.ingest._add_new_request(SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},

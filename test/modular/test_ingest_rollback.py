@@ -55,7 +55,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     w = make_worker(
         graph_runtime=SimpleNamespace(
-            add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
+            add_request=lambda **kw: 5, get_sharding_config=lambda rid: None, get_rid_handle=lambda wire: None,
             register_stop_limits=lambda rid, info: None,
         ),
         engine_manager=SimpleNamespace(
@@ -84,7 +84,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
         initial_inputs=[],
         request_info=SimpleNamespace(
-            partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None,
+            partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None, input_epoch=-1,
         ),
     )
     w.ingest._add_new_request(body)

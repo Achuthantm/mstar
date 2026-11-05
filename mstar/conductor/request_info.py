@@ -62,6 +62,10 @@ class CurrentForwardPassInfo:
     # items run under; set by the producer worker as the pass emits
     stream_consumer_walks: dict[str, str] = field(default_factory=dict)
 
+    # Conductor-issued admission generation. -1 retains drain-based closure.
+    # Separate from fwd_index, which is advanced after the next pass is sent.
+    input_epoch: int = -1
+
     def update_publish_info(self, other: dict[str, PublishedInfo]):
         merge_publish_info(self.resource_publish_info, other)
 
@@ -135,6 +139,9 @@ class PartitionState:
     graph_walk: str = ""
     fwd_pass_number: int = 0
     random_seed: int = 0
+    input_epoch: int = 0
+    input_workers: set[str] = field(default_factory=set)
+    input_closed_workers: set[str] = field(default_factory=set)
     is_done: bool = False
     completed_worker_graph_ids: set[int] = field(default_factory=set)
     current_worker_graph_ids: set[int] = field(default_factory=set)

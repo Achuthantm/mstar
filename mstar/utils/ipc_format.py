@@ -407,6 +407,9 @@ class WorkerGraphsDone(MessageBody):
     # The sender identifies the rank whose previous snapshot this replaces.
     worker_id: str = ""
     has_inflight_reads: bool = False
+    # Admission was sealed for this partition/pass before this report was sent.
+    # -1 means the sender supplied only a read snapshot.
+    closed_input_epoch: int = -1
 
 
 @dataclass

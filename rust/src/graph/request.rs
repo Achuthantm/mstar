@@ -29,12 +29,39 @@ pub struct WorkerGraphMeta {
 /// Per (request, partition).
 pub struct RequestPartitionInfo {
     pub graph_walk: Sym,
+    /// All local graphs assigned to this partition, including later walks.
+    pub worker_graphs: Vec<WgIndex>,
     /// Local worker graphs live in the CURRENT walk. Derived from the walk, so
     /// it is a cache: `set_walk` recomputes it, and nothing else may write it.
     pub walk_worker_graphs: Vec<WgIndex>,
     /// Set when the consuming pass sees the final streaming chunk, or a stop
     /// check returns `END_PARTITION`.
     pub partition_done: bool,
+    /// Survives RequestState::reset, so a late descriptor cannot start the
+    /// completed pass again. None is the unconditional-drain path.
+    pub input_epoch: Option<u64>,
+    pub input_sealed: bool,
+    pub input_pending_wgs: Vec<WgIndex>,
+}
+
+impl RequestPartitionInfo {
+    pub fn open_inputs(&mut self, epoch: u64) {
+        self.input_epoch = Some(epoch);
+        self.input_sealed = false;
+        self.input_pending_wgs.clone_from(&self.walk_worker_graphs);
+    }
+
+    pub fn complete_inputs(&mut self, wg: WgIndex) {
+        if self.input_epoch.is_some() {
+            self.input_pending_wgs.retain(|&pending| pending != wg);
+        }
+    }
+
+    pub fn seal_inputs(&mut self) {
+        if self.input_epoch.is_some() && self.input_pending_wgs.is_empty() {
+            self.input_sealed = true;
+        }
+    }
 }
 
 /// Python's `NestedLoopIndices`, as the runtime stores it.
@@ -207,13 +234,20 @@ impl RequestInfo {
     ///
     /// `live` is the worker graphs active in `walk`; the caller derives it
     /// because only it holds the walk -> worker graph index.
-    pub fn set_partition(&mut self, partition: PartitionId, walk: Sym, live: Vec<WgIndex>) {
+    pub fn set_partition(
+        &mut self, partition: PartitionId, walk: Sym,
+        live: Vec<WgIndex>, worker_graphs: Vec<WgIndex>,
+    ) {
         self.partitions.insert(
             partition,
             RequestPartitionInfo {
                 graph_walk: walk,
+                worker_graphs,
                 walk_worker_graphs: live,
                 partition_done: false,
+                input_epoch: None,
+                input_sealed: false,
+                input_pending_wgs: Vec::new(),
             },
         );
     }
@@ -320,7 +354,7 @@ mod tests {
     #[test]
     fn set_walk_reports_only_real_transitions_and_refreshes_the_cache() {
         let mut info = RequestInfo::default();
-        info.set_partition(7, 100, vec![0]);
+        info.set_partition(7, 100, vec![0], vec![0]);
 
         // Same walk: no transition, and the cache is left alone.
         assert!(!info.set_walk(7, 100, || vec![9, 9]));
@@ -363,8 +397,8 @@ mod tests {
     #[test]
     fn partition_done_is_per_partition() {
         let mut info = RequestInfo::default();
-        info.set_partition(1, 10, vec![]);
-        info.set_partition(2, 20, vec![]);
+        info.set_partition(1, 10, vec![], vec![]);
+        info.set_partition(2, 20, vec![], vec![]);
         info.mark_partition_done(1);
         assert!(info.partition_done(1));
         assert!(!info.partition_done(2));

@@ -238,6 +238,7 @@ pub struct WorkerGraphsDone<'a> {
     pub request_id: &'a str,
     pub worker_id: &'a str,
     pub has_inflight_reads: bool,
+    pub closed_input_epoch: Option<u64>,
     pub worker_graph_ids: &'a [u32],
     pub is_first_tp_rank: bool,
     pub persist_signals: Vec<(Sym, Vec<TensorPointerInfo>)>,
@@ -262,6 +263,9 @@ impl WorkerGraphsDone<'_> {
             w_str(m.key("request_id"), self.request_id);
             w_str(m.key("worker_id"), self.worker_id);
             w_bool(m.key("has_inflight_reads"), self.has_inflight_reads);
+            if let Some(epoch) = self.closed_input_epoch {
+                w_u64(m.key("closed_input_epoch"), epoch);
+            }
             w_arr(m.key("worker_graph_ids"), self.worker_graph_ids.len() as u32);
             for &w in self.worker_graph_ids {
                 w_u64(m.buf(), w as u64);

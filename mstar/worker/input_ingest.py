@@ -179,6 +179,15 @@ class InputIngest:
         # READS_DONE the worker still takes the request in, without reads, since on a follower rank 0's moves for the
         # request wait until it holds the request.
         unread = not lifecycle.takes_input(wire_rid)
+        known = self._runtime.get_rid_handle(wire_rid)
+        existing = self._request_state.per_request_info.get(known)
+        if existing:
+            part = existing.per_partition_info.get(body.request_info.partition_name)
+            if part is not None and part.current_fwd_info.input_epoch >= 0:
+                # One NEW_REQUEST opens each partition. A delayed duplicate
+                # cannot reset its seal, including one with a missing epoch.
+                self._tensors.ack_unread_tensors(body.initial_inputs)
+                return
         logger.debug("Worker %s received request %s", self._worker_id, wire_rid)
         laps = PhaseLaps("worker.msg.new_request.")
         runtime = self._runtime
@@ -191,6 +200,7 @@ class InputIngest:
             partition_worker_graph_ids=body.partition_worker_graph_ids,
             worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
             loop_caps=body.loop_caps,
+            input_epoch=body.request_info.input_epoch if not self._layout.side_keys else -1,
         )
         body.request_info.rid_handle = rid
         lifecycle.add(rid, wire_rid)
@@ -316,6 +326,14 @@ class InputIngest:
         req_info = self._request_state.per_request_info.get(rid)
         enable_nvtx = self._enable_nvtx
 
+        non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
+        if non_streaming and not runtime.accept_input_pass(
+            rid, body.partition_name, body.request_info.graph_walk,
+            body.request_info.input_epoch,
+        ):
+            self._tensors.ack_unread_tensors(body.inputs)
+            return
+
         if enable_nvtx:
             range_push("process_new_inputs.routing_update")
         # Handle producer_done signal: end the producer's streams it counts.
@@ -331,7 +349,6 @@ class InputIngest:
 
         # Separate streaming edges: they'll be handled when tensors are ready
         # (streaming edges with tensor_info go through RDMA, handled in check_ready_tensors)
-        non_streaming = [edge for edge in body.inputs if not edge.is_streaming]
         buffers = req_info.stream_buffers if req_info else {}
         streaming_with_tensors = []
         unbuffered = []
@@ -350,7 +367,6 @@ class InputIngest:
             # handle); stamp this worker's so submodules keying per-request
             # state can use it directly.
             body.request_info.rid_handle = rid
-            runtime.set_walk(rid, body.partition_name, body.request_info.graph_walk)
             for _rid, _iters in runtime.get_dynamic_loop_iters(
                 [rid], partition=body.partition_name,
             ):

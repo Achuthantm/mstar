@@ -387,6 +387,7 @@ class RequestData:
     # Latest read reports, across all partitions and ranks. Allocate only
     # when a worker reports reads; a later clear report removes that worker.
     workers_with_inflight_reads: set[str] | None = None
+    input_closure_enabled: bool = False
 
     # Partition state (always populated — single-partition models use a "default" partition)
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
@@ -1500,6 +1501,10 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
             prompt_tokens=body.prompt_tokens,
+            input_closure_enabled=(
+                not streaming_connections and not body.input_open and not self._client_streams
+                and all(len(workers) == 1 for workers in worker_graph_to_workers.values())
+            ),
         )
         self._register_request(body.request_id, request_data)
 
@@ -1523,6 +1528,7 @@ class Conductor:
             ).items():
                 fwd_args = first_steps[partition_name]
                 pstate = partition_states[partition_name]
+                pstate.input_workers.add(worker_id)
                 inputs_per_worker = self._split_inputs_to_workers(
                     sharding_config=request_data.sharding_config,
                     inputs=fwd_args.inputs,
@@ -1544,6 +1550,7 @@ class Conductor:
                         step_metadata=fwd_args.step_metadata,
                         stream_lead_items=stream_lead_items,
                         fwd_index=pstate.fwd_pass_number,
+                        input_epoch=pstate.input_epoch if request_data.input_closure_enabled else -1,
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
@@ -1879,14 +1886,15 @@ class Conductor:
         if still_persisted:
             self._un_persist_tensors(request_id, still_persisted)
 
-        # The preprocess worker may still be delivering outputs. Workers
-        # reporting extra reads need the drain barrier too, including every
-        # TP rank: followers only honor their leader's forwarded drain.
-        # Client streams always drain because new input can arrive after a
-        # worker's completion report.
+        # A clear snapshot is sufficient only after every participant sealed
+        # its last authorized input pass. Unsupported paths retain the barrier.
         workers = self._request_workers(request_data)
         expected_acks = {self.PREPROCESS_WORKER}
-        if self._client_streams or request_data.workers_with_inflight_reads:
+        inputs_closed = request_data.input_closure_enabled and all(
+            p.input_workers and p.input_workers <= p.input_closed_workers
+            for p in request_data.partition_states.values()
+        )
+        if self._client_streams or request_data.workers_with_inflight_reads or not inputs_closed:
             self._send_drain(request_id, workers)
             expected_acks |= workers
         self._register_draining(
@@ -1950,6 +1958,14 @@ class Conductor:
             request_data.workers_with_inflight_reads.add(body.worker_id)
         elif request_data.workers_with_inflight_reads:
             request_data.workers_with_inflight_reads.discard(body.worker_id)
+
+        if (
+            request_data.input_closure_enabled
+            and body.closed_input_epoch == pstate.input_epoch
+            and not body.has_inflight_reads
+            and body.worker_id in pstate.input_workers
+        ):
+            pstate.input_closed_workers.add(body.worker_id)
 
         # Any report of the pass may carry it, not only the one that completes
         # the pass: that can be another worker's (an encoder's, say).
@@ -2078,6 +2094,15 @@ class Conductor:
                         self._send_producer_done(request_id, conn.from_partition, conn.to_partition)
         elif fwd_args.inputs:
             # Partition has inputs to send — conductor-driven
+            if request_data.input_closure_enabled:
+                pstate.input_epoch += 1
+                # Workers absent from the new walk keep their earlier seal.
+                pstate.input_closed_workers.difference_update(
+                    worker
+                    for wg_id, workers in request_data.worker_graph_to_workers.items()
+                    if pstate.graph_walk in self.worker_graphs[wg_id].graph_walks
+                    for worker in workers
+                )
             self._send_inputs(request_id, partition_name, fwd_args.inputs, pstate.graph_walk, fwd_args.step_metadata)
         # else: no inputs — partition self-triggers via StreamBuffer
 
@@ -2216,6 +2241,7 @@ class Conductor:
                         graph_walk=graph_walk,
                         step_metadata=step_metadata,
                         fwd_index=pstate.fwd_pass_number,
+                        input_epoch=pstate.input_epoch if request_data.input_closure_enabled else -1,
                         random_seed=pstate.random_seed,
                         resource_publish_info=pstate.resource_publish_info,
                         partition_name=partition_name,

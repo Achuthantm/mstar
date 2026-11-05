@@ -91,13 +91,13 @@ class _Mesh:
             bookkeeping=self.book._rust, me=ME, communicator=self.comm,
         )
 
-    def admit(self, wgs=(WG_ID,), workers=(ME,)):
+    def admit(self, wgs=(WG_ID,), workers=(ME,), input_epoch=-1):
         return self.rt.add_request(
             # Single partition, so the partition's worker graphs and the
             # request's are the same list.
             "r1", "default", WALK, list(wgs), list(wgs), list(workers),
             [1] * len(wgs),
-            [], [],
+            [], [], input_epoch=input_epoch,
         )
 
     def run(self, rid, uuids, route=None, **send_kwargs):
@@ -146,6 +146,8 @@ def _send(rt, completion_id, **aos):
         publish_rids=publish_rids, publications=publications,
         skip_rids=aos.get("skip_rids", []),
         inflight_read_rids=aos.get("inflight_read_rids", []),
+        input_closure_rids=aos.get("input_closure_rids", []),
+        input_epochs=aos.get("input_epochs", []),
     )
 
 
@@ -204,6 +206,20 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path, infligh
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
+
+
+@pytest.mark.parametrize("executing_epoch", [0, 1])
+def test_a_completion_certifies_only_its_executing_input_epoch(tmp_path, executing_epoch):
+    mesh = _Mesh(tmp_path, outs=[("out", "", False)])
+    rid = mesh.admit(input_epoch=1)
+    got = mesh.run(rid, uuids=[], input_closure_rids=[rid], input_epochs=[executing_epoch])
+
+    report = got["conductor"][0].body
+    assert report.closed_input_epoch == (1 if executing_epoch == 1 else -1)
+    assert mesh.rt.accept_input_pass(rid, "default", WALK, 1) == (executing_epoch != 1)
+    assert not mesh.rt.accept_input_pass(rid, "default", WALK, 0)
+    # Only a completed current pass can authorize the next generation.
+    assert mesh.rt.accept_input_pass(rid, "default", WALK, 2) == (executing_epoch == 1)
 
 
 def test_an_emitted_signal_reaches_the_api_server(tmp_path):

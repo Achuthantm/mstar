@@ -661,7 +661,7 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
     """
     from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping, TensorStore
     from mstar.worker.rid_table import RidTable
-    from mstar.worker.worker import Worker
+    from mstar.testing_utils.worker import make_worker
 
     bookkeeping = PythonTensorBookkeeping
     if bookkeeper == "rust":
@@ -693,23 +693,22 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
         engine.report(src[1].data_ptr(), 9)
         mgr.get_ready_tensors()
 
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "receiver"
-    worker._graph_runtime = SimpleNamespace(get_rid_handle=table.handle)
-    worker.tensor_manager = mgr
-    worker.communicator = mgr.communicator
-    worker._draining_rids = {"request"}
-    worker._reads_done_sent = set()
-    worker.scheduler = SimpleNamespace(pending_tp_follow_count={})
+    worker = make_worker(
+        worker_id="receiver", graph_runtime=SimpleNamespace(get_rid_handle=table.handle),
+        tensor_manager=mgr, communicator=mgr.communicator,
+    )
+    worker.lifecycle.add(rid, "request")
+    worker.lifecycle.begin_drain("request")
     for _ in range(3):
         mgr.get_ready_tensors()
-        worker._complete_drain_if_ready("request")
-        assert not worker._reads_done_sent
+        worker.pipeline._apply_drains(set())
+        assert not worker.lifecycle._reads_done_sent
         assert mgr.has_inflight_reads(rid)
         assert mgr.inflight_read_rids([rid]) == frozenset({rid})
     assert _never_freed(mgr) == ptrs
 
     mgr.force_cleanup_request(rid)
+    worker.lifecycle.removed(rid, "request")
     table.release(rid)
     assert table.intern("next") == rid
     mgr.get_ready_tensors()
@@ -717,8 +716,9 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
     assert mgr.inflight_read_rids([rid]) == frozenset()
     assert mgr._kept_reads == [] and _never_freed(mgr) == ptrs
     assert engine.unregistered == []
-    worker._draining_rids = {"next"}
-    worker._complete_drain_if_ready("next")
+    worker.lifecycle.add(rid, "next")
+    worker.lifecycle.begin_drain("next")
+    worker.pipeline._apply_drains(set())
     [(entity, ack)] = mgr.communicator.sent
     assert entity == "conductor" and ack.message_type == ConductorMessageType.READS_DONE
     assert ack.body.request_id == "next"

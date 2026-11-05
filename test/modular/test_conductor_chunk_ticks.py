@@ -44,7 +44,7 @@ def test_tick_reaches_the_chunked_nodes_rank_not_the_encoders():
     c = Conductor.__new__(Conductor)
     c.requests = {"r": SimpleNamespace(
         sharding_config=cfg, partition_states={"default": PartitionState("default")},
-        max_output_tokens=8, resource_configs={},
+        max_output_tokens=8, resource_configs={}, input_closure_enabled=False,
     )}
     c._update_persist_ref_counts = lambda rid, edges: None
     sent = {}

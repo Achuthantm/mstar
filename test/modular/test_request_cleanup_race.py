@@ -18,7 +18,7 @@ from mstar.communication import tensors
 from mstar.communication.communicator import CommProtocol
 from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping, TensorStore
 from mstar.conductor.conductor import Conductor, RequestData
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionState
+from mstar.conductor.request_info import PartitionState
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge
 from mstar.testing_utils.worker import deliver, make_worker
@@ -127,7 +127,7 @@ def _conductor():
     c.enable_prof = False
     c.producer_triggered_partitions = set()
     c.requests["request"].partition_states["default"] = PartitionState(
-        partition_name="default", metadata=CurrentForwardConductorMetadata(graph_walk="decode", is_prefill=False),
+        partition_name="default", graph_walk="decode",
         current_worker_graph_ids={0},
     )
     c._client_streams = {}
@@ -215,7 +215,9 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             entity: msg.body for entity, msg in c.communicator.sent
             if msg.message_type == WorkerMessageType.DRAIN_REQUEST
         }
-        assert set(drains) == (set() if read_timing == "normal" else {"w0", "w1"})
+        # This fixture reports snapshots without sealing admission, so even a
+        # completed read requires the barrier. Native seals have separate tests.
+        assert set(drains) == {"w0", "w1"}
         for entity in teardown_order:
             if entity in drains:
                 deliver(workers[entity], WorkerMessage(WorkerMessageType.DRAIN_REQUEST, drains[entity]))
