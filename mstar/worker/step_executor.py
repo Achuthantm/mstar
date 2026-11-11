@@ -1,6 +1,6 @@
 """One step, from launch to publish: the GPU thread's body, the plan thread's
 pre-plan, and the postprocess that waits on the GPU, checks stops and routes the
-outputs. Owns both thread pools, since everything that runs on them is its code:
+outputs. Owns the execution and completion-wait pools:
 the pipeline gets back futures and events to wait on."""
 from __future__ import annotations
 
@@ -322,6 +322,7 @@ class StepExecutor:
         )
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
+        self._completion_pool: ThreadPool | None = None
         # ``knobs: step_threads: serial``: the GPU and plan threads' work runs on the main thread
         self._serial_steps = False
         # lane -> its stream, made on the lane's first step
@@ -649,11 +650,36 @@ class StepExecutor:
         if self.device.type == "cpu":
             return
         if batch_N.node_batch.completion_event is not None:
+            if batch_N.node_batch.completion_event.query():
+                return
             with self.timer.span("worker.postprocess.event_sync"):
                 batch_N.node_batch.completion_event.synchronize()
         else:
             with self.timer.span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
+
+    def completion_future(self, step: PendingBatch) -> Future:
+        """Wait off the message thread and wake its poll when the GPU finishes.
+
+        This pool is separate from launch and pre-plan: waiting there would
+        prevent the next step from overlapping this one's GPU work.
+        """
+        if self._completion_pool is None:
+            self._completion_pool = ThreadPool(
+                max_workers=1, thread_name_prefix=f"mstar-completion-{self.worker_id}",
+            )
+        future = self._completion_pool.submit(self._wait_for_completion, step)
+        self.wakeup_event.register_future(future)
+        return future
+
+    def _wait_for_completion(self, step: PendingBatch) -> None:
+        if self.timer.period:
+            set_step_key(step_key(step.node_name, step.graph_walk))
+        try:
+            self.wait_for_step(step)
+        finally:
+            if self.timer.period:
+                set_step_key(None)
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
         """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to

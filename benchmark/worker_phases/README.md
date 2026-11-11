@@ -59,7 +59,9 @@ The names say neither which thread a phase runs on nor whether it is work.
 
 | phase | thread | what it is |
 | --- | --- | --- |
-| `worker.postprocess.event_sync` | main | **The only real GPU wait.** Blocks on the step's completion event |
+| `worker.postprocess.event_sync` | completion waiter, or main for direct postprocess | **The real GPU wait.** Blocks on the step's completion event; already-completed events add no sample |
+| `worker.await_completion` | main | Wait for completion, including message polling and eligible teardowns; overlaps `event_sync` |
+| `worker.completion_poll` | main | Message ingestion and teardown work during `await_completion` |
 | `await_gpu` | main | Waits for the GPU *thread's* host work (`prepare_inputs` plus kernel launch). Not GPU execution |
 | `worker.gpu_thread.exec` | GPU | CPU time spent enqueuing kernels, not GPU time |
 | `worker.gpu_thread.prepare_inputs` | GPU | Host work, but it absorbs any host sync inside a submodule's `prepare_inputs` |
@@ -83,7 +85,9 @@ Consequences:
   `prepare_inputs` to one after its last launch, so it includes any gaps the host
   leaves inside the step. `gpu_exec.<walk>` is the same per graph walk.
 * `postprocess_batch` contains several of the `postprocess.*` phases, so it
-  does not sum with them.
+  does not sum with them. The pipeline normally waits for GPU completion before
+  entering it: `event_sync` then runs on the completion waiter, overlapping
+  `await_completion` and `completion_poll`, and must not be added to either.
 * **GPU busy time is not in this table**, and `iter_total - event_sync` is not
   GPU idle time. A non-zero `event_sync` means the CPU did wait on the GPU; a
   small one means the GPU-bound component is marginal, not absent. For the

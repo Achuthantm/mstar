@@ -60,3 +60,11 @@ Streaming, TP/SP/CFG, side-step deployments, missing execution metadata, and que
 or submitted work require the drain barrier. Read failures whose transfer
 status is unknown keep that barrier pending until forced removal. The existing
 forced-drain timeout still applies.
+
+The conductor's admission-slot release and the worker's resource cleanup are
+separate events. While a step's accelerator completion event is pending, a
+dedicated waiter wakes the worker's message poll when it finishes. The main
+thread continues ingesting messages and applying eligible teardowns, so a late
+`REMOVE_REQUEST` need not wait for unrelated GPU work. Cleanup still excludes
+requests held by the current, speculative, and side-lane steps, and polling
+waits for the speculative step's admission fence to preserve TP teardown order.

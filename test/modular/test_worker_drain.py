@@ -5,6 +5,9 @@ is in flight; no read may start after that. The hard cleanup
 (force_cleanup_request) waits for the conductor's REMOVE_REQUEST.
 """
 
+from concurrent.futures import Future
+from dataclasses import replace
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -31,8 +34,10 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
+from mstar.utils.profiler import PhaseLaps
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
+from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -176,7 +181,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
     w.tensor_manager.cleanup_collectable = lambda *args: None
     w._graph_runtime.pending_loop_stop_rids = lambda *args: {7}
     waits = []
-    event = SimpleNamespace(synchronize=lambda: waits.append("event")) if has_event else None
+    event = SimpleNamespace(query=lambda: False, synchronize=lambda: waits.append("event")) if has_event else None
     pending = SimpleNamespace(
         batch=ScheduledBatch(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
@@ -359,6 +364,142 @@ def test_drain_deferred_behind_inflight_gpu_step():
     w.pipeline.in_flight_rids.clear()  # step finished
     w.pipeline._teardown(w.pipeline.in_flight_rids)
     assert "X" in w.lifecycle.draining and len(_reads_done(w)) == 1
+
+
+@pytest.mark.parametrize("speculating", [False, True])
+def test_remove_is_serviced_while_an_unrelated_gpu_step_runs(speculating):
+    """REMOVE arrives after the preamble; cleanup must not wait for GPU work
+    belonging to other requests, including the already launched next step."""
+    inbox, log = [], []
+    ready, notified, cleaned = Event(), Event(), Event()
+    cleaned_before_completion = []
+    w = _worker(known_rids=("X", "N", "next", "side"))
+    p = w.pipeline
+    # Only the event is simulated; the message dispatcher and teardown are real.
+    p._services = replace(p._services, device=torch.device("cuda"))
+    w.executor.device = torch.device("cuda")
+    w.executor.wakeup_event = SimpleNamespace(
+        register_future=lambda future: future.add_done_callback(lambda _: notified.set()),
+    )
+
+    def synchronize():
+        if ready.is_set():
+            return
+        inbox.extend(
+            WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=rid))
+            for rid in ("X", "N", "next", "side")
+        )
+        notified.set()
+        cleaned_before_completion.append(cleaned.wait(1))
+        ready.set()
+
+    event = SimpleNamespace(query=ready.is_set, synchronize=synchronize)
+
+    def step(rid, completion_event=None):
+        future = Future()
+        future.set_result(BatchedModelOutput())
+        admitted = Event()
+        admitted.set()
+        return PendingBatch(
+            batch=ScheduledBatch(node_name="dit", graph_walk="image_gen", request_to_worker_graph={rid: 0}),
+            node_batch=SimpleNamespace(
+                completion_event=completion_event, launch_started_event=admitted,
+                admit_error=None, failed_requests={},
+            ),
+            node_name="dit", graph_walk="image_gen", partition="p", future=future,
+        )
+
+    current, following = step("N", event), step("next")
+    p._set_pending(current)
+    p._hold_rows(1, ("side",))
+
+    def messages():
+        if speculating:
+            assert following.node_batch.launch_started_event.is_set(), "polled before the next step admitted"
+        batch = list(inbox)
+        inbox.clear()
+        return batch
+
+    def wait(timeout):
+        notified.wait(timeout / 1000)
+        notified.clear()
+
+    def remove(rid):
+        log.append(("remove", rid, ready.is_set()))
+        if rid == "X":
+            cleaned.set()
+
+    w.communicator.get_all_new_messages = messages
+    w.communicator.wait_for_work = wait
+    w.ingest.check_ready_tensors = lambda: None
+    w.ingest.poll_stream_buffers = lambda: None
+    w.engine_manager.remove_request = remove
+    w.executor.clear_in_flight = lambda batch: None
+    w.speculator.is_tp_follow_pending = lambda pending: False
+
+    def finish(pending, outputs, **kwargs):
+        w.executor.wait_for_step(pending)
+        log.append(("postprocess", "N", ready.is_set()))
+
+    p._finish_step = finish
+    if speculating:
+        admitted = Event()
+        following.node_batch.launch_started_event = SimpleNamespace(
+            is_set=admitted.is_set, wait=lambda timeout: admitted.set() or True,
+        )
+        p._speculation = SimpleNamespace(is_yield_away=True)
+        p._launch_speculation = lambda outputs, laps: setattr(p, "_spec_pending", following)
+
+    try:
+        p._finish_chain_step(PhaseLaps("test."))
+        assert cleaned_before_completion == [True]
+        assert ("remove", "X", False) in log
+        held = {"N", "side", "next"} if speculating else {"N", "side"}
+        assert not any(kind == "remove" and rid in held and not done
+                       for kind, rid, done in log)
+        assert ("postprocess", "N", True) in log
+        assert "side" in w.lifecycle.pending_removes
+        if speculating:
+            assert "next" in w.lifecycle.pending_removes
+    finally:
+        ready.set()
+        cleaned.set()
+        pool = getattr(w.executor, "_completion_pool", None)
+        if pool is not None:
+            pool.shutdown()
+
+
+@pytest.mark.parametrize("has_event", [False, True])
+def test_completed_step_needs_no_completion_thread(has_event):
+    w = _worker()
+    w.pipeline._services = replace(w.pipeline._services, device=torch.device("cuda"))
+    event = SimpleNamespace(query=lambda: True) if has_event else None
+    w.pipeline._await_step_completion(SimpleNamespace(node_batch=SimpleNamespace(completion_event=event)))
+    assert w.executor._completion_pool is None
+
+
+def test_completion_wait_failure_reaches_the_pipeline():
+    w = _worker()
+    w.pipeline._services = replace(w.pipeline._services, device=torch.device("cuda"))
+    w.executor.device = torch.device("cuda")
+    notified = Event()
+    w.executor.wakeup_event = SimpleNamespace(
+        register_future=lambda future: future.add_done_callback(lambda _: notified.set()),
+    )
+    w.communicator.wait_for_work = lambda timeout: notified.wait(timeout / 1000)
+    w.ingest.poll = lambda: None
+
+    def fail():
+        raise RuntimeError("completion failed")
+
+    step = SimpleNamespace(node_batch=SimpleNamespace(
+        completion_event=SimpleNamespace(query=lambda: False, synchronize=fail),
+    ))
+    try:
+        with pytest.raises(RuntimeError, match="completion failed"):
+            w.pipeline._await_step_completion(step)
+    finally:
+        w.executor._completion_pool.shutdown()
 
 
 def test_speculation_stops_for_a_rid_being_torn_down():

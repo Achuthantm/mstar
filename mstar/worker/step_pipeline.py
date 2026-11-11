@@ -408,6 +408,7 @@ class StepPipeline:
         # valid; ``_handle_admit_failure`` already rehabilitated the failed rids.
         laps.skip()
         if pending.node_batch.admit_error is None:
+            self._await_step_completion(pending)
             self._finish_step(
                 pending, outputs,
                 next_step_rids=(
@@ -594,6 +595,7 @@ class StepPipeline:
             return
         try:
             outputs = step.future.result()
+            self._await_step_completion(step)
             self.executor.wait_for_step(step)
             self.executor.clear_in_flight(step.batch)
             self._count_turn(step)
@@ -607,6 +609,37 @@ class StepPipeline:
             self._hold_rows(SIDE_LANE, ())
 
     # -- steps -------------------------------------------------------------------
+
+    def _await_step_completion(self, step: PendingBatch) -> None:
+        """Service late teardown messages while unrelated GPU work runs.
+
+        Keep every launched step's rows protected and cross its admit fence
+        before polling: ingest and teardown can both move replicated pages.
+        """
+        if self._services.device.type == "cpu":
+            return
+        event = step.node_batch.completion_event
+        if event is None or event.query():
+            return
+        completion = self.executor.completion_future(step)
+        if self._spec_pending is not None:
+            self._hold_rows(
+                CHAIN_LANE,
+                self._rows_by_lane.get(CHAIN_LANE, frozenset()).union(
+                    self._spec_pending.batch.request_to_worker_graph,
+                ),
+            )
+        self._await_admit_settled(self._spec_pending)
+        with self.timer.span("worker.await_completion"):
+            while not completion.done():
+                self.communicator.wait_for_work(20)
+                if completion.done():
+                    break
+                with self.timer.span("worker.completion_poll"):
+                    self.ingest.poll()
+                    self._report_failures()
+                    self._teardown(self.in_flight_rids)
+            completion.result()
 
     def _await_admit_settled(self, pending: "PendingBatch | None") -> None:
         """Block until the in-flight step has admitted.

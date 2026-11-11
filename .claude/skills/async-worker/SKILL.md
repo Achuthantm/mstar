@@ -16,6 +16,7 @@ The worker does not run one batch at a time. While batch N's kernels are on the 
 | Main thread | The loop below: messages, tensor readiness, scheduling, speculation, postprocess |
 | `StepExecutor` GPU thread (1 worker) | `GpuStepBody`: declare → admit → plan → forward launch → commit |
 | Plan thread (1 worker) | Pre-plan for N+1, on its own CUDA stream, gated on N's commit event |
+| Completion waiter (1 worker, created on demand) | Wait for N's GPU event, then wake the main thread's message poll |
 | Side stream | D2H copies for `check_stop` pre-materialization |
 | A side lane's stream | A side lane's steps (`side_stream: true` on a node group), launched from the GPU thread between two chain steps; its windows collate there on the main thread |
 
@@ -50,7 +51,7 @@ The loop is circular, so this starts at an arbitrary point: **batch N is running
 
 **6. Launch N+1.** Submit to the GPU thread, which starts queuing kernels. The main thread then blocks on the step's `launch_started_event` (set at launch, or on completion by `StepExecutor._submit_gpu_step`; timeout `MSTAR_LAUNCH_WAIT_MS`) so it holds off the GIL until the GPU thread reaches the forward launch. Staleness is checked on the GPU thread, after the plan future resolves and after prepare. From submission on, the GPU thread owns the pre-plan.
 
-**7. Postprocess N.** Now wait for the actual GPU work (`event_sync`), D2H the outputs, pre-materialize on the side stream, run `check_stop` to look for EOS, extend prefix hash chains from the host copy of sampled tokens, then route and send outputs. The side stream exists because the default stream has GPU(N+1) queued behind GPU(N)'s outputs by this point.
+**7. Postprocess N.** A pending GPU completion event is waited on by the completion waiter (`event_sync`). Meanwhile the main thread polls messages and applies eligible teardowns, after N+1's admit fence and with N, N+1 and side-lane rows protected. Completion wakes the poll without waiting for its timeout. Then D2H the outputs, pre-materialize on the side stream, run `check_stop` to look for EOS, extend prefix hash chains from the host copy of sampled tokens, then route and send outputs. The side stream exists because the default stream has GPU(N+1) queued behind GPU(N)'s outputs by this point.
 
 ## Steps beside the chain
 
