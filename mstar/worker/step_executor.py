@@ -38,7 +38,7 @@ from mstar.utils.profiler import PhaseLaps, range_pop, range_push, set_step_key
 from mstar.utils.threads import InlineExecutor, ThreadPool, pin_thread
 from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs, crop_to_spans
 from mstar.worker.lockstep import Lockstep
-from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
 from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
@@ -285,6 +285,7 @@ class StepExecutor:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
         lockstep: Lockstep, lifecycle: RequestLifecycle, preemption: Preemption, *,
+        scheduler: MicroScheduler,
         wakeup_event=None, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None,
         device_capability: DeviceCapability | None = None,
@@ -304,6 +305,7 @@ class StepExecutor:
         self.lockstep = lockstep
         self.lifecycle = lifecycle
         self.preemption = preemption
+        self._scheduler = scheduler
         self.wakeup_event = wakeup_event
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
@@ -1350,7 +1352,7 @@ class StepExecutor:
         self, rids: list[int], infos: list, lane: int, next_step_rids: Iterable[int],
         rows_by_lane: Mapping[int, frozenset[int]] | None = None,
     ) -> frozenset[int]:
-        """Exclude rows still held by another step. The runtime additionally
+        """Exclude rows held by another step or the scheduler backlog. The runtime additionally
         checks the executing epoch, local graph completion and queued work.
         Side-step deployments retain the drain barrier."""
         if self._layout.side_keys:
@@ -1365,6 +1367,12 @@ class StepExecutor:
                 for other, held in rows_by_lane.items():
                     if other != lane:
                         candidates.difference_update(held)
+            # Backlogged rows have left the ready queues. A graph reset can
+            # also clear their in_flight flags before the runtime seals it.
+            for batch in self._scheduler.backlog.values():
+                if not candidates:
+                    break
+                candidates.difference_update(candidates & batch.request_to_worker_graph.keys())
         return frozenset(candidates)
 
     def _inline_emit_values(

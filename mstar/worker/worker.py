@@ -410,6 +410,7 @@ class Worker:
         )
         self.executor = StepExecutor(
             services=services, layout=layout, timer=self.timer, lockstep=self.lockstep,
+            scheduler=self.scheduler,
             lifecycle=self.lifecycle, preemption=self.preemption, wakeup_event=self.wakeup_event,
             metrics=self._metrics, profile_info=self.profile_info, device_capability=self.device_capability,
             enable_nvtx=self.enable_nvtx, enable_prof=enable_prof, step_cpus=step_cpus,

@@ -249,7 +249,7 @@ def _postprocess_worker(refuse, follower=False, **fields):
     w = make_worker(
         streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
         parallel_nodes={"llm"} if follower else set(),
-        scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
+        scheduler=SimpleNamespace(backlog={}, drop_backlogged=lambda rids: None),
         communicator=SimpleNamespace(send=lambda e, m: log.conductor.append(m)),
         request_state=SimpleNamespace(
             per_request_info={0: object(), 1: object()},
@@ -321,7 +321,7 @@ def test_postprocess_snapshots_reads_once_for_the_whole_batch():
     assert sends[1].inflight_read_rids == frozenset()
 
 
-@pytest.mark.parametrize("outstanding", ["none", "next_step", "other_lane", "side_lane"])
+@pytest.mark.parametrize("outstanding", ["none", "next_step", "other_lane", "side_lane", "backlog"])
 def test_pipeline_passes_input_closure_fences_to_completion(outstanding):
     w = _postprocess_worker(
         refuse=set(), side_keys={("llm", "decode")} if outstanding == "side_lane" else (),
@@ -335,6 +335,8 @@ def test_pipeline_passes_input_closure_fences_to_completion(outstanding):
     w.request_state.get_fwd_info = lambda rid, partition: current
     if outstanding == "other_lane":
         w.pipeline._hold_rows(1, {0})
+    elif outstanding == "backlog":
+        w.scheduler.backlog[("other", "decode")] = ScheduledBatch("other", "decode", {0: 1})
     sends = []
     w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
 

@@ -182,6 +182,7 @@ def make_worker(
     ))
     component("executor", lambda: StepExecutor(
         services=services, layout=layout, timer=worker.timer, lockstep=worker.lockstep,
+        scheduler=worker.scheduler,
         lifecycle=worker.lifecycle, preemption=worker.preemption, wakeup_event=wakeup_event, metrics=metrics,
         profile_info=worker.profile_info, enable_nvtx=enable_nvtx, enable_prof=enable_prof,
     ))

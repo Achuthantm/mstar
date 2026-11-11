@@ -8,6 +8,7 @@ import pytest
 pytest.importorskip("mstar_rust")
 
 from rust_runtime import Inboxes, build_runtime
+from test_micro_scheduler import _Engine
 
 from mstar.conductor.conductor import Conductor, RequestData
 from mstar.conductor.request_info import (
@@ -16,10 +17,11 @@ from mstar.conductor.request_info import (
     WalkStep,
 )
 from mstar.distributed.base import ShardingConfig
-from mstar.graph.base import GraphEdge, GraphNode
+from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import PostprocessNeed, PostprocessRequest, RouteInput, RouteTensors, SendInput
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
+from mstar.model.submodule_base import StepOrder
 from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
@@ -30,6 +32,7 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.scheduled_batch import ScheduledBatch
 
 
 def _info(epoch=0, request="r", partition="default", walk="run"):
@@ -40,25 +43,30 @@ def _info(epoch=0, request="r", partition="default", walk="run"):
 
 
 class _Case:
-    def __init__(self, path, count=1, epoch=0, partitions=None, side_keys=()):
+    def __init__(self, path, count=1, epoch=0, partitions=None, side_keys=(), sections=None):
         self.boxes = Inboxes("w0", path)
-        partitions = partitions or dict.fromkeys(range(count), "default")
-        graphs = [
-            WorkerGraph(
-                section=GraphNode(
-                    name=f"n{i}", input_names={"input"},
-                    outputs=[GraphEdge(name="out", next_node=EMPTY_DESTINATION)],
-                ),
-                graph_walks={"run"}, ranks=[0], worker_graph_id=i,
+        sections = sections or {
+            i: GraphNode(
+                name=f"n{i}", input_names={"input"},
+                outputs=[GraphEdge(name="out", next_node=EMPTY_DESTINATION)],
             )
             for i in range(count)
+        }
+        partitions = partitions or dict.fromkeys(sections, "default")
+        self.graph_of = {node: i for i, section in sections.items() for node in section.get_nodes()}
+        graphs = [
+            WorkerGraph(
+                section=section,
+                graph_walks={"run"}, ranks=[0], worker_graph_id=i,
+            )
+            for i, section in sections.items()
         ]
         self.rt = build_runtime(
             inboxes=self.boxes, my_worker_id="w0", my_worker_graphs=graphs,
-            all_wg_ids_to_graph_walks={i: {"run"} for i in range(count)},
-            all_wg_ids_to_dyn_loops={i: set() for i in range(count)},
-            all_wg_ids_to_nodes={i: {f"n{i}"} for i in range(count)},
-            node_to_partition={f"n{i}": partitions[i] for i in range(count)},
+            all_wg_ids_to_graph_walks={i: {"run"} for i in sections},
+            all_wg_ids_to_dyn_loops={i: set() for i in sections},
+            all_wg_ids_to_nodes={i: set(section.get_nodes()) for i, section in sections.items()},
+            node_to_partition={node: partitions[i] for node, i in self.graph_of.items()},
             sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         )
         self.reads, self.unread = [], []
@@ -76,32 +84,39 @@ class _Case:
             side_keys=side_keys,
         )
         w.ingest._skip_unshared_publish = lambda *a: None
-        ids = [i for i in range(count) if partitions[i] == "default"]
+        ids = [i for i in sections if partitions[i] == "default"]
         self.new = NewRequest(
             request_id="r", partition_worker_graph_ids=ids,
-            worker_graph_to_workers={i: ["w0"] for i in range(count)},
-            initial_inputs=[GraphEdge(name="input", next_node=f"n{i}") for i in ids],
+            worker_graph_to_workers={i: ["w0"] for i in sections},
+            initial_inputs=[GraphEdge(name="input", next_node=node) for node, i in self.graph_of.items() if i in ids],
             request_info=_info(epoch), loop_caps={},
         )
         w.ingest._add_new_request(self.new)
         self.rid = self.rt.get_rid_handle("r")
         self.reads.clear()
 
-    def finish(self, node=0, *, other_work=(), reads=False, native=False, reported_epoch=None):
-        assert self.rt.pop_rids(f"n{node}", "run", [self.rid]) is not None
+    def finish(self, node=0, *, other_work=(), reads=False, native=False, reported_epoch=None, batch=None):
+        if batch is None:
+            assert self.rt.pop_rids(f"n{node}", "run", [self.rid]) is not None
+        else:
+            self.worker.executor.clear_in_flight(batch)
+        wg_id = self.graph_of[f"n{node}"]
         if native:
             step = self.rt.begin_postprocess(PostprocessRequest(
                 partition="default", graph_walk="run", node_name=f"n{node}",
-                output_signals=["out"], wg_ids=ParallelList([self.rid], [node]),
+                output_signals=["out"], wg_ids=ParallelList([self.rid], [wg_id]),
             ))
             assert step.need is PostprocessNeed.STORE
             step = self.rt.resume_postprocess(stored=RouteTensors([], [0]))
+            if step.need is PostprocessNeed.DONE:
+                assert self.boxes.take() == []
+                return None
             assert step.need is PostprocessNeed.SEND
             route = step.route_output
         else:
             route = self.rt.complete_and_route_batch(RouteInput(
                 partition="default", graph_walk="run", node_name=f"n{node}",
-                output_signals=["out"], wg_ids=ParallelList([self.rid], [node]),
+                output_signals=["out"], wg_ids=ParallelList([self.rid], [wg_id]),
                 tensors=[], num_tensors=[0],
             ))
         info = self.worker.request_state.get_fwd_info(self.rid, "default")
@@ -119,7 +134,10 @@ class _Case:
             assert self.rt.resume_postprocess(send=send).need is PostprocessNeed.DONE
         else:
             self.rt.send_outputs(send)
-        [report] = [msg.body for peer, msg in self.boxes.take() if peer == "conductor"]
+        reports = [msg.body for peer, msg in self.boxes.take() if peer == "conductor"]
+        if not reports:
+            return None
+        [report] = reports
         return report
 
     def input(self, epoch, *, node=0, tensor=False, partition="default", walk="run"):
@@ -201,14 +219,98 @@ def test_all_local_graphs_must_complete_before_sealing(tmp_path):
     assert not case.reads
 
 
-def test_queued_work_in_an_already_completed_graph_prevents_sealing(tmp_path):
+@pytest.mark.parametrize("native", [False, True], ids=["split", "native"])
+def test_queued_work_in_an_already_completed_graph_prevents_sealing(tmp_path, native):
     case = _Case(tmp_path, count=2)
-    case.finish(0)
+    case.finish(0, native=native)
     # A late input arrived while the other local graph was still running.
     # Its read is complete, but its queued work could itself start more reads.
     case.input(0, node=0)
-    assert case.finish(1).closed_input_epoch == -1
-    assert case.finish(0).closed_input_epoch == 0
+    assert case.finish(1, native=native).closed_input_epoch == -1
+    assert case.finish(0, native=native).closed_input_epoch == 0
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["split", "native"])
+@pytest.mark.parametrize("same_graph", [False, True], ids=["separate-graphs", "same-graph-reset"])
+def test_backlogged_work_prevents_sealing_and_keeps_conductor_drain(tmp_path, native, same_graph):
+    sections = None
+    if same_graph:
+        sections = {0: Sequential(sections=[
+            Loop(name="L", max_iters=1, outputs=[], section=GraphNode(
+                name="n0", input_names={"input"},
+                outputs=[GraphEdge(name="out", next_node=EMPTY_DESTINATION)],
+            )),
+            GraphNode(name="n1", input_names={"input"},
+                      outputs=[GraphEdge(name="out", next_node=EMPTY_DESTINATION)]),
+        ])}
+    case = _Case(tmp_path, count=2, sections=sections)
+    worker, rt, rid = case.worker, case.rt, case.rid
+    scheduler = worker.scheduler
+    scheduler.parallel_leader_nodes = frozenset({"n0", "n1"})
+    worker.request_state.node_to_partition.update({"n0": "default", "n1": "default"})
+    engine = _Engine(max_bs=1, order=StepOrder.TURNS)
+    worker.engine_manager.get_engine = lambda node: engine
+    scheduler.note_ran(ScheduledBatch("n0", "run", {rid: 0}))
+    first = case.finish(0, native=native)
+    worker.ingest._add_new_request(NewRequest(
+        request_id="other", partition_worker_graph_ids=[0],
+        worker_graph_to_workers={0: ["w0"]},
+        initial_inputs=[GraphEdge(name="input", next_node="n0")],
+        request_info=_info(request="other"), loop_caps={},
+    ))
+    other_rid = rt.get_rid_handle("other")
+    case.input(0, node=0)
+    worker.pipeline.in_flight_rids.add(rid)
+    # While n1 runs, the real scheduler selects the older row at cap 1 and
+    # parks r. Its input is no longer visible in the runtime's ready queue.
+    selected = scheduler.next_batch(exclude_target=("n1", "run"))
+    assert selected.request_to_worker_graph == {other_rid: 0}
+    assert scheduler.backlog[("n0", "run")].request_to_worker_graph == {rid: 0}
+    assert rt.is_in_flight("n0", 0, rid)
+    assert not any(spec.node_name == "n0" and rid in spec.rids for spec in rt.get_ready_nodes(set()))
+    report = case.finish(1, native=native, other_work=selected.request_to_worker_graph)
+    # Completing a sibling in the same graph resets even the in_flight flag;
+    # only the Python backlog still records the outstanding work in that case.
+    assert rt.is_in_flight("n0", 0, rid) is not same_graph
+    assert not report.has_inflight_reads
+    assert report.closed_input_epoch == -1
+
+    c = _conductor()
+    request = c.requests["r"]
+    request.worker_graph_to_workers = case.new.worker_graph_to_workers
+    partition = request.partition_states["default"]
+    partition.current_worker_graph_ids = set(case.new.partition_worker_graph_ids)
+    partition.input_workers = {"w0"}
+    if first is not None:
+        c._process_worker_graphs_done(first)
+    c._process_worker_graphs_done(report)
+    c._process_request_done("r")
+    assert {peer for peer, msg in c.sent if msg.message_type == WorkerMessageType.DRAIN_REQUEST} == {"w0"}
+
+    resumed = scheduler.next_batch(exclude_target=("n1", "run"))
+    assert resumed.request_to_worker_graph == {rid: 0}
+    if not same_graph:
+        assert case.finish(0, native=native, batch=resumed).closed_input_epoch == 0
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["split", "native"])
+def test_another_requests_backlog_does_not_prevent_sealing(tmp_path, native):
+    case = _Case(tmp_path)
+    worker, rt = case.worker, case.rt
+    worker.scheduler.parallel_leader_nodes = frozenset({"n0"})
+    worker.request_state.node_to_partition["n0"] = "default"
+    engine = _Engine(max_bs=1, order=StepOrder.TURNS)
+    worker.engine_manager.get_engine = lambda node: engine
+    worker.ingest._add_new_request(NewRequest(
+        request_id="other", partition_worker_graph_ids=[0], worker_graph_to_workers={0: ["w0"]},
+        initial_inputs=[GraphEdge(name="input", next_node="n0")],
+        request_info=_info(request="other"), loop_caps={},
+    ))
+    other_rid = rt.get_rid_handle("other")
+    selected = worker.scheduler.next_batch()
+    assert selected.request_to_worker_graph == {case.rid: 0}
+    assert worker.scheduler.backlog[("n0", "run")].request_to_worker_graph == {other_rid: 0}
+    assert case.finish(native=native, batch=selected).closed_input_epoch == 0
 
 
 def test_new_epoch_cannot_discard_unfinished_local_graph(tmp_path):
