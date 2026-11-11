@@ -249,7 +249,6 @@ def _postprocess_worker(refuse, follower=False, **fields):
     w = make_worker(
         streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
         parallel_nodes={"llm"} if follower else set(),
-        scheduler=SimpleNamespace(backlog={}, drop_backlogged=lambda rids: None),
         communicator=SimpleNamespace(send=lambda e, m: log.conductor.append(m)),
         request_state=SimpleNamespace(
             per_request_info={0: object(), 1: object()},
@@ -294,8 +293,14 @@ def _fail_requests_sent(w):
     ]
 
 
-def test_postprocess_snapshots_reads_once_for_the_whole_batch():
+@pytest.mark.parametrize("outstanding", ["none", "next_step", "backlog"])
+def test_postprocess_snapshots_reads_once_for_the_whole_batch(outstanding):
     w = _postprocess_worker(refuse=set())
+    info = _fwd_info("decode", "p")
+    info.input_epoch = 0
+    w.request_state.get_fwd_info = lambda rid, partition: info
+    if outstanding == "backlog":
+        w.scheduler.backlog[("other", "decode")] = ScheduledBatch("other", "decode", {0: 1, 1: 1})
     pending, done = Future(), Future()
     done.set_result(None)
     w.tensor_manager.pending = [
@@ -312,13 +317,62 @@ def test_postprocess_snapshots_reads_once_for_the_whole_batch():
 
     w.tensor_manager.inflight_read_rids = snapshot
     w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
-    w.executor.postprocess(*_decode_step([0, 1]))
+    def postprocess():
+        step, outputs = _decode_step([0, 1])
+        step.node_batch.per_request_info = dict.fromkeys([0, 1], info)
+        w.executor.postprocess(
+            step, outputs, next_step_rids={0, 1} if outstanding == "next_step" else (),
+        )
+
+    postprocess()
     assert snapshots == [frozenset({0})]
     assert sends[0].inflight_read_rids == frozenset({0})
+    assert sends[0].input_closure_rids == ({0, 1} if outstanding == "none" else set())
     pending.set_result(None)
-    w.executor.postprocess(*_decode_step([0, 1]))
+    postprocess()
     assert snapshots == [frozenset({0}), frozenset()]
     assert sends[1].inflight_read_rids == frozenset()
+
+
+@pytest.mark.parametrize("kind", ["disabled_epoch", "missing_epoch", "side_lane"])
+def test_postprocess_skips_read_snapshot_when_certification_is_disabled(kind):
+    w = _postprocess_worker(
+        refuse=set(), side_keys={("llm", "decode")} if kind == "side_lane" else (),
+    )
+    info = _fwd_info("decode", "p")
+    info.input_epoch = 0
+    w.request_state.get_fwd_info = lambda rid, partition: info
+    step, outputs = _decode_step([0, 1])
+    if kind != "missing_epoch":
+        executing = _fwd_info("decode", "p")
+        executing.input_epoch = -1 if kind == "disabled_epoch" else 0
+        step.node_batch.per_request_info = dict.fromkeys([0, 1], executing)
+    w.tensor_manager.inflight_read_rids = lambda rids: pytest.fail("disabled closure scanned pending reads")
+    sends = []
+    w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
+
+    w.executor.postprocess(step, outputs)
+
+    [send] = sends
+    assert send.inflight_read_rids == frozenset()
+
+
+def test_postprocess_read_snapshot_excludes_disabled_rows_in_a_mixed_batch():
+    w = _postprocess_worker(refuse=set())
+    infos = {rid: _fwd_info("decode", "p") for rid in [0, 1]}
+    infos[0].input_epoch = 0
+    w.request_state.get_fwd_info = lambda rid, partition: infos[rid]
+    step, outputs = _decode_step([0, 1])
+    step.node_batch.per_request_info = infos
+    snapshots, sends = [], []
+    w.tensor_manager.inflight_read_rids = lambda rids: snapshots.append(list(rids)) or frozenset({0})
+    w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
+
+    w.executor.postprocess(step, outputs)
+
+    assert snapshots == [[0]]
+    assert sends[0].inflight_read_rids == {0}
+    assert sends[0].input_epochs == [0, -1]
 
 
 @pytest.mark.parametrize("outstanding", ["none", "next_step", "other_lane", "side_lane", "backlog"])

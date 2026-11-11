@@ -144,6 +144,9 @@ class _KeptRead:
     # request is forcibly removed; its destination buffers stay pinned.
     unresolved: bool = False
 
+    def may_be_reading(self) -> bool:
+        return self.future is not None or bool(self.running) or self.unresolved
+
 
 #: Earlier Mooncake releases let any host that reaches the TCP data port read
 #: or write arbitrary process memory (CVE-2026-103764). NVD lists "before
@@ -2143,7 +2146,7 @@ class TensorCommunicationManager(ABC):
                     return frozenset(rids)
         rids.update(
             kept.rid for kept in self._kept_reads
-            if kept.rid in wanted and (kept.future is not None or kept.running or kept.unresolved)
+            if kept.rid in wanted and kept.may_be_reading()
         )
         return frozenset(rids)
 
@@ -2158,7 +2161,7 @@ class TensorCommunicationManager(ABC):
             and ep.future is not None and _may_be_reading(ep.future)
             for ep in self.pending
         ) or any(
-            kept.rid == request_id and (kept.future is not None or kept.running or kept.unresolved)
+            kept.rid == request_id and kept.may_be_reading()
             for kept in self._kept_reads
         )
 

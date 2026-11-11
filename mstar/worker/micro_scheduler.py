@@ -1542,6 +1542,13 @@ class MicroScheduler:
             rows[spec.node_name] += len(spec.rids)
         return rows
 
+    def exclude_backlogged(self, candidates: set[int]) -> None:
+        """Remove backlogged requests from ``candidates`` in place, leaving the backlog intact."""
+        for batch in self.backlog.values():
+            if not candidates:
+                break
+            candidates.difference_update(candidates & batch.request_to_worker_graph.keys())
+
     def drop_backlogged(self, rids: Iterable[int]) -> None:
         """Requests that failed or are draining: nothing waiting for them runs."""
         for rid in rids:

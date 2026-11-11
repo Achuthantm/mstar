@@ -1315,6 +1315,15 @@ class StepExecutor:
         close_inputs = self._input_closure_candidates(
             info_rids, infos, next_step_rids,
         )
+        input_epochs = [
+            getattr(batch_N.node_batch.per_request_info.get(rid), "input_epoch", -1)
+            for rid in info_rids
+        ]
+        # An already sealed epoch can report again, so its reads still count
+        # even when this step cannot newly seal it. Disabled epochs cannot certify.
+        read_rids = [
+            rid for rid, epoch in zip(info_rids, input_epochs, strict=True) if epoch >= 0
+        ] if not self._layout.side_keys else []
         return SendInput(
             completion_id=route_output.completion_id,
             per_request_info=ParallelList(
@@ -1337,13 +1346,10 @@ class StepExecutor:
             ),
             failed_rids=failed_rids,
             inflight_read_rids=(
-                self.tensor_manager.inflight_read_rids(info_rids) if info_rids else frozenset()
+                self.tensor_manager.inflight_read_rids(read_rids) if read_rids else frozenset()
             ),
             input_closure_rids=close_inputs,
-            input_epochs=[
-                getattr(batch_N.node_batch.per_request_info.get(rid), "input_epoch", -1)
-                for rid in info_rids
-            ],
+            input_epochs=input_epochs,
         )
 
     def _input_closure_candidates(
@@ -1363,10 +1369,7 @@ class StepExecutor:
             candidates.difference_update(next_step_rids)
             # Backlogged rows have left the ready queues. A graph reset can
             # also clear their in_flight flags before the runtime seals it.
-            for batch in self._scheduler.backlog.values():
-                if not candidates:
-                    break
-                candidates.difference_update(candidates & batch.request_to_worker_graph.keys())
+            self._scheduler.exclude_backlogged(candidates)
         return frozenset(candidates)
 
     def _inline_emit_values(

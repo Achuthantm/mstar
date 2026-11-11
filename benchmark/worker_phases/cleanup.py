@@ -17,13 +17,13 @@ import statistics
 import time
 import timeit
 from pathlib import Path
-from types import SimpleNamespace
 
 from mstar.communication.tensor_store import RustTensorBookkeeping
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.runtime.rust import RustGraphRuntime
 from mstar.graph.runtime.utils import require_rust_extension
+from mstar.testing_utils.worker import make_scheduler
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import DrainRequest
 from mstar.worker.scheduled_batch import ScheduledBatch
@@ -47,7 +47,8 @@ def _closure_case(cls, rows, state):
         backlog[("n0", "run")] = ScheduledBatch("n0", "run", dict.fromkeys(rids[::2], 0))
     executor = cls.__new__(cls)
     executor._layout = WorkerLayout()
-    executor._scheduler = SimpleNamespace(backlog=backlog)
+    executor._scheduler = make_scheduler()
+    executor._scheduler.backlog = backlog
 
     args = (executor, rids, infos)
     args += (0, (), {}) if "lane" in inspect.signature(method).parameters else ((),)
