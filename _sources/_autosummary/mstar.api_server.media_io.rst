@@ -1,0 +1,77 @@
+mstar.api\_server.media\_io
+===========================
+
+.. automodule:: mstar.api_server.media_io
+
+   
+   
+   .. rubric:: Module Attributes
+
+   .. autosummary::
+   
+      BARE_REF_AUDIO_REFUSAL
+   
+   
+
+   
+   
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      audio_formats
+      check_audio_format
+      check_ref_audio
+      check_resample_rate
+      check_saved_ref_audio
+      decode_audio
+      decode_torchcodec_capped
+      g711_decode
+      g711_encode
+      modality_from_mime
+      mux_mp4_with_pcm16
+      pcm16_to_container
+      pcm16_to_wav_bytes
+      png_to_data_url
+      read_soundfile_capped
+      remove_uploads
+      resample_kernel_size
+      resolve_media_ref
+      save_base64
+      save_data_url
+      save_remote_url
+      schedule_upload_cleanup
+      split_windows
+      to_pcm16
+      torchcodec_samples_capped
+      wav_stream_header
+      window_stop
+      write_wav
+   
+   
+
+   
+   
+   .. rubric:: Classes
+
+   .. autosummary::
+   
+      StreamResampler
+   
+   
+
+   
+   
+   .. rubric:: Exceptions
+
+   .. autosummary::
+   
+      AudioRefusedError
+      AudioTooLongError
+      RefAudioTooLongError
+      RemoteFetchError
+   
+   
+
+
+
