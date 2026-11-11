@@ -278,7 +278,9 @@ class RequestLifecycle:
         not see would never fire and the rollout would run to ``max_iters`` for
         a client that has gone."""
         wire = None
-        if (self.pending_drains or self.draining) and rid in self.arrivals:
+        # begin_drain and add mark admitted drains failed; only pending drains
+        # need the wire id to stop speculation before the drain can begin.
+        if self.pending_drains and rid in self.arrivals:
             wire = self._runtime.get_rid_string(rid)
         return self.closing(rid, wire)
 

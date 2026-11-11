@@ -1,5 +1,9 @@
 """The order ``RequestLifecycle`` hands teardowns back in, which keeps a TP
 follower's page state in step with rank 0's."""
+from unittest.mock import patch
+
+import pytest
+
 from mstar.utils.ipc_format import DrainRequest, MessageSource, RemoveRequest
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout
@@ -90,6 +94,57 @@ def test_a_drain_stays_pending_until_it_begins():
     lifecycle.drain(DrainRequest(request_id="r2", source=MessageSource.CONDUCTOR))
     lifecycle.begin_drain("r1")
     assert lifecycle.drains_ready(set()) == ["r2"]
+
+
+@pytest.mark.parametrize("follower", [False, True])
+@pytest.mark.parametrize("admit_after_drain", [False, True])
+@pytest.mark.parametrize("reads_done", [False, True])
+def test_active_drains_stop_speculation_without_wire_lookups(follower, admit_after_drain, reads_done):
+    lifecycle = _lifecycle(2, follower=follower)
+    if not admit_after_drain:
+        _add(lifecycle, 1, "r1")
+    source = MessageSource.TP_RANK_0 if follower else MessageSource.CONDUCTOR
+    lifecycle.drain(DrainRequest(request_id="r1", source=source))
+    lifecycle.begin_drain("r1")
+    if admit_after_drain:
+        _add(lifecycle, 1, "r1")
+    if reads_done:
+        lifecycle.reads_done("r1")
+
+    assert 1 in lifecycle.failed_rids
+    assert lifecycle.teardowns_pending()
+    runtime = lifecycle._runtime
+    with patch.object(runtime, "get_rid_string", wraps=runtime.get_rid_string) as lookup:
+        assert lifecycle.is_tearing_down(1)
+        assert not lifecycle.is_tearing_down(2)
+        lookup.assert_not_called()
+
+
+def test_pending_drains_still_stop_speculation_before_the_failed_mark():
+    lifecycle = _lifecycle(1, 2, 3)
+    lifecycle.begin_drain("r3")
+    lifecycle.drain(DrainRequest(request_id="r1", source=MessageSource.CONDUCTOR))
+
+    assert 1 not in lifecycle.failed_rids
+    assert lifecycle.drains_ready({1}) == []
+    assert lifecycle.is_tearing_down(1)
+    assert not lifecycle.is_tearing_down(2)
+    assert lifecycle.is_tearing_down(3)
+
+
+def test_a_recycled_drained_handle_can_speculate_without_wire_lookups():
+    lifecycle = _lifecycle(1, 2)
+    lifecycle.begin_drain("r1")
+    lifecycle.begin_drain("r2")
+    lifecycle.removed(1, "r1")
+    _add(lifecycle, 1, "next")
+
+    assert 1 not in lifecycle.failed_rids
+    runtime = lifecycle._runtime
+    with patch.object(runtime, "get_rid_string", wraps=runtime.get_rid_string) as lookup:
+        assert not lifecycle.is_tearing_down(1)
+        assert lifecycle.is_tearing_down(2)
+        lookup.assert_not_called()
 
 
 def test_a_stamped_remove_is_purged_with_its_handle():
