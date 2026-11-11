@@ -321,6 +321,35 @@ def test_postprocess_snapshots_reads_once_for_the_whole_batch():
     assert sends[1].inflight_read_rids == frozenset()
 
 
+@pytest.mark.parametrize("outstanding", ["none", "next_step", "other_lane", "side_lane"])
+def test_pipeline_passes_input_closure_fences_to_completion(outstanding):
+    w = _postprocess_worker(
+        refuse=set(), side_keys={("llm", "decode")} if outstanding == "side_lane" else (),
+    )
+    pending, outputs = _decode_step([0, 1])
+    executing = _fwd_info("decode", "p")
+    executing.input_epoch = 0
+    pending.node_batch.per_request_info = dict.fromkeys([0, 1], executing)
+    current = _fwd_info("decode", "p")
+    current.input_epoch = 1
+    w.request_state.get_fwd_info = lambda rid, partition: current
+    if outstanding == "other_lane":
+        w.pipeline._hold_rows(1, {0})
+    sends = []
+    w._graph_runtime.send_outputs = lambda send: sends.append(send) or []
+
+    w.pipeline._finish_step(
+        pending, outputs, next_step_rids={0} if outstanding == "next_step" else (),
+    )
+
+    [send] = sends
+    expected = set() if outstanding == "side_lane" else {0, 1} if outstanding == "none" else {1}
+    assert send.input_closure_rids == expected
+    # New metadata cannot certify the older step retiring through the executor.
+    assert send.input_epochs == [0, 0]
+    assert all(info.input_epoch == 1 for info in send.per_request_info.values)
+
+
 def test_the_speculated_next_step_sends_nothing_of_a_refused_request():
     """Async scheduling submits step N+1 before step N is post-processed, so
     a rid whose registration is refused in N is already in N+1. N+1 must

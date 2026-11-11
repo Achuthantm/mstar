@@ -431,9 +431,10 @@ class RequestData:
 
 @dataclass
 class DrainingRequest:
-    """Teardown barrier state: a request whose participants are draining their
-    reads. Once every entity in ``expected_acks`` has sent READS_DONE it is safe
-    to send the hard RemoveRequest to all ``participants``."""
+    """Acknowledgements still required before REMOVE_REQUEST. Success waits
+    only on preprocess output delivery if every compute worker certified
+    closed inputs and clear reads; otherwise all workers must ACK. The
+    conductor can force removal if the barrier times out."""
     expected_acks: set[str]
     participants: set[str]
     # Set for the fail path: the client notification is deferred until the
@@ -1635,7 +1636,7 @@ class Conductor:
     ):
         """Start the teardown barrier for a request. Applies any READS_DONE that
         raced ahead of registration, and finalizes immediately if already
-        satisfied (e.g. a happy path with no outstanding reader)."""
+        satisfied (e.g. certified completion after the output-delivery ACK)."""
         expected_acks = set(expected_acks) - self._early_reads_done.pop(request_id, set())
         self.draining[request_id] = DrainingRequest(
             expected_acks=expected_acks,

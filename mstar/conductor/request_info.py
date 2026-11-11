@@ -139,8 +139,12 @@ class PartitionState:
     graph_walk: str = ""
     fwd_pass_number: int = 0
     random_seed: int = 0
+    # Incremented before each conductor-driven input pass is sent.
     input_epoch: int = 0
+    # Workers assigned to this partition, including later walks.
     input_workers: set[str] = field(default_factory=set)
+    # Workers sealed for their last authorized pass. A new walk invalidates
+    # only its participants; workers absent from it keep their earlier seal.
     input_closed_workers: set[str] = field(default_factory=set)
     is_done: bool = False
     completed_worker_graph_ids: set[int] = field(default_factory=set)

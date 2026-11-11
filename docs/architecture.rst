@@ -101,7 +101,7 @@ already-read queued edges cannot restart it. A newer authorized epoch reopens
 admission. Seals survive graph reset and are removed with the request before
 its handle is reused.
 
-Streaming, TP/SP, side-step deployments, missing execution metadata, and queued
+Streaming, TP/SP/CFG, side-step deployments, missing execution metadata, and queued
 or submitted work require the drain barrier. Read failures whose transfer
 status is unknown keep that barrier pending until forced removal. The existing
 forced-drain timeout still applies.

@@ -351,7 +351,7 @@ def test_a_leader_sends_the_marker_for_a_step_it_drops_before_its_decision(monke
     w, sched, state, rec = _tp_loop(monkeypatch)
     build_step_1 = _builds_step_1(w, sched, state)
 
-    def finish_step(pending, outputs):
+    def finish_step(pending, outputs, *, next_step_rids=()):
         if raise_in == "finish_step":
             raise RuntimeError("boom")
 

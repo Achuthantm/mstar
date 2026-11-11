@@ -1350,6 +1350,9 @@ class StepExecutor:
         self, rids: list[int], infos: list, lane: int, next_step_rids: Iterable[int],
         rows_by_lane: Mapping[int, frozenset[int]] | None = None,
     ) -> frozenset[int]:
+        """Exclude rows still held by another step. The runtime additionally
+        checks the executing epoch, local graph completion and queued work.
+        Side-step deployments retain the drain barrier."""
         if self._layout.side_keys:
             return frozenset()
         candidates = {

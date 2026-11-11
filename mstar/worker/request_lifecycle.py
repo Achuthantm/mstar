@@ -103,8 +103,9 @@ class RequestLifecycle:
         return True
 
     def takes_input(self, wire_rid: str) -> bool:
-        """Whether this rank still reads the inputs of NEW_REQUEST and INPUT_SIGNALS
-        for a request: until it sends READS_DONE, draining or not, since a step
+        """Whether teardown permits more reads from NEW_REQUEST and INPUT_SIGNALS.
+        InputIngest also checks the partition's input epoch. Teardown allows
+        reads until READS_DONE, draining or not, since a step
         rank 0 committed may wait on one that arrives behind the forwarded drain.
         After READS_DONE the producer may free what it sent."""
         return wire_rid not in self._reads_done_sent
@@ -193,10 +194,11 @@ class RequestLifecycle:
     # -- drains --------------------------------------------------------------
 
     def drain(self, body: DrainRequest) -> None:
-        """A DRAIN. A follower honors only the leader's forward, like a remove,
-        but for a request never admitted here: the conductor sends a NEW_REQUEST
-        ahead of its drain on one FIFO socket, so the leader has no handle either
-        and forwards nothing."""
+        """Ignore drains after removal. An admitted follower honors only the
+        leader's forward, so it drains in step order. For a request never
+        admitted here, it also accepts the conductor's drain: NEW_REQUEST and
+        DRAIN share a FIFO socket, so the leader has no handle either and
+        forwards nothing."""
         # A drain from another socket can arrive after removal.
         if body.request_id in self._removed:
             return

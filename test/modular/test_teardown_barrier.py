@@ -1,9 +1,8 @@
-"""Teardown barrier (conductor side): the hard RemoveRequest that unlinks a
-segment is sent only after every reader has drained (READS_DONE).
+"""Conductor cleanup: wait for output delivery and closed, clear compute
+inputs or the READS_DONE barrier, unless the forced-drain timeout expires.
 
-Covers the happy path (defer Remove until the preprocess worker finished
-delivering outputs, and unpersist still-held signals with correct counts) and
-the abort/fail path (drain all workers + preprocess worker, then Remove).
+Covers successful completion, per-worker read reports, persisted-signal
+reference counts, and abort/failure draining of every participant.
 """
 
 import types
@@ -35,8 +34,7 @@ def _request_data(workers=("w0",), persist_signals=None, ref_cnts=None):
         all_worker_graph_ids={0},
         max_output_tokens=1,
         random_seed=0,
-        # Post-resource-pool refactor: requests carry per-resource configs
-        # rather than a sampling_config. The barrier never reads them.
+        # The barrier does not read resource configurations.
         resource_configs={},
     )
 

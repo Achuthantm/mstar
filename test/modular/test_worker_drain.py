@@ -335,9 +335,12 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
 
 @pytest.mark.parametrize("known_rids", [(), ("X",)], ids=["never-admitted", "removed"])
 @pytest.mark.parametrize("source", [MessageSource.CONDUCTOR, MessageSource.TP_RANK_0])
-def test_late_drain_does_not_recreate_removed_request_state(known_rids, source):
-    w = _worker(known_rids=known_rids)
-    _remove(w, request_id="X")
+@pytest.mark.parametrize("is_follower", [False, True], ids=["leader", "follower"])
+def test_late_drain_does_not_recreate_removed_request_state(known_rids, source, is_follower):
+    w = _worker(known_rids=known_rids, is_follower=is_follower)
+    remove_source = MessageSource.TP_RANK_0 if is_follower and known_rids else MessageSource.CONDUCTOR
+    _remove(w, request_id="X", source=remove_source)
+    assert "X" in w.lifecycle._removed
     _drain(w, request_id="X", source=source)
 
     assert not w.lifecycle.draining

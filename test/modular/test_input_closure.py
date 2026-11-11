@@ -65,9 +65,10 @@ class _Case:
         w = self.worker = make_worker(
             graph_runtime=self.rt, request_state=RequestStateManager(),
             engine_manager=SimpleNamespace(add_request=lambda *a: None),
-            streams=SimpleNamespace(add_request=lambda *a: None),
+            streams=SimpleNamespace(add_request=lambda *a: None, consumer_node={}),
             wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
             tensor_manager=SimpleNamespace(
+                get_tensor=None, my_entity_id="w0",
                 register_request=lambda *a: None,
                 start_read_tensors=lambda rid, edges, **kw: self.reads.extend(edges) or [],
                 ack_unread_tensors=self.unread.extend,

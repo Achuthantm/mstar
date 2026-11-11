@@ -1,6 +1,6 @@
-"""A failed async tensor read (a Mooncake transfer error) fails only its own
-request, and its buffers are freed once Mooncake reports that every transfer
-into them stopped.
+"""An async tensor read failure fails only its own request. Its buffers stay
+allocated until the transport proves every transfer stopped. An unknown status
+holds READS_DONE until forced removal and keeps the destination buffers pinned.
 
 Before, ``get_ready_tensors`` re-raised the same failed future on every poll,
 so no other request on that worker or data worker received its inputs until
@@ -660,8 +660,8 @@ def test_an_unresolved_read_holds_the_drain_until_removal(engine, where, bookkee
     buffers pinned; reusing that handle must not inherit the old drain.
     """
     from mstar.communication.tensor_store import PythonTensorBookkeeping, RustTensorBookkeeping, TensorStore
-    from mstar.worker.rid_table import RidTable
     from mstar.testing_utils.worker import make_worker
+    from mstar.worker.rid_table import RidTable
 
     bookkeeping = PythonTensorBookkeeping
     if bookkeeper == "rust":

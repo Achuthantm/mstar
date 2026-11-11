@@ -2148,12 +2148,10 @@ class TensorCommunicationManager(ABC):
         return frozenset(rids)
 
     def has_inflight_reads(self, request_id: Rid) -> bool:
-        """Whether any async read for this request is still touching a remote
-        segment. Synchronous (SHM) reads complete inside ``start_read_tensors``
-        with ``future=None``, so they never count here; only outstanding
-        async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
-        So does a failed read whose transfers have not all stopped: they may
-        still be reading the producer's memory.
+        """Whether a read may still access this request's producer memory.
+        Immediate copies use ``future=None`` and do not count. Outstanding
+        futures, including arena events, and failed transfers not proven to
+        have stopped hold the READS_DONE ACK during a drain.
         """
         return any(
             ep.request_id == request_id

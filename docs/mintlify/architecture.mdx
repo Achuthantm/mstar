@@ -34,3 +34,28 @@ A worker that dies (an exception during setup, an OOM kill, a segfault) sends no
 2.  The conductor asks the model once, at ingest, for each partition's walk plan (`walk_plan`: e.g. `prefill` then `decode`), and runs it: it sends each walk its inputs and moves to the next walk as each one completes.
 3.  Workers execute the ready graph nodes on GPU through the engine. The engine declares and admits each step's resource work around the forward pass. Workers then route the output tensors to downstream nodes and workers.
 4.  Outputs marked for the client are post-processed (`postprocess`) and streamed back.
+
+## Successful request cleanup {#successful-request-cleanup}
+
+The conductor emits `request_complete` before cleanup. `REMOVE_REQUEST`
+waits for the preprocess worker's output-delivery acknowledgement and for
+compute workers to certify closed input admission or finish the
+`DRAIN_REQUEST` / `READS_DONE` barrier.
+
+For non-streaming, single-rank graphs, the conductor advances `input_epoch`
+before sending each new pass. The runtime can seal admission once every local
+graph in that pass finishes and no queued or submitted work remains. Completion
+reports carry the executing batch's epoch and a request-wide read snapshot,
+taken on the main thread without interleaved input handling. Skipping the drain
+requires a valid seal from every participant for its last authorized pass and
+no outstanding reads. Workers absent from a later walk keep their earlier seal.
+
+A sealed pass acknowledges same-generation or older input descriptors unread;
+already-read queued edges cannot restart it. A newer authorized epoch reopens
+admission. Seals survive graph reset and are removed with the request before
+its handle is reused.
+
+Streaming, TP/SP/CFG, side-step deployments, missing execution metadata, and queued
+or submitted work require the drain barrier. Read failures whose transfer
+status is unknown keep that barrier pending until forced removal. The existing
+forced-drain timeout still applies.

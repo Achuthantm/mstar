@@ -40,7 +40,9 @@ pub struct RequestPartitionInfo {
     /// Survives RequestState::reset, so a late descriptor cannot start the
     /// completed pass again. None is the unconditional-drain path.
     pub input_epoch: Option<u64>,
+    /// Reject further descriptors and queued read results for this epoch.
     pub input_sealed: bool,
+    /// Current-walk local graphs still awaiting completion in this epoch.
     pub input_pending_wgs: Vec<WgIndex>,
 }
 

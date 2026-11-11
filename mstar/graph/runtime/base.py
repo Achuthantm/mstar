@@ -937,7 +937,10 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     @abstractmethod
     def accept_input_pass(self, rid: int, partition: str, walk: str, input_epoch: int) -> bool:
-        """Authorize non-streaming input before any transport read starts."""
+        """Check the input epoch before starting a non-streaming read, changing
+        the walk if accepted. A sealed pass rejects same/older epochs; a newer
+        authorized pass reopens it. Unsealed epochs may accept multiple inputs.
+        Partitions admitted with epoch -1 do not check input epochs."""
         pass
 
     @abstractmethod

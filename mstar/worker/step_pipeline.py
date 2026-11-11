@@ -964,6 +964,7 @@ class StepPipeline:
         # ignoring ref counts / persist. The conductor gates REMOVE_REQUEST on
         # sealed, clear completion reports and output delivery, or the
         # READS_DONE barrier when closure is not certified or on abort/failure.
+        # Its timeout can still force removal before every reader is done.
         laps = PhaseLaps("worker.msg.remove_request.")
         for message in self.lifecycle.removed(rid, wire_rid):
             self.ingest.drop_for_removed(message)
@@ -999,9 +1000,9 @@ class StepPipeline:
         laps.lap("runtime")
 
     def _apply_drains(self, in_flight: Collection[int]) -> None:
-        """Phase-1 teardown: stop scheduling a rid, then ACK
-        READS_DONE once its in-flight reads finish. The hard cleanup waits for
-        the conductor's REMOVE_REQUEST, sent only after every reader has ACKed."""
+        """Stop new scheduling, then ACK READS_DONE once reads and committed
+        follower steps finish. Hard cleanup waits for the conductor's
+        REMOVE_REQUEST, after the barrier completes or its timeout expires."""
         lifecycle = self.lifecycle
         for wire_rid in lifecycle.drains_ready(in_flight):
             rid = lifecycle.begin_drain(wire_rid)

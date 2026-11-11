@@ -564,6 +564,7 @@ pub(super) struct SendArgs {
     pub inflight_read_rids: Vec<u32>,
     /// Rows with no other step that can still need this pass's inputs.
     pub input_closure_rids: Vec<u32>,
+    /// Executing epochs in info_rids order; negative entries cannot certify closure.
     pub input_epochs: Vec<i64>,
 }
 
