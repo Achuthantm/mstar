@@ -194,18 +194,23 @@ def _sent(msg):
 @pytest.mark.parametrize("inflight", [False, True])
 def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path, inflight):
     mesh = _Mesh(tmp_path, outs=[("out", "", False)])
-    rid = mesh.admit()
-    got = mesh.run(rid, uuids=[], inflight_read_rids=[rid] if inflight else [rid + 1])
+    rid = mesh.admit(input_epoch=0)
+    got = mesh.run(
+        rid, uuids=[], inflight_read_rids=[rid] if inflight else [rid + 1],
+        input_closure_rids=[rid], input_epochs=[0],
+    )
 
     assert got["conductor"] == [_sent(ConductorMessage(
         message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
         body=WorkerGraphsDone(
             request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
-            worker_id=ME, has_inflight_reads=inflight,
+            worker_id=ME, closed_input_epoch=-1 if inflight else 0,
             partition_name="default", graph_walk=WALK,
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
+    # Seal admission even while reads finish; only the certificate waits.
+    assert not mesh.rt.accept_input_pass(rid, "default", WALK, 0)
 
 
 @pytest.mark.parametrize("executing_epoch", [0, 1])

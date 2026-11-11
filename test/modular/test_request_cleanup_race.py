@@ -181,19 +181,17 @@ def test_successful_cleanup_does_not_invalidate_a_read(
         _total_fanin=1, _shard_dim=None,
     )
     c = _conductor()
-    def report_reads():
-        for entity, manager in managers.items():
-            handle = tables[entity].handle("request")
+    def report_completion():
+        for entity in managers:
             c._process_worker_graphs_done(WorkerGraphsDone(
                 request_id="request", worker_graph_ids=[0],
                 is_first_tp_rank=entity == "w0", worker_id=entity,
-                has_inflight_reads=handle in manager.inflight_read_rids([handle]),
             ))
 
     if read_timing == "client-stream":
-        # Open input can arrive after the snapshot, so it must always drain.
+        # Open input can arrive after completion, so it must always drain.
         c._client_streams = {"audio": object()}
-        report_reads()
+        report_completion()
         c._process_request_done("request")
     [future] = receiver.start_read_tensors(receiver_rid, [edge])
     try:
@@ -208,14 +206,14 @@ def test_successful_cleanup_does_not_invalidate_a_read(
             receiver.communicator.sent.clear()
 
         if read_timing != "client-stream":
-            report_reads()
+            report_completion()
             c._process_request_done("request")
         c._handle_reads_done(ReadsDone(request_id="request", entity_id=c.PREPROCESS_WORKER))
         drains = {
             entity: msg.body for entity, msg in c.communicator.sent
             if msg.message_type == WorkerMessageType.DRAIN_REQUEST
         }
-        # This fixture reports snapshots without sealing admission, so even a
+        # This fixture reports completion without sealing admission, so even a
         # completed read requires the barrier. Native seals have separate tests.
         assert set(drains) == {"w0", "w1"}
         for entity in teardown_order:

@@ -324,7 +324,7 @@ def test_postprocess_snapshots_reads_once_for_the_whole_batch():
 @pytest.mark.parametrize("outstanding", ["none", "next_step", "other_lane", "side_lane", "backlog"])
 def test_pipeline_passes_input_closure_fences_to_completion(outstanding):
     w = _postprocess_worker(
-        refuse=set(), side_keys={("llm", "decode")} if outstanding == "side_lane" else (),
+        refuse=set(), side_keys={("llm", "decode")} if outstanding in {"side_lane", "other_lane"} else (),
     )
     pending, outputs = _decode_step([0, 1])
     executing = _fwd_info("decode", "p")
@@ -345,7 +345,7 @@ def test_pipeline_passes_input_closure_fences_to_completion(outstanding):
     )
 
     [send] = sends
-    expected = set() if outstanding == "side_lane" else {0, 1} if outstanding == "none" else {1}
+    expected = set() if outstanding in {"side_lane", "other_lane"} else {0, 1} if outstanding == "none" else {1}
     assert send.input_closure_rids == expected
     # New metadata cannot certify the older step retiring through the executor.
     assert send.input_epochs == [0, 0]

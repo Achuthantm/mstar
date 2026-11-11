@@ -384,9 +384,6 @@ class RequestData:
     # set once request_complete goes out; after that the client must never get
     # request_failed
     completion_sent: bool = False
-    # Latest read reports, across all partitions and ranks. Allocate only
-    # when a worker reports reads; a later clear report removes that worker.
-    workers_with_inflight_reads: set[str] | None = None
     input_closure_enabled: bool = False
 
     # Partition state (always populated — single-partition models use a "default" partition)
@@ -1887,15 +1884,16 @@ class Conductor:
         if still_persisted:
             self._un_persist_tensors(request_id, still_persisted)
 
-        # A clear snapshot is sufficient only after every participant sealed
-        # its last authorized input pass. Unsupported paths retain the barrier.
+        # Each certificate covers sealed inputs and clear request-wide reads.
+        # New passes invalidate their participants' certificates before sending
+        # inputs; sealed passes cannot start new reads. Other paths still drain.
         workers = self._request_workers(request_data)
         expected_acks = {self.PREPROCESS_WORKER}
         inputs_closed = request_data.input_closure_enabled and all(
             p.input_workers and p.input_workers <= p.input_closed_workers
             for p in request_data.partition_states.values()
         )
-        if self._client_streams or request_data.workers_with_inflight_reads or not inputs_closed:
+        if self._client_streams or not inputs_closed:
             self._send_drain(request_id, workers)
             expected_acks |= workers
         self._register_draining(
@@ -1950,20 +1948,10 @@ class Conductor:
             )
             return []
 
-        # A later report from this worker covers all its reads for the request,
-        # so it can clear an earlier report, even from another partition.
-        # A different rank's clear report must not erase an outstanding read.
-        if body.has_inflight_reads:
-            if request_data.workers_with_inflight_reads is None:
-                request_data.workers_with_inflight_reads = set()
-            request_data.workers_with_inflight_reads.add(body.worker_id)
-        elif request_data.workers_with_inflight_reads:
-            request_data.workers_with_inflight_reads.discard(body.worker_id)
-
         if (
-            request_data.input_closure_enabled
+            body.closed_input_epoch >= 0
+            and request_data.input_closure_enabled
             and body.closed_input_epoch == pstate.input_epoch
-            and not body.has_inflight_reads
             and body.worker_id in pstate.input_workers
         ):
             pstate.input_closed_workers.add(body.worker_id)

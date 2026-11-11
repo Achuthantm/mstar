@@ -8,7 +8,7 @@ import torch
 sys.path.insert(0, ".")
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.conductor.conductor import Conductor, RequestData
+from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import (
     PartitionState,
     merge_publish_info,
@@ -42,15 +42,12 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     partition = PartitionState(
         partition_name="default", graph_walk="image_gen_cfg2", current_worker_graph_ids={"wg"},
     )
-    request = RequestData(
+    request = SimpleNamespace(
         partition_states={"default": partition},
+        output_chunk_counts={},
         persist_signals={},
-        persist_signal_ref_cnt={},
+        streaming_connections={},
         worker_graph_to_workers={"wg": ["worker_0", "worker_1"]},
-        all_worker_graph_ids={"wg"},
-        max_output_tokens=32,
-        random_seed=0,
-        resource_configs={},
     )
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
@@ -63,7 +60,6 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
                 request_id="request",
                 worker_graph_ids=["wg"],
                 is_first_tp_rank=rank == 0,
-                worker_id=f"worker_{rank}",
                 resource_publish_info={"kv": _rank_publish(rank)},
             )
         )

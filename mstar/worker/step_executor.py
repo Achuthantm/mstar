@@ -706,7 +706,6 @@ class StepExecutor:
         outputs: BatchedModelOutput,
         clear_loop_stops: bool = True,
         next_step_rids: Iterable[int] = (),
-        rows_by_lane: Mapping[int, frozenset[int]] | None = None,
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
         # a nested `_span`, because of the two early returns.
@@ -910,7 +909,7 @@ class StepExecutor:
             else:
                 send = self._send_input(
                     batch_N, request, step, stored, engine,
-                    next_step_rids=next_step_rids, rows_by_lane=rows_by_lane,
+                    next_step_rids=next_step_rids,
                 )
                 sent_here = True
                 stage = "send_prep"
@@ -1214,7 +1213,6 @@ class StepExecutor:
         self, batch_N: PendingBatch, request: PostprocessRequest, step: PostprocessStep,
         stored: StoredOutputs | None, engine,
         *, next_step_rids: Iterable[int] = (),
-        rows_by_lane: Mapping[int, frozenset[int]] | None = None,
     ) -> SendInput:
         """SEND: what the send needs of the worker, after the stopped rows'
         finalize, the step's publication and the route's tensor work."""
@@ -1315,7 +1313,7 @@ class StepExecutor:
         ntc_rids = [rid for rid in send_rids if new_token_counts.get(rid)]
         infos = [self.request_state.get_fwd_info(rid, batch_N.partition) for rid in info_rids]
         close_inputs = self._input_closure_candidates(
-            info_rids, infos, batch_N.lane, next_step_rids, rows_by_lane,
+            info_rids, infos, next_step_rids,
         )
         return SendInput(
             completion_id=route_output.completion_id,
@@ -1349,12 +1347,12 @@ class StepExecutor:
         )
 
     def _input_closure_candidates(
-        self, rids: list[int], infos: list, lane: int, next_step_rids: Iterable[int],
-        rows_by_lane: Mapping[int, frozenset[int]] | None = None,
+        self, rids: list[int], infos: list, next_step_rids: Iterable[int],
     ) -> frozenset[int]:
         """Exclude rows held by another step or the scheduler backlog. The runtime additionally
         checks the executing epoch, local graph completion and queued work.
-        Side-step deployments retain the drain barrier."""
+        Side-step deployments retain the drain barrier, so only the chain's
+        next step can hold an otherwise eligible row."""
         if self._layout.side_keys:
             return frozenset()
         candidates = {
@@ -1363,10 +1361,6 @@ class StepExecutor:
         }
         if candidates:
             candidates.difference_update(next_step_rids)
-            if rows_by_lane:
-                for other, held in rows_by_lane.items():
-                    if other != lane:
-                        candidates.difference_update(held)
             # Backlogged rows have left the ready queues. A graph reset can
             # also clear their in_flight flags before the runtime seals it.
             for batch in self._scheduler.backlog.values():

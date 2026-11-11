@@ -90,13 +90,13 @@ def _collect(box):
     return out
 
 
-def _start(rt, n, limits=True):
+def _start(rt, n, limits=True, input_epoch=-1):
     rids = []
     for i in range(n):
         rid = rt.add_request(
             request_id=f"r{i}", partition=PART, graph_walk=WALK,
             partition_worker_graph_ids=[0],
-            worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
+            worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={}, input_epoch=input_epoch)
         if limits:
             # a limit no step reaches: EOS and the loop's cap end the rows
             rt.register_stop_limits(rid, SimpleNamespace(max_tokens=1 << 20, resource_configs={}, partition_name=PART))
@@ -133,6 +133,8 @@ def _drive(rt, request, values, model_stops, dropped=(), inflight_read_rids=froz
                 per_request_info=ParallelList(info, [None] * len(info)),
                 new_token_counts=ParallelList([], []),
                 inflight_read_rids=inflight_read_rids,
+                input_closure_rids=frozenset(info),
+                input_epochs=[0] * len(info),
             ))
 
 
@@ -150,7 +152,7 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
         d.mkdir()
         boxes[k] = {p: ZmqCommunicator(p, str(d)) for p in ("api_server", "conductor")}
         rts[k] = _runtime(cls, str(d))
-    rids = [_start(rt, n) for rt in rts.values()]
+    rids = [_start(rt, n, input_epoch=0) for rt in rts.values()]
     assert rids[0] == rids[1]
     active = rids[0]
     needs = set()
@@ -197,7 +199,8 @@ def test_native_matches_reference(tmp_path, mode, dtype, reverse_rows):
             reports = [m.body for m in got["native"]
                        if m.message_type == ConductorMessageType.WORKER_GRAPHS_DONE]
             assert reports
-            assert {m.request_id for m in reports if m.has_inflight_reads} == {"r1"}
+            assert {m.request_id for m in reports if m.closed_input_epoch < 0} == {"r1"}
+            assert all(m.closed_input_epoch == 0 for m in reports if m.request_id != "r1")
             assert all(m.worker_id == ME for m in reports)
     for rt in rts.values():
         assert rt._rust.num_parked_completions() == 0

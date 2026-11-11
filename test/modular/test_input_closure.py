@@ -126,7 +126,7 @@ class _Case:
             new_token_counts=ParallelList([], []),
             inflight_read_rids=frozenset({self.rid}) if reads else frozenset(),
             input_closure_rids=self.worker.executor._input_closure_candidates(
-                [self.rid], [info], 0, other_work, self.worker.pipeline._rows_by_lane,
+                [self.rid], [info], other_work,
             ),
             input_epochs=None if reported_epoch is None else [reported_epoch],
         )
@@ -157,11 +157,32 @@ class _Case:
 def test_late_descriptor_is_rejected_before_transport_read(tmp_path, epoch, native):
     case = _Case(tmp_path)
     report = case.finish(native=native)
-    assert not report.has_inflight_reads
     edge = case.input(epoch, tensor=True)
     assert case.reads == [], "a late descriptor started a read after the clear completion report"
     assert case.unread == [edge]
     assert report.closed_input_epoch == 0
+
+
+@pytest.mark.parametrize("native", [False, True], ids=["split", "native"])
+@pytest.mark.parametrize("reads", [False, True])
+def test_input_seal_certifies_cleanup_only_without_pending_reads(tmp_path, native, reads):
+    case = _Case(tmp_path)
+    report = case.finish(reads=reads, native=native)
+    assert report.closed_input_epoch == (-1 if reads else 0)
+    c = _conductor()
+    c._process_worker_graphs_done(WorkerGraphsDone(
+        request_id="r", worker_graph_ids=[1], is_first_tp_rank=True,
+        worker_id="w1", closed_input_epoch=0,
+    ))
+    c._process_worker_graphs_done(report)
+    c._process_request_done("r")
+    assert c.draining["r"].expected_acks == (
+        {"w0", "w1", c.PREPROCESS_WORKER} if reads else {c.PREPROCESS_WORKER}
+    )
+    # Still seal admission immediately: waiting for the read must not admit
+    # more descriptors and extend the drain.
+    edge = case.input(0, tensor=True)
+    assert case.reads == [] and case.unread == [edge]
 
 
 def test_new_epoch_reopens_same_walk_and_old_epoch_stays_closed(tmp_path):
@@ -272,7 +293,6 @@ def test_backlogged_work_prevents_sealing_and_keeps_conductor_drain(tmp_path, na
     # Completing a sibling in the same graph resets even the in_flight flag;
     # only the Python backlog still records the outstanding work in that case.
     assert rt.is_in_flight("n0", 0, rid) is not same_graph
-    assert not report.has_inflight_reads
     assert report.closed_input_epoch == -1
 
     c = _conductor()
@@ -335,7 +355,7 @@ def test_retiring_old_step_cannot_certify_newer_epoch(tmp_path):
 
 @pytest.mark.parametrize("kind", ["next_step", "other_lane", "side_lane"])
 def test_outstanding_work_requires_barrier(tmp_path, kind):
-    case = _Case(tmp_path, side_keys={("n0", "run")} if kind == "side_lane" else ())
+    case = _Case(tmp_path, side_keys={("n0", "run")} if kind in {"side_lane", "other_lane"} else ())
     other_work = ()
     if kind == "next_step":
         other_work = {case.rid}
@@ -399,11 +419,13 @@ def _conductor():
     return c
 
 
-@pytest.mark.parametrize("missing", ["none", "worker", "old_epoch", "positive_read", "unsupported"])
+@pytest.mark.parametrize("missing", ["none", "worker", "old_epoch", "other_partition", "unsupported"])
 def test_conductor_requires_every_participants_current_seal(missing):
     c = _conductor()
     if missing == "unsupported":
         c.requests["r"].input_closure_enabled = False
+    elif missing == "other_partition":
+        c.requests["r"].partition_states["other"] = PartitionState("other", input_workers={"w0"})
     for index, worker in enumerate(("w0", "w1")):
         if missing == "worker" and index == 1:
             continue
@@ -411,7 +433,6 @@ def test_conductor_requires_every_participants_current_seal(missing):
             request_id="r", worker_graph_ids=[index], is_first_tp_rank=True,
             worker_id=worker,
             closed_input_epoch=-1 if missing == "old_epoch" and index == 1 else 0,
-            has_inflight_reads=missing == "positive_read" and index == 1,
         ))
     c._process_request_done("r")
     drains = {peer for peer, msg in c.sent if msg.message_type == WorkerMessageType.DRAIN_REQUEST}

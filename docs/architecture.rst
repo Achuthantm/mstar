@@ -91,10 +91,11 @@ compute workers to certify closed input admission or finish the
 For non-streaming, single-rank graphs, the conductor advances ``input_epoch``
 before sending each new pass. The runtime can seal admission once every local
 graph in that pass finishes and no queued or submitted work remains. Completion
-reports carry the executing batch's epoch and a request-wide read snapshot,
-taken on the main thread without interleaved input handling. Skipping the drain
-requires a valid seal from every participant for its last authorized pass and
-no outstanding reads. Workers absent from a later walk keep their earlier seal.
+reports certify the executing batch's epoch only when admission is sealed and
+request-wide reads are clear, checked on the main thread without interleaved
+input handling. Admission stays sealed while existing reads finish. Skipping
+the drain requires a certificate from every participant for its last authorized
+pass. Workers absent from a later walk keep their earlier certificate.
 
 A sealed pass acknowledges same-generation or older input descriptors unread;
 already-read queued edges cannot restart it. A newer authorized epoch reopens

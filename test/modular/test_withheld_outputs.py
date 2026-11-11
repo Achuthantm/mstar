@@ -218,7 +218,7 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         ),
         node_batch=_batch(),
         node_name=NODE, partition="default", graph_walk=WALK, loop_name=None,
-        speculative_new_iter=False, lane=0,
+        speculative_new_iter=False,
     )
 
     w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs=_outputs()))

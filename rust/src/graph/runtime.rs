@@ -363,7 +363,7 @@ pub struct GraphRuntime {
         let partition = self.interner.get(partition_name);
         let closed_input_epoch = partition
             .and_then(|p| self.info(rid).and_then(|i| i.partitions.get(&p)))
-            .filter(|p| p.input_sealed && p.input_epoch == input_epoch)
+            .filter(|p| !has_inflight_reads && p.input_sealed && p.input_epoch == input_epoch)
             .and_then(|p| p.input_epoch);
         let (persist, new_tokens, output_signals, stream_items) =
             match self.requests[rid as usize].as_mut() {
@@ -376,7 +376,6 @@ pub struct GraphRuntime {
         let frame = frames::WorkerGraphsDone {
             request_id: &request_id,
             worker_id: self.interner.name(self.shard.me),
-            has_inflight_reads,
             closed_input_epoch,
             worker_graph_ids,
             is_first_tp_rank,

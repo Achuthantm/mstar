@@ -1,7 +1,7 @@
 """Conductor cleanup: wait for output delivery and closed, clear compute
 inputs or the READS_DONE barrier, unless the forced-drain timeout expires.
 
-Covers successful completion, per-worker read reports, persisted-signal
+Covers successful completion, missing closure certificates, persisted-signal
 reference counts, and abort/failure draining of every participant.
 """
 
@@ -12,14 +12,12 @@ import pytest
 import torch
 
 from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
-from mstar.conductor.request_info import PartitionState
 from mstar.graph.base import TensorPointerInfo
 from mstar.utils.ipc_format import (
     FailRequests,
     NewRequestConductor,
     ReadsDone,
     UnpersistTensors,
-    WorkerGraphsDone,
     WorkerMessageType,
 )
 
@@ -96,19 +94,6 @@ def _remove_targets(c, rid):
         e for e, m in _by_type(c, WorkerMessageType.REMOVE_REQUEST)
         if m.body.request_id == rid
     }
-
-
-def _report_reads(c, worker, inflight, partition="default", rid="r1"):
-    rd = c.requests[rid]
-    rd.partition_states.setdefault(partition, PartitionState(
-        partition_name=partition,
-        graph_walk="decode",
-        current_worker_graph_ids={0},
-    ))
-    return c._process_worker_graphs_done(WorkerGraphsDone(
-        request_id=rid, worker_graph_ids=[0], is_first_tp_rank=worker == "w0",
-        partition_name=partition, worker_id=worker, has_inflight_reads=inflight,
-    ))
 
 
 # ── abort / fail path ───────────────────────────────────────────────────────
@@ -204,72 +189,8 @@ def test_done_completes_client_immediately_but_defers_remove():
     assert c.admits == 1
 
 
-@pytest.mark.parametrize("early_preprocess_ack", [False, True])
-def test_done_with_a_followers_extra_read_drains_all_workers(early_preprocess_ack):
-    """#244: a clear leader report cannot release an outstanding follower read."""
-    c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
-    assert _report_reads(c, "w1", True) == []
-    assert _report_reads(c, "w0", False) == ["default"]
-    if early_preprocess_ack:
-        c._handle_reads_done(ReadsDone("r1", PREPROCESS))
-    c._process_request_done("r1")
-
-    assert len(_by_type(c, "request_complete")) == 1
-    assert _drain_targets(c, "r1") == {"w0", "w1"}
-    assert _remove_targets(c, "r1") == set()
-    if not early_preprocess_ack:
-        c._handle_reads_done(ReadsDone("r1", PREPROCESS))
-    c._handle_reads_done(ReadsDone("r1", "w0"))
-    assert _remove_targets(c, "r1") == set()
-    assert "r1" in c.requests and c.admits == 0
-    c._handle_reads_done(ReadsDone("r1", "w1"))
-    assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
-    assert "r1" not in c.requests and c.admits == 1
-
-
-def test_clear_snapshots_without_seals_still_drain():
-    c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
-    _report_reads(c, "w0", False)
-    _report_reads(c, "w1", False)
-    assert c.requests["r1"].workers_with_inflight_reads is None
-    c._process_request_done("r1")
-    assert _drain_targets(c, "r1") == {"w0", "w1"}
-    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
-    c._handle_reads_done(ReadsDone("r1", PREPROCESS))
-    assert _remove_targets(c, "r1") == set()
-    c._handle_reads_done(ReadsDone("r1", "w0"))
-    c._handle_reads_done(ReadsDone("r1", "w1"))
-    assert _remove_targets(c, "r1") == {"w0", "w1", PREPROCESS}
-
-
-def test_a_later_clear_report_supersedes_only_that_workers_snapshot():
-    c = _conductor({"r1": _request_data(workers=("w0", "w1"))})
-    _report_reads(c, "w0", True, partition="producer")
-    _report_reads(c, "w1", True, partition="producer")
-    _report_reads(c, "w0", False, partition="consumer")
-    assert c.requests["r1"].workers_with_inflight_reads == {"w1"}
-    _report_reads(c, "w1", False, partition="consumer")
-    assert not c.requests["r1"].workers_with_inflight_reads
-    c._process_request_done("r1")
-    assert _drain_targets(c, "r1") == {"w0", "w1"}
-    assert c.draining["r1"].expected_acks == {"w0", "w1", PREPROCESS}
-
-
-def test_read_reports_do_not_hold_another_requests_teardown():
-    c = _conductor({"r1": _request_data(), "r2": _request_data()})
-    _report_reads(c, "w0", True, rid="r1")
-    _report_reads(c, "w0", False, rid="r2")
-    c._process_request_done("r2")
-    assert _drain_targets(c, "r2") == {"w0"}
-    c._handle_reads_done(ReadsDone("r2", "w0"))
-    c._handle_reads_done(ReadsDone("r2", PREPROCESS))
-    assert "r2" not in c.requests
-    assert c.requests["r1"].workers_with_inflight_reads == {"w0"}
-
-
 def test_early_worker_acks_do_not_send_drains_after_remove():
     c = _conductor({"r1": _request_data()})
-    _report_reads(c, "w0", True)
     for worker in ("w0", PREPROCESS):
         c._handle_reads_done(ReadsDone("r1", worker))
     c._process_request_done("r1")

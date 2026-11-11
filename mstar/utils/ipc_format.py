@@ -403,12 +403,9 @@ class WorkerGraphsDone(MessageBody):
     graph_timings: GraphTimings = field(default_factory=dict)
     rx_info: list[RxInfo] = field(default_factory=list)
     tx_info: list[TxInfo] = field(default_factory=list)
-    # Request-wide read snapshot, including reads outside the completed graph.
-    # The sender identifies the rank whose previous snapshot this replaces.
+    # The rank certifying its partition's last authorized input pass.
     worker_id: str = ""
-    has_inflight_reads: bool = False
-    # Admission was sealed for this partition/pass before this report was sent.
-    # -1 means the sender supplied only a read snapshot.
+    # Admission is sealed and request-wide reads are clear. -1 requires draining.
     closed_input_epoch: int = -1
 
 

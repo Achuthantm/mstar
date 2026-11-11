@@ -620,8 +620,7 @@ def test_send_outputs_consumes_the_completion(tmp_path):
         runtime.send_outputs(send)
 
 
-@pytest.mark.parametrize("inflight", [False, True])
-def test_persist_signals_are_buffered_until_a_worker_graph_finishes(tmp_path, inflight):
+def test_persist_signals_are_buffered_until_a_worker_graph_finishes(tmp_path):
     """They ride WORKER_GRAPHS_DONE rather than going out on their own, so a
     persist cannot race the message announcing it."""
     single = GraphNode(
@@ -637,8 +636,7 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes(tmp_path, in
     store, minter = runtime.tensor_store, TensorUuidMinter("worker_0")
 
     out, uuids = _route_one(runtime, mgr, rid, store, minter)
-    send = _send_input(runtime, rid, out.completion_id, _fwd_info("decode"))
-    runtime.send_outputs(send._replace(inflight_read_rids=frozenset({rid} if inflight else {rid + 1})))
+    runtime.send_outputs(_send_input(runtime, rid, out.completion_id, _fwd_info("decode")))
 
     wgd = [
         m for e, m in comm.sent
@@ -647,8 +645,6 @@ def test_persist_signals_are_buffered_until_a_worker_graph_finishes(tmp_path, in
     ]
     assert len(wgd) == 1, "the finished worker graph must report exactly once"
     assert wgd[0].body.persist_signals["token"][0].uuid == uuids[0]
-    assert wgd[0].body.worker_id == "worker0"
-    assert wgd[0].body.has_inflight_reads is inflight
     # Flushed, so a second pass does not resend them.
     assert runtime._rust.pending_persist_signals(rid) == []
 

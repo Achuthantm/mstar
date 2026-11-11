@@ -679,7 +679,7 @@ class StepPipeline:
             with self.timer.span(span, cpu=f"{span}.cpu"):
                 self.executor.postprocess(
                     step, outputs, clear_loop_stops=chain,
-                    next_step_rids=next_step_rids, rows_by_lane=self._rows_by_lane,
+                    next_step_rids=next_step_rids,
                 )
         finally:
             if keyed:

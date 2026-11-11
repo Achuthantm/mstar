@@ -67,7 +67,6 @@ def test_cuda_input_is_rejected_after_clear_seal(tmp_path, monkeypatch, late_epo
         torch.testing.assert_close(receiver.get_tensor(edges[0].tensor_info[0].uuid).cpu(), expected)
         assert not receiver.has_inflight_reads(case.rid)
         report = case.finish(native=native)
-        assert not report.has_inflight_reads
 
         reads = []
         start_read = receiver.start_read_tensors
